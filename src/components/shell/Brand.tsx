@@ -20,7 +20,7 @@ export function Brand({
           the browser keep the proportions whatever the file shape is. */}
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img
-        src="/logo.png"
+        src="/upnrise-logo.png"
         alt="UPnRise"
         className="block w-auto"
         style={{ height: `${heightPx}px` }}
