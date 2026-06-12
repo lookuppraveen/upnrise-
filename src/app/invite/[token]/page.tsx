@@ -10,6 +10,7 @@ import Link from "next/link";
 import { prisma } from "@/lib/db/client";
 import { verifyInviteToken } from "@/lib/auth/invite-token";
 import { AcceptInviteForm } from "@/components/auth/AcceptInviteForm";
+import { Brand } from "@/components/shell/Brand";
 
 export const dynamic = "force-dynamic";
 
@@ -106,8 +107,8 @@ function InviteShell({
   return (
     <div className="min-h-screen bg-bg grid place-items-center px-4 py-10">
       <div className="w-full max-w-[480px] bg-surface border border-border rounded-[14px] p-6 md:p-8 shadow-sm">
-        <div className="text-[10.5px] font-bold uppercase tracking-[0.12em] text-ink-3 mb-2">
-          UPnRise
+        <div className="mb-3">
+          <Brand size="sm" />
         </div>
         <h1 className="font-display text-[26px] leading-tight -tracking-[0.01em] mb-4">
           {title}

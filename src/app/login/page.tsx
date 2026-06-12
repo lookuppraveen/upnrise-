@@ -4,6 +4,7 @@
 import { signIn } from "./actions";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
+import { Brand } from "@/components/shell/Brand";
 
 export default function LoginPage({
   searchParams,
@@ -13,10 +14,8 @@ export default function LoginPage({
   return (
     <main className="flex-1 flex items-center justify-center px-6">
       <Card pad="lg" className="w-full max-w-[400px] space-y-5">
-        <header className="space-y-1">
-          <div className="font-display text-[28px] leading-[1.05] tracking-tight">
-            Sign in to <span className="text-accent">UPnR●se</span>
-          </div>
+        <header className="space-y-3">
+          <Brand size="lg" />
           <p className="text-ink-2 text-[13px]">
             Use a dev account from the seed (e.g. <code className="font-mono text-[12px]">super@upnrise.local</code>).
           </p>

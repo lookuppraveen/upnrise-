@@ -6,6 +6,7 @@
 import Link from "next/link";
 import { Icon } from "@/components/ui/Icon";
 import { cn } from "@/lib/cn";
+import { Brand } from "./Brand";
 import type { ShellConfig } from "./nav-types";
 
 export function Sidebar({
@@ -21,21 +22,8 @@ export function Sidebar({
       style={{ width: config.sidebarWidth }}
     >
       {/* Brand */}
-      <div className="flex items-center gap-[11px] px-[18px] pt-[18px] pb-[16px] border-b border-border">
-        <div
-          className="w-8 h-8 grid place-items-center rounded-[9px] text-white font-display font-bold text-[17px] bg-ai-grad"
-          style={{ boxShadow: "0 2px 8px rgba(232,93,58,0.3)" }}
-        >
-          U
-        </div>
-        <div className="flex flex-col leading-tight">
-          <span className="font-semibold text-[15px] -tracking-[0.01em]">
-            UPnR<span className="text-accent">●</span>se
-          </span>
-          <span className="text-[10.5px] text-ink-3 tracking-[0.04em] -mt-px">
-            {config.brandSub}
-          </span>
-        </div>
+      <div className="px-[18px] pt-[18px] pb-[16px] border-b border-border">
+        <Brand size="md" withSub sub={config.brandSub} />
       </div>
 
       {/* Nav */}
