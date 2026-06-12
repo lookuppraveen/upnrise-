@@ -12,18 +12,23 @@ export function Brand({
   withSub?: boolean;
   sub?: string;
 }) {
-  const heightPx = size === "sm" ? 24 : size === "lg" ? 56 : 32;
+  const heightPx = size === "sm" ? 28 : size === "lg" ? 64 : 36;
+  const maxWidthPx = size === "sm" ? 140 : size === "lg" ? 260 : 180;
   return (
     <div className="flex flex-col leading-tight">
-      {/* Plain <img>, not next/image — the file's native aspect ratio
-          should drive width. Constraining only height + width:auto lets
-          the browser keep the proportions whatever the file shape is. */}
+      {/* Plain <img> + object-contain so the browser preserves the
+          file's intrinsic aspect ratio no matter what the box dims are.
+          height is fixed, width is bounded by maxWidth — the image will
+          shrink to whichever constraint is tighter without distorting. */}
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img
         src="/upnrise-logo.png"
         alt="UPnRise"
-        className="block w-auto"
-        style={{ height: `${heightPx}px` }}
+        className="block w-auto object-contain"
+        style={{
+          height: `${heightPx}px`,
+          maxWidth: `${maxWidthPx}px`,
+        }}
       />
       {withSub && sub ? (
         <span className="text-[10.5px] text-ink-3 tracking-[0.04em] mt-1">
