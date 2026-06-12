@@ -18,7 +18,7 @@ export function Brand({
   return (
     <div className="flex flex-col leading-tight">
       <Image
-        src="/upnrise-logo.png"
+        src="/logo.png"
         alt="UPnRise"
         width={heightPx * 4}
         height={heightPx}
