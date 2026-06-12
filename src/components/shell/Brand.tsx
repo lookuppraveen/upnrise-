@@ -3,8 +3,6 @@
 // /public/upnrise-logo.png (or .svg) — height is what we constrain;
 // width is whatever the image's aspect ratio dictates.
 
-import Image from "next/image";
-
 export function Brand({
   size = "md",
   withSub,
@@ -17,12 +15,13 @@ export function Brand({
   const heightPx = size === "sm" ? 24 : size === "lg" ? 56 : 32;
   return (
     <div className="flex flex-col leading-tight">
-      <Image
+      {/* Plain <img>, not next/image — the file's native aspect ratio
+          should drive width. Constraining only height + width:auto lets
+          the browser keep the proportions whatever the file shape is. */}
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
         src="/logo.png"
         alt="UPnRise"
-        width={heightPx * 4}
-        height={heightPx}
-        priority
         className="block w-auto"
         style={{ height: `${heightPx}px` }}
       />
