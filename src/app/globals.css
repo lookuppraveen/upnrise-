@@ -1,0 +1,139 @@
+@import "tailwindcss";
+
+/* ============================================================
+   UPnRise Design Tokens
+   Ported verbatim from design_handoff_upnrise/DESIGN_TOKENS.md
+   (originally design_files/prototype.css :root)
+   Keep values 1:1 with the prototype.
+   ============================================================ */
+:root {
+  /* Neutrals */
+  --bg: #f7f7f5;
+  --surface: #ffffff;
+  --surface-2: #f1f1ef;
+  --border: #e4e3df;
+  --border-strong: #d3d2cc;
+  --ink: #1a1a1a;
+  --ink-2: #595956;
+  --ink-3: #8a8a86;
+
+  /* Accent — UPnRise orange */
+  --accent: #e85d3a;
+  --accent-pale: #fdebe4;
+  --accent-strong: #c64a2b;
+
+  /* Semantic */
+  --good: #2a7d4f;
+  --good-pale: #e8f5ee;
+  --warn: #c97a1b;
+  --warn-pale: #fdf1de;
+  --bad: #c5392f;
+  --bad-pale: #fde7e4;
+
+  /* AI gradients */
+  --ai-grad: linear-gradient(135deg, #ff8a5b 0%, #e85d3a 60%, #b94e8d 100%);
+  --ai-grad-soft: linear-gradient(135deg, #ffe4d6 0%, #fde0ed 100%);
+
+  /* Radius */
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-xl: 20px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.06);
+
+  /* Layout dimensions */
+  --sidebar-w: 252px;       /* admin sidebar */
+  --sidebar-w-learn: 224px; /* trainee sidebar */
+  --copilot-w: 360px;       /* admin AI drawer */
+  --copilot-w-super: 440px; /* super-admin AI drawer */
+  --topbar-h: 60px;
+}
+
+/* Wire CSS vars into Tailwind v4 theme so utilities like `bg-bg`, `text-ink`,
+   `border-border`, `rounded-md` etc resolve to our tokens. */
+@theme inline {
+  /* colors — single-value tokens become bg-/text-/border-/etc utilities */
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+
+  --color-accent: var(--accent);
+  --color-accent-pale: var(--accent-pale);
+  --color-accent-strong: var(--accent-strong);
+
+  --color-good: var(--good);
+  --color-good-pale: var(--good-pale);
+  --color-warn: var(--warn);
+  --color-warn-pale: var(--warn-pale);
+  --color-bad: var(--bad);
+  --color-bad-pale: var(--bad-pale);
+
+  /* fonts — wired via next/font in layout.tsx */
+  --font-sans: var(--font-dm-sans);
+  --font-display: var(--font-dm-serif);
+  --font-mono: var(--font-jetbrains);
+
+  /* radii — overrides Tailwind defaults so `rounded-md` = 10px etc */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+
+  /* shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.06);
+
+  /* layout dims as spacing tokens so we can use w-sidebar etc */
+  --spacing-sidebar: 252px;
+  --spacing-sidebar-learn: 224px;
+  --spacing-copilot: 360px;
+  --spacing-copilot-super: 440px;
+  --spacing-topbar: 60px;
+}
+
+/* Base canvas — matches prototype.css body rules */
+html,
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans), system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* AI gradient utility (background) */
+.bg-ai-grad {
+  background: var(--ai-grad);
+}
+.bg-ai-grad-soft {
+  background: var(--ai-grad-soft);
+}
+.text-ai-grad {
+  background: var(--ai-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+
+/* Toast slide-in. Sits above the viewport-edge so it lands cleanly. */
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) translateX(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) translateX(0);
+  }
+}

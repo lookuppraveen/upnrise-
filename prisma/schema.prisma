@@ -1,0 +1,991 @@
+// UPnRise — schema (Phase 0 + Phase 1 + Phase 2)
+//
+// Phase 0/1: tenancy + auth + audit spine.
+// Phase 2 (this update): trainings, modules, roleplay configs/sessions,
+//   assignments, dictionary, feedback, feed posts, kb_sources.
+// Phase 3 will add: billing/plans (most), embeddings on kb_sources.
+// Phase 4 will add: support tickets, platform settings, shared content.
+//
+// All tenant-scoped tables carry `companyId`. RLS policies live in
+// prisma/sql/01_rls_policies.sql (Phase 1) — Phase 2 RLS will be added
+// when the trainee surfaces start serving real data (planned for §2.5).
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  directUrl  = env("DIRECT_URL")
+  extensions = [pgcrypto, vector]
+}
+
+// ─────────────────────────────── Enums ───────────────────────────────
+
+enum Role {
+  super_admin
+  admin
+  trainee
+}
+
+enum CompanyHealth {
+  healthy
+  watch
+  at_risk
+}
+
+enum TrainingStatus {
+  draft
+  published
+  archived
+}
+
+enum TrainingVisibility {
+  private
+  org_wide
+  public
+}
+
+enum TrainingRepeat {
+  never
+  weekly
+  monthly
+  quarterly
+}
+
+enum CoachTone {
+  soft
+  balanced
+  direct
+}
+
+enum ModuleType {
+  video
+  roleplay
+  quiz
+  document
+  // Phase H additions: surfaces a "Gamified Activity" learner experience
+  // (gamified) and a dedicated open-ended Evaluation module (evaluation).
+  // Their body editors land in Phase M.
+  gamified
+  evaluation
+}
+
+enum RoleplayMode {
+  text
+  voice
+  video
+}
+
+enum AssignmentStatus {
+  not_started
+  in_progress
+  completed
+  overdue
+}
+
+enum AssignmentPriority {
+  p1
+  p2
+  p3
+}
+
+enum KbSourceStatus {
+  uploading
+  indexing
+  ready
+  failed
+}
+
+enum KbSourceKind {
+  pdf
+  doc
+  url
+  text
+}
+
+// Reusable question-bank entries. Two kinds today:
+// - `evaluation`   : multiple-choice questions an Assessment module
+//                    pulls from at quiz time. Future: random sampling.
+// - `whatsapp_mcq` : nudge-style MCQs delivered over WhatsApp by the
+//                    AI follow-up pipeline (Phase G integration).
+enum QuestionBankItemKind {
+  evaluation
+  whatsapp_mcq
+}
+
+// Avatar-video providers we can plug into. HeyGen is the only working
+// driver today; the others are registered so the UI can let an admin
+// add a key + flip the active provider per company without a schema
+// migration. New providers should be added here AND get a driver in
+// src/lib/video/providers/.
+enum VideoProviderKind {
+  heygen
+  synthesia
+  did
+  elevenlabs
+}
+
+enum FeedbackKind {
+  ai
+  human
+}
+
+enum FeedbackSentiment {
+  positive
+  neutral
+  negative
+}
+
+// Lightweight tag so the inbox can be filtered by what learners are
+// reacting to. Independent of FeedbackKind (ai vs human).
+enum FeedbackCategory {
+  roleplay
+  quiz
+  pronunciation
+  platform
+  content
+  other
+}
+
+enum SavedReportKind {
+  trainings
+  learners
+  sessions
+  zone
+}
+
+enum ReportCadence {
+  manual
+  daily
+  weekly
+  monthly
+}
+
+enum FeedPostKind {
+  announcement
+  win
+  ai_nudge
+}
+
+enum CampaignStatus {
+  draft
+  active
+  completed
+  archived
+}
+
+enum RewardAction {
+  complete_training
+  complete_module
+  score_above_80
+  score_above_90
+  streak_5_days
+  first_session
+}
+
+enum SubscriptionStatus {
+  trialing
+  active
+  past_due
+  cancelled
+}
+
+enum CreditEntryKind {
+  setup
+  topup
+  ai_consumption
+  adjustment
+}
+
+// ─────────────────────────────── Platform / tenancy ───────────────────
+
+model Company {
+  id           String         @id @default(uuid()) @db.Uuid
+  name         String
+  logoInitials String         @map("logo_initials")
+  brandColor   String         @map("brand_color")
+  industry     String?
+  region       String?
+  seats        Int            @default(0)
+  health       CompanyHealth  @default(healthy)
+  since        DateTime?
+  // Global Bot config — woven into the Trainee Coach system prompt.
+  // Null fields fall back to platform defaults.
+  botPersona    String?       @map("bot_persona")
+  botGuardrails String?       @map("bot_guardrails")
+  botTagline    String?       @map("bot_tagline")
+  // Super Admin commercial fields
+  csm           String?
+  churnRisk     Int?          @map("churn_risk")
+  expandScore   Int?          @map("expand_score")
+  growthPct     Int?          @map("growth_pct")
+  aiSpendCents  Int           @default(0) @map("ai_spend_cents")
+  createdAt    DateTime       @default(now()) @map("created_at")
+  updatedAt    DateTime       @updatedAt @map("updated_at")
+
+  users                  User[]
+  impersonationSessions  ImpersonationSession[]
+  auditLogs              AuditLog[]
+  trainings              Training[]
+  dictionaryTerms        DictionaryTerm[]
+  pronunciations         Pronunciation[]
+  feedPosts              FeedPost[]
+  campaigns              Campaign[]
+  rewardRules            RewardRule[]
+  rewardItems            RewardItem[]
+  rewardEarnings         RewardEarning[]
+  subscription           Subscription?
+  creditLedger           CreditLedgerEntry[]
+  zones                  Zone[]
+  hqs                    HQ[]
+  teams                  Team[]
+  conversations          Conversation[]
+  savedReports           SavedReport[]
+  kbSources              KbSource[]
+  videoProviders         VideoProvider[]
+  didPortraits           DidPortrait[]
+  questionBankItems      QuestionBankItem[]
+
+  @@map("companies")
+}
+
+// One row per CSV export the admin has saved. cadence drives the
+// scheduler (not yet wired): manual reports email on demand only;
+// daily/weekly/monthly reports email to `recipients` automatically.
+// nextSendAt is null until the scheduler computes it.
+model SavedReport {
+  id          String         @id @default(uuid()) @db.Uuid
+  companyId   String         @map("company_id") @db.Uuid
+  createdById String         @map("created_by_id") @db.Uuid
+  name        String
+  kind        SavedReportKind
+  cadence     ReportCadence  @default(manual)
+  // Email destinations. Empty array = no email, dashboard download only.
+  recipients  String[]
+  lastSentAt  DateTime?      @map("last_sent_at")
+  nextSendAt  DateTime?      @map("next_send_at")
+  createdAt   DateTime       @default(now()) @map("created_at")
+  updatedAt   DateTime       @updatedAt @map("updated_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, createdAt])
+  @@map("saved_reports")
+}
+
+// ───────────────── Org structure ─────────────────
+// Per-tenant three-level org tree. Zone (region bucket) → HQ (office) →
+// Team (functional unit). User.teamId is optional — unassigned users
+// still work everywhere, they just don't show up in zone/HQ rollups.
+// All three tables scope by companyId; deletes cascade with the tenant.
+
+model Zone {
+  id        String   @id @default(uuid()) @db.Uuid
+  companyId String   @map("company_id") @db.Uuid
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  hqs     HQ[]
+
+  @@unique([companyId, name])
+  @@index([companyId])
+  @@map("zones")
+}
+
+model HQ {
+  id        String   @id @default(uuid()) @db.Uuid
+  companyId String   @map("company_id") @db.Uuid
+  zoneId    String?  @map("zone_id") @db.Uuid
+  name      String
+  city      String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  zone    Zone?   @relation(fields: [zoneId], references: [id], onDelete: SetNull)
+  teams   Team[]
+
+  @@unique([companyId, name])
+  @@index([companyId])
+  @@index([zoneId])
+  @@map("hqs")
+}
+
+model Team {
+  id        String   @id @default(uuid()) @db.Uuid
+  companyId String   @map("company_id") @db.Uuid
+  hqId      String?  @map("hq_id") @db.Uuid
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  hq      HQ?     @relation(fields: [hqId], references: [id], onDelete: SetNull)
+  members User[]
+
+  @@unique([companyId, name])
+  @@index([companyId])
+  @@index([hqId])
+  @@map("teams")
+}
+
+// ───────────────── Global Bot conversations ─────────────────
+// One row per learner ↔ Global Bot thread. Turns stored as child rows so
+// transcripts can be browsed. `helpful` captures explicit 👍 / 👎 feedback
+// at thread close; `flaggedAt` lets reviewers triage problematic answers.
+
+model Conversation {
+  id        String   @id @default(uuid()) @db.Uuid
+  companyId String   @map("company_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  title     String?
+  // Tri-state rating: null = unrated, true = 👍, false = 👎
+  helpful   Boolean?
+  flaggedAt DateTime? @map("flagged_at")
+  startedAt DateTime  @default(now()) @map("started_at")
+  endedAt   DateTime? @map("ended_at")
+
+  company Company            @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user    User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  turns   ConversationTurn[]
+
+  @@index([companyId, startedAt])
+  @@index([userId, startedAt])
+  @@map("conversations")
+}
+
+model ConversationTurn {
+  id             String   @id @default(uuid()) @db.Uuid
+  conversationId String   @map("conversation_id") @db.Uuid
+  // "user" | "bot"
+  role           String
+  content        String
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@map("conversation_turns")
+}
+
+/**
+ * Append-only ledger of credit movements. `amount` is signed in plan-credit
+ * units (same denomination as Plan.setupCredits): positive = grant
+ * (setup/topup/positive adjustment), negative = consumption. Sum over a
+ * tenant = current balance; sum of negatives = consumed; sum of positives
+ * = total granted.
+ *
+ * Phase 5.2: powers the /super/credits used/total bar and Top up action.
+ */
+model CreditLedgerEntry {
+  id        String          @id @default(uuid()) @db.Uuid
+  companyId String          @map("company_id") @db.Uuid
+  kind      CreditEntryKind
+  amount    Int
+  reason    String?
+  /** UUID of the super_admin who initiated. Null for system entries (e.g. ai_consumption). */
+  actorId   String?         @map("actor_id") @db.Uuid
+  createdAt DateTime        @default(now()) @map("created_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, createdAt])
+  @@map("credit_ledger")
+}
+
+// Singleton row holding platform-wide AI knobs. Flows into every tenant's
+// Coach + Copilot system prompts. Tenants can override persona/guardrails
+// via /admin/global-bot.
+model PlatformSettings {
+  id                      String   @id @default("singleton")
+  // AI knobs (Phase 4.4)
+  defaultModel            String   @default("claude-opus-4-7")
+  fastModel               String   @default("claude-haiku-4-5-20251001")
+  defaultCoachPersona     String?  @map("default_coach_persona")
+  defaultCoachGuardrails  String?  @map("default_coach_guardrails")
+  maxTokensPerTurn        Int      @default(700) @map("max_tokens_per_turn")
+  monthlySpendCapCents    Int      @default(50000) @map("monthly_spend_cap_cents")
+  notes                   String?
+  // Master Settings (Phase 4.7) — branding + feature flags
+  productName             String   @default("UPnRise") @map("product_name")
+  signupEnabled           Boolean  @default(false) @map("signup_enabled")
+  defaultRegion           String   @default("AMER") @map("default_region")
+  // Active regions tenants can be placed in.
+  regions                 String[] @default(["AMER", "EMEA", "APAC"])
+  // Free-form feature flag keys → bool/string. Read by the app where
+  // gating matters. Empty by default.
+  featureFlags            Json     @default("{}") @map("feature_flags")
+  updatedAt               DateTime @updatedAt @map("updated_at")
+
+  @@map("platform_settings")
+}
+
+model Plan {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String   @unique
+  color        String
+  priceCents   Int      @map("price_cents")
+  cycle        String   @default("monthly")
+  setupCredits Int      @default(0) @map("setup_credits")
+  seatsMin     Int      @default(1) @map("seats_min")
+  seatsMax     Int?     @map("seats_max")
+  trialDays    Int      @default(0) @map("trial_days")
+  features     String[]
+  limits       Json
+  badge        String?
+  active       Boolean  @default(true)
+  sortOrder    Int      @default(0) @map("sort_order")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  subscriptions Subscription[]
+
+  @@map("plans")
+}
+
+model Subscription {
+  id                 String             @id @default(uuid()) @db.Uuid
+  companyId          String             @unique @map("company_id") @db.Uuid
+  planId             String             @map("plan_id") @db.Uuid
+  status             SubscriptionStatus @default(active)
+  seats              Int                @default(0)
+  priceOverrideCents Int?               @map("price_override_cents")
+  startedAt          DateTime           @default(now()) @map("started_at")
+  renewalAt          DateTime?          @map("renewal_at")
+  createdAt          DateTime           @default(now()) @map("created_at")
+  updatedAt          DateTime           @updatedAt @map("updated_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  plan    Plan    @relation(fields: [planId], references: [id])
+
+  @@map("subscriptions")
+}
+
+model User {
+  id         String   @id @db.Uuid
+  email      String   @unique
+  name       String?
+  role       Role
+  companyId  String?  @map("company_id") @db.Uuid
+  teamId     String?  @map("team_id") @db.Uuid
+  status     String   @default("active")
+  lastActive DateTime? @map("last_active")
+  // Optional HRIS-style attributes surfaced in the trainings → Assign table.
+  // All nullable so existing seed users keep working without backfill.
+  employeeCode String? @map("employee_code")
+  zone         String?
+  designation  String?
+  department   String?
+  // AI-derived risk flag. Set by the Copilot pipeline when a learner
+  // shows churn/at-risk signals; admins can filter on this in the Users
+  // / Employees views. aiFlagReason is the short prose justification.
+  aiFlagged  Boolean  @default(false) @map("ai_flagged")
+  aiFlagReason String? @map("ai_flag_reason")
+  // Direct reporting manager. Self-reference so an admin/coach can be
+  // assigned as the manager of a trainee. Nullable so legacy users
+  // load fine; SetNull on delete so removing a manager doesn't
+  // cascade-delete their reports.
+  managerId  String?  @map("manager_id") @db.Uuid
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  company Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  team    Team?    @relation(fields: [teamId], references: [id], onDelete: SetNull)
+  manager User?    @relation("UserManager", fields: [managerId], references: [id], onDelete: SetNull)
+  reports User[]   @relation("UserManager")
+
+  impersonationSessionsAsOperator ImpersonationSession[] @relation("operator")
+  auditLogs                       AuditLog[]
+  assignments                     Assignment[]
+  roleplaySessions                RoleplaySession[]
+  feedbackReceived                Feedback[]   @relation("recipient")
+  feedPosts                       FeedPost[]   @relation("author")
+  rewardEarnings                  RewardEarning[]
+  conversations                   Conversation[]
+  moduleCompletions               ModuleCompletion[]
+
+  @@index([companyId])
+  @@index([teamId])
+  @@index([managerId])
+  @@map("users")
+}
+
+model ImpersonationSession {
+  id         String   @id @default(uuid()) @db.Uuid
+  operatorId String   @map("operator_id") @db.Uuid
+  companyId  String   @map("company_id") @db.Uuid
+  asRole     Role     @map("as_role")
+  startedAt  DateTime @default(now()) @map("started_at")
+  endedAt    DateTime? @map("ended_at")
+
+  operator User    @relation("operator", fields: [operatorId], references: [id], onDelete: Cascade)
+  company  Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([operatorId])
+  @@index([companyId])
+  @@map("impersonation_sessions")
+}
+
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  actorId   String   @map("actor_id") @db.Uuid
+  companyId String?  @map("company_id") @db.Uuid
+  action    String
+  target    String?
+  metadata  Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  actor   User     @relation(fields: [actorId], references: [id], onDelete: Cascade)
+  company Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+
+  @@index([companyId, createdAt])
+  @@index([actorId, createdAt])
+  @@map("audit_log")
+}
+
+// ─────────────────────────────── Learning content ─────────────────────
+
+model Training {
+  id               String         @id @default(uuid()) @db.Uuid
+  companyId        String         @map("company_id") @db.Uuid
+  title            String
+  description      String?
+  categories       String[]       // free-form tags shown as chips
+  status           TrainingStatus @default(draft)
+  houseStyleMatch  Int?           @map("house_style_match") // 0–100 (AI score)
+  thumbnailUrl     String?        @map("thumbnail_url")
+  // Step 4 settings — visibility / scheduling / completion / AI behavior.
+  visibility         TrainingVisibility @default(private)
+  prerequisiteIds    String[]           @map("prerequisite_ids") @db.Uuid
+  selfEnrollment     Boolean            @default(false) @map("self_enrollment")
+  startAt            DateTime?          @map("start_at")
+  dueAt              DateTime?          @map("due_at")
+  repeat             TrainingRepeat     @default(never)
+  issueCertificate   Boolean            @default(true)  @map("issue_certificate")
+  passingScore       Int                @default(70)    @map("passing_score")
+  rewardPoints       Int                @default(100)   @map("reward_points")
+  adaptiveDifficulty Boolean            @default(true)  @map("adaptive_difficulty")
+  liveCoachTips      Boolean            @default(true)  @map("live_coach_tips")
+  followUpNudges     Boolean            @default(true)  @map("follow_up_nudges")
+  feedbackTone       CoachTone          @default(balanced) @map("feedback_tone")
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime       @updatedAt @map("updated_at")
+
+  company     Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  modules     TrainingModule[]
+  kbSources   KbSource[]
+  questionBankItems QuestionBankItem[]
+  assignments Assignment[]
+  feedback    Feedback[]
+  campaigns   Campaign[]
+
+  @@index([companyId, status])
+  @@map("trainings")
+}
+
+model TrainingModule {
+  id           String      @id @default(uuid()) @db.Uuid
+  trainingId   String      @map("training_id") @db.Uuid
+  name         String
+  type         ModuleType
+  order        Int         @default(0)
+  published    Boolean     @default(false)
+  // AI quality score (0–100) — set when Generate-with-AI drafts the module.
+  aiScore      Int?        @map("ai_score")
+  thumbnailUrl String?     @map("thumbnail_url")
+  // Free-form module body for video/quiz/document. Shape depends on `type`.
+  // Roleplay-specific config lives in `RoleplayConfig` (1:1).
+  body         Json?
+  createdAt    DateTime    @default(now()) @map("created_at")
+  updatedAt    DateTime    @updatedAt @map("updated_at")
+
+  training        Training         @relation(fields: [trainingId], references: [id], onDelete: Cascade)
+  roleplayConfig  RoleplayConfig?
+  roleplaySessions RoleplaySession[]
+  completions     ModuleCompletion[]
+
+  @@index([trainingId, order])
+  @@map("training_modules")
+}
+
+// One row per (user, module) pair when a non-roleplay module is marked
+// done. Roleplay completion is still tracked via RoleplaySession.endedAt
+// because each attempt is independently scored — this table is for the
+// fire-once "I watched the video / I read the doc / I answered the quiz"
+// signal that video/quiz/document modules need.
+model ModuleCompletion {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  moduleId    String   @map("module_id") @db.Uuid
+  // 0-100 for quiz; null for video/document.
+  scorePct    Int?     @map("score_pct")
+  completedAt DateTime @default(now()) @map("completed_at")
+
+  user   User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  module TrainingModule @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, moduleId])
+  @@index([moduleId])
+  @@map("module_completions")
+}
+
+model RoleplayConfig {
+  id        String        @id @default(uuid()) @db.Uuid
+  moduleId  String        @unique @map("module_id") @db.Uuid
+  persona   String
+  scenario  String
+  mode      RoleplayMode  @default(text)
+  // Rubric for scoring (jsonb). Shape:
+  // { criteria: [{ id, label, weight, description }], pass_score?: number }
+  rubric    Json
+  // System prompt prefix appended to the persona system message.
+  systemPrompt String?    @map("system_prompt")
+  createdAt DateTime      @default(now()) @map("created_at")
+  updatedAt DateTime      @updatedAt @map("updated_at")
+
+  module TrainingModule @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+
+  @@map("roleplay_configs")
+}
+
+// KB sources live at the tenant level so they can be picked while
+// drafting a new training (no trainingId yet). When an admin attaches
+// a source to an existing training, trainingId is set; sources can
+// also live free-floating in the company library. `content` stores
+// the extracted plaintext for grounding LLM prompts; PDF parsing is
+// deferred — the v1 ingest path is text paste / URL fetch / .txt/.md
+// upload.
+model KbSource {
+  id           String          @id @default(uuid()) @db.Uuid
+  companyId    String          @map("company_id") @db.Uuid
+  trainingId   String?         @map("training_id") @db.Uuid
+  kind         KbSourceKind
+  name         String
+  size         Int?
+  status       KbSourceStatus  @default(ready)
+  storageRef   String?         @map("storage_ref")
+  embeddingRef String?         @map("embedding_ref")
+  content      String?         @db.Text
+  sourceUrl    String?         @map("source_url")
+  createdAt    DateTime        @default(now()) @map("created_at")
+  updatedAt    DateTime        @updatedAt @map("updated_at")
+
+  company  Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  training Training? @relation(fields: [trainingId], references: [id], onDelete: SetNull)
+
+  @@index([companyId])
+  @@index([trainingId])
+  @@map("kb_sources")
+}
+
+// Tenant question bank. Two shapes coexist on this model:
+//   - `evaluation`   : open-ended voice/text questions scored by AI
+//                      against an `idealAnswer`, tagged with `skills`
+//                      + `keywords`. Optional `minSpeakingSeconds`
+//                      gates fast/short answers; optional `audioUrl`
+//                      lets the admin attach a sample. Drives the
+//                      Assessment module's evaluation surface.
+//   - `whatsapp_mcq` : multiple-choice nudge items delivered via the
+//                      future WhatsApp follow-up pipeline. Uses
+//                      `options` + `answer`.
+// MCQ fields are nullable so open-ended rows aren't forced to carry
+// empty arrays / null answer indices. `trainingId` is optional —
+// items can be free-floating or attached to a training, mirroring
+// KbSource.
+model QuestionBankItem {
+  id          String                @id @default(uuid()) @db.Uuid
+  companyId   String                @map("company_id") @db.Uuid
+  trainingId  String?               @map("training_id") @db.Uuid
+  kind        QuestionBankItemKind
+  question    String                @db.Text
+  // MCQ shape — used by whatsapp_mcq kind.
+  options     String[]              @default([])
+  answer      Int?                  // 0-indexed correct option
+  tags        String[]              @default([])
+  // Open-ended evaluation shape — used by evaluation kind.
+  skills              String[]      @default([])
+  keywords            String[]      @default([])
+  idealAnswer         String?       @map("ideal_answer") @db.Text
+  minSpeakingSeconds  Int?          @map("min_speaking_seconds")
+  audioUrl            String?       @map("audio_url") @db.Text
+  additionalPrompt    String?       @map("additional_prompt") @db.Text
+  createdAt   DateTime              @default(now()) @map("created_at")
+  updatedAt   DateTime              @updatedAt @map("updated_at")
+
+  company  Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  training Training? @relation(fields: [trainingId], references: [id], onDelete: SetNull)
+
+  @@index([companyId, kind])
+  @@index([trainingId])
+  @@map("question_bank_items")
+}
+
+// Tenant-configured avatar video provider. Multiple rows per company are
+// allowed (e.g. HeyGen + Synthesia side by side) but exactly one row is
+// the active provider at a time — see the partial unique index on
+// (companyId) where isDefault=true. The apiKey is stored as a plain
+// string for v1; a future pass should encrypt at rest.
+model VideoProvider {
+  id         String            @id @default(uuid()) @db.Uuid
+  companyId  String            @map("company_id") @db.Uuid
+  kind       VideoProviderKind
+  label      String?
+  apiKey     String            @map("api_key")
+  // Provider-specific defaults used when rendering a video. For HeyGen
+  // these map to avatar_id and voice_id. Other providers ignore them.
+  avatarId   String?           @map("avatar_id")
+  voiceId    String?           @map("voice_id")
+  isDefault  Boolean           @default(false) @map("is_default")
+  createdAt  DateTime          @default(now()) @map("created_at")
+  updatedAt  DateTime          @updatedAt @map("updated_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@map("video_providers")
+}
+
+// Tenant-scoped library of D-ID portraits the admin has uploaded via
+// POST https://api.d-id.com/images. Avoids re-typing the long s3://
+// URI for every persona override — admins pick from a labelled list.
+// HeyGen has its own catalogue picker (AvatarPickerModal) so this
+// library is intentionally D-ID-only for now.
+model DidPortrait {
+  id         String   @id @default(uuid()) @db.Uuid
+  companyId  String   @map("company_id") @db.Uuid
+  label      String
+  // sourceUrl is the s3://d-id-images-prod/… reference that /talks
+  // and /talks/streams accept. displayUrl is the publicly-fetchable
+  // copy we mirror to Supabase Storage so the trainee browser can
+  // actually render the portrait in audio-only mode (where there is
+  // no WebRTC video track to fall back on).
+  sourceUrl  String   @map("source_url")
+  displayUrl String?  @map("display_url")
+  voiceId    String?  @map("voice_id")
+  voiceName  String?  @map("voice_name")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@map("did_portraits")
+}
+
+model DictionaryTerm {
+  id         String   @id @default(uuid()) @db.Uuid
+  companyId  String   @map("company_id") @db.Uuid
+  term       String
+  definition String
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, term])
+  @@map("dictionary_terms")
+}
+
+/**
+ * Per-tenant pronunciations. Drives voice-mode roleplays and the dictionary
+ * "how to say it" affordance. `phonetic` is a simple phonetic spelling
+ * (e.g. "MED-ick"), `mnemonic` is a free-text "say it like…" hint, `notes`
+ * are optional stress/origin/etymology details. AI-generated rows are flagged
+ * so the editor can show the gradient badge.
+ */
+model Pronunciation {
+  id            String   @id @default(uuid()) @db.Uuid
+  companyId     String   @map("company_id") @db.Uuid
+  word          String
+  phonetic      String
+  mnemonic      String?
+  notes         String?
+  generatedByAi Boolean  @default(false) @map("generated_by_ai")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, word])
+  @@map("pronunciations")
+}
+
+// ─────────────────────────────── People / engagement ────────────────────
+
+model Assignment {
+  id          String              @id @default(uuid()) @db.Uuid
+  trainingId  String              @map("training_id") @db.Uuid
+  userId      String              @map("user_id") @db.Uuid
+  status      AssignmentStatus    @default(not_started)
+  priority    AssignmentPriority  @default(p2)
+  progress    Int                 @default(0) // 0–100
+  dueAt       DateTime?           @map("due_at")
+  // AI-generated rationale for why this matters to this learner.
+  aiReason    String?             @map("ai_reason")
+  createdAt   DateTime            @default(now()) @map("created_at")
+  updatedAt   DateTime            @updatedAt @map("updated_at")
+
+  training Training @relation(fields: [trainingId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+  @@index([trainingId])
+  @@map("assignments")
+}
+
+model RoleplaySession {
+  id          String        @id @default(uuid()) @db.Uuid
+  userId      String        @map("user_id") @db.Uuid
+  moduleId    String        @map("module_id") @db.Uuid
+  // Final aggregate score 0–100. Null while session is in progress.
+  score       Int?
+  // Score on this learner's previous attempt of this module (for trend).
+  priorScore  Int?          @map("prior_score")
+  mode        RoleplayMode
+  // Language the trainee picked at the pre-session gate (BCP-47 tag,
+  // e.g. "en-US", "hi-IN"). Nullable so legacy sessions render with a
+  // safe "English" fallback on the results page.
+  language    String?
+  // Total seconds spent in the session.
+  durationSec Int?          @map("duration_sec")
+  // Skill tags surfaced by the scoring Claude call.
+  strongSkills String[]     @map("strong_skills")
+  weakSkills   String[]     @map("weak_skills")
+  // The full conversation. Shape:
+  // [{ role: "persona"|"learner", content, ts }]
+  transcript  Json
+  // Per-criterion breakdown (id → score 0–100). Mirrors RoleplayConfig.rubric.
+  rubricScores Json?        @map("rubric_scores")
+  startedAt   DateTime      @default(now()) @map("started_at")
+  endedAt     DateTime?     @map("ended_at")
+  createdAt   DateTime      @default(now()) @map("created_at")
+
+  user   User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  module TrainingModule @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  feedback Feedback[]
+
+  @@index([userId, moduleId, startedAt])
+  @@index([moduleId])
+  @@map("roleplay_sessions")
+}
+
+model Feedback {
+  id           String              @id @default(uuid()) @db.Uuid
+  recipientId  String              @map("recipient_id") @db.Uuid
+  trainingId   String?             @map("training_id") @db.Uuid
+  sessionId    String?             @map("session_id") @db.Uuid
+  kind         FeedbackKind
+  sentiment    FeedbackSentiment?
+  // What the feedback is about. Defaults to roleplay because that's the
+  // only auto-generated path today.
+  category     FeedbackCategory   @default(roleplay)
+  body         String
+  // For AI feedback, the model that produced it.
+  source       String?             // e.g. "claude-opus-4-7" or "manager:vijay"
+  readAt       DateTime?           @map("read_at")
+  createdAt    DateTime            @default(now()) @map("created_at")
+
+  recipient User             @relation("recipient", fields: [recipientId], references: [id], onDelete: Cascade)
+  training  Training?        @relation(fields: [trainingId], references: [id], onDelete: SetNull)
+  session   RoleplaySession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  @@index([recipientId, createdAt])
+  @@index([category])
+  @@map("feedback")
+}
+
+model Campaign {
+  id          String         @id @default(uuid()) @db.Uuid
+  companyId   String         @map("company_id") @db.Uuid
+  name        String
+  description String?
+  status      CampaignStatus @default(draft)
+  // Free-text description of the audience (e.g. "All EMEA SDRs").
+  // Audience-resolution to specific users lands in a later phase.
+  audience    String?
+  startsAt    DateTime?      @map("starts_at")
+  endsAt      DateTime?      @map("ends_at")
+  // Optional link to the training this campaign drives.
+  trainingId  String?        @map("training_id") @db.Uuid
+  createdAt   DateTime       @default(now()) @map("created_at")
+  updatedAt   DateTime       @updatedAt @map("updated_at")
+
+  company  Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  training Training? @relation(fields: [trainingId], references: [id], onDelete: SetNull)
+
+  @@index([companyId, status])
+  @@map("campaigns")
+}
+
+model RewardRule {
+  id        String       @id @default(uuid()) @db.Uuid
+  companyId String       @map("company_id") @db.Uuid
+  action    RewardAction
+  points    Int
+  enabled   Boolean      @default(true)
+  createdAt DateTime     @default(now()) @map("created_at")
+  updatedAt DateTime     @updatedAt @map("updated_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, action])
+  @@map("reward_rules")
+}
+
+model RewardItem {
+  id          String   @id @default(uuid()) @db.Uuid
+  companyId   String   @map("company_id") @db.Uuid
+  name        String
+  description String?
+  pointsCost  Int      @map("points_cost")
+  available   Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, available])
+  @@map("reward_items")
+}
+
+// One row per awarded points event. The (userId, action, sourceKind,
+// sourceId) unique index makes the award helper idempotent: calling
+// award() twice for the same trigger no-ops on the second call.
+model RewardEarning {
+  id         String       @id @default(uuid()) @db.Uuid
+  companyId  String       @map("company_id") @db.Uuid
+  userId     String       @map("user_id") @db.Uuid
+  action     RewardAction
+  // Snapshot of rule.points at award time — preserves history even if the
+  // admin later edits or disables the rule.
+  points     Int
+  // sourceKind: "session" | "module" | "training" | "streak"
+  sourceKind String       @map("source_kind")
+  sourceId   String       @map("source_id")
+  awardedAt  DateTime     @default(now()) @map("awarded_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, action, sourceKind, sourceId])
+  @@index([userId, awardedAt])
+  @@index([companyId, awardedAt])
+  @@map("reward_earnings")
+}
+
+model FeedPost {
+  id        String       @id @default(uuid()) @db.Uuid
+  companyId String       @map("company_id") @db.Uuid
+  authorId  String?      @map("author_id") @db.Uuid // null = AI-generated
+  kind      FeedPostKind @default(announcement)
+  body      String
+  createdAt DateTime     @default(now()) @map("created_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  author  User?   @relation("author", fields: [authorId], references: [id], onDelete: SetNull)
+
+  @@index([companyId, createdAt])
+  @@map("feed_posts")
+}

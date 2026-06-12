@@ -1,0 +1,2661 @@
+// RoleplayPlayer — three-panel client player matching prototype.css `.rp-shell`.
+//
+//   • Left pane: scenario context (persona + scenario + mode)
+//   • Center pane: chat transcript + composer
+//   • Right pane: rubric criteria as "what we're scoring" coach cards
+//
+// Behavior unchanged from the Phase 2.3 spike:
+//   • Calls POST /api/roleplay/start on mount → renders opening turn
+//   • POST /api/roleplay/turn (streamed) on submit, appends chunks
+//   • POST /api/roleplay/end → redirects to results
+//
+// Bubble styling follows prototype.css `.bubble.bot` / `.bubble.me` —
+// surface-2 fill for persona, ink fill for learner, with one corner
+// squared off (4px) so the bubbles "point" toward the speaker.
+
+"use client";
+
+import { useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
+import { Button } from "@/components/ui/Button";
+import { Icon } from "@/components/ui/Icon";
+import { cn } from "@/lib/cn";
+import { useVoiceMode, type VoiceOption } from "@/hooks/useVoiceMode";
+import { useStreamingAvatar } from "@/hooks/useStreamingAvatar";
+import {
+  MODE_DESCRIPTIONS,
+  MODE_LABELS,
+  type PlayerMode,
+} from "@/lib/roleplay/additional-settings";
+
+type Bubble = { role: "persona" | "learner"; content: string };
+
+type CoachHint = { hint: string; tone: "tip" | "warn"; turn: number };
+
+type RubricCriterion = {
+  id: string;
+  label: string;
+  weight: number;
+  description: string;
+};
+
+type Rubric = {
+  pass_score?: number;
+  criteria: RubricCriterion[];
+};
+
+export function RoleplayPlayer({
+  moduleId,
+  moduleName,
+  trainingTitle = "",
+  personaName,
+  personaBlurb,
+  scenario,
+  mode,
+  rubric,
+  availableModes = [],
+  userChoiceMode = false,
+  scenarioIntroGif = null,
+  attemptInfo = null,
+  duration,
+  flow,
+  hints,
+  recordAv = false,
+  availableLanguages = [],
+  personaPortraitUrl = null,
+}: {
+  moduleId: string;
+  moduleName: string;
+  trainingTitle?: string;
+  personaName: string;
+  personaBlurb: string;
+  scenario: string;
+  mode: "text" | "voice" | "video";
+  rubric: Rubric;
+  availableModes?: PlayerMode[];
+  userChoiceMode?: boolean;
+  scenarioIntroGif?: { name: string; dataUrl: string } | null;
+  attemptInfo?: { used: number; limit: number } | null;
+  duration?: {
+    minMin: number;
+    maxMin: number;
+    autoDisconnect: boolean;
+    disconnectOnInactivity: boolean;
+    failBelowMin: boolean;
+  };
+  flow?: {
+    startBy: "ai" | "user" | "either";
+    endBy: "ai" | "user" | "either";
+  };
+  hints?: {
+    kind: "yes" | "no" | "limited";
+    limit: number;
+    type: "complete" | "bullet";
+  };
+  recordAv?: boolean;
+  /** Public https URL of the persona portrait. Resolved by the play
+   *  page (persona override > tenant default). When provided, the
+   *  audio-only roleplay surface renders it instead of initials. */
+  personaPortraitUrl?: string | null;
+  /** Languages the admin enabled on this persona. The trainee picks
+   *  one at the pre-session gate (only shown when 2+). Stored on the
+   *  RoleplaySession so the results page reads the actual choice. */
+  availableLanguages?: string[];
+}) {
+  const router = useRouter();
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [bubbles, setBubbles] = useState<Bubble[]>([]);
+  const [input, setInput] = useState("");
+  const [streaming, setStreaming] = useState(false);
+  const [ending, startEnd] = useTransition();
+  const [error, setError] = useState<string | null>(null);
+  const [coachHint, setCoachHint] = useState<CoachHint | null>(null);
+  const [coachLoading, setCoachLoading] = useState(false);
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const startedRef = useRef(false);
+
+  // Pre-session gating: when the admin attached a Scenario Intro GIF
+  // or asked the trainee to pick a mode, we render an overlay first
+  // and only fire /api/roleplay/start after the trainee proceeds.
+  const initialMode: PlayerMode | null = useMemo(() => {
+    if (userChoiceMode) return null;
+    if (availableModes.length > 0) return availableModes[0];
+    return null;
+  }, [availableModes, userChoiceMode]);
+  const [chosenMode, setChosenMode] = useState<PlayerMode | null>(initialMode);
+  const needsModePick = userChoiceMode && chosenMode === null;
+  // Language: when the persona only allows one language, auto-pick it
+  // silently. When multiple are configured, prompt at the gate.
+  const initialLanguage: string | null = useMemo(() => {
+    if (availableLanguages.length === 1) return availableLanguages[0];
+    return null;
+  }, [availableLanguages]);
+  const [chosenLanguage, setChosenLanguage] = useState<string | null>(
+    initialLanguage,
+  );
+  const needsLanguagePick =
+    availableLanguages.length > 1 && chosenLanguage === null;
+  const [introDismissed, setIntroDismissed] = useState(!scenarioIntroGif);
+  const sessionGated = needsModePick || needsLanguagePick || !introDismissed;
+
+  // Resolve the chosen player mode (or admin fallback) into the
+  // voice / avatar / webcam flags the existing player flow consumes.
+  const resolved = resolvePlayerFlags(chosenMode, mode);
+
+  // Voice mode is opt-in via the mic button. We default it on when the
+  // module was configured as voice/video so the admin's intent is
+  // honoured, but the trainee can always flip it.
+  const [voiceMode, setVoiceMode] = useState(resolved.voiceMode);
+  // Streaming avatar is opt-in via "Avatar" toggle; only meaningful
+  // when voice mode is on (the avatar IS the audio output). Default
+  // on for video mode, off for voice/text — the trainee can flip it.
+  const [avatarMode, setAvatarMode] = useState(resolved.avatarMode);
+  // Webcam preview tile — shown when the admin picked a mode that
+  // includes the user's video. Off for AI-only / audio.
+  const [userVideoOn, setUserVideoOn] = useState(resolved.userVideo);
+
+  // When the trainee picks a mode in the pre-session screen, commit
+  // it AND mirror the resolved flags into the three player-side
+  // toggles in one shot. Doing this in the event handler avoids the
+  // cascading-render lint rule that fires when we sync via useEffect.
+  function handlePickMode(m: PlayerMode) {
+    const next = resolvePlayerFlags(m, mode);
+    setChosenMode(m);
+    setVoiceMode(next.voiceMode);
+    setAvatarMode(next.avatarMode);
+    setUserVideoOn(next.userVideo);
+  }
+
+  // ───────── Duration & inactivity tracking ─────────
+  // Wall-clock start anchor for the session timer. Captured the first
+  // tick after the gate clears so the timer doesn't run while the
+  // intro / mode-picker is still up.
+  const sessionStartRef = useRef<number | null>(null);
+  const [elapsedSec, setElapsedSec] = useState(0);
+  const lastActivityRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    if (sessionStartRef.current === null) {
+      sessionStartRef.current = Date.now();
+    }
+    if (lastActivityRef.current === null) {
+      lastActivityRef.current = Date.now();
+    }
+    const t = setInterval(() => {
+      if (sessionStartRef.current !== null) {
+        setElapsedSec(
+          Math.round((Date.now() - sessionStartRef.current) / 1000),
+        );
+      }
+    }, 1000);
+    return () => clearInterval(t);
+  }, [sessionId]);
+
+  const minSec = duration ? duration.minMin * 60 : 0;
+  const maxSec = duration ? duration.maxMin * 60 : 0;
+  const minReached = duration ? elapsedSec >= minSec : true;
+  const maxReached = duration ? elapsedSec >= maxSec : false;
+  // Derive a TTS gender hint from the persona blurb so a "Priya, CFO…"
+  // persona gets a female voice instead of Windows' default Microsoft
+  // David. Falls back to null (browser default) when nothing matches.
+  const personaGender = useMemo(
+    () => derivePersonaGender(personaName, personaBlurb),
+    [personaName, personaBlurb],
+  );
+  // Manual voice override — trainee picks via the dropdown next to
+  // the mic. Persists per-tab in sessionStorage so a refresh keeps
+  // their choice but switching personas / modules resets cleanly.
+  const voiceOverrideKey = `roleplay.voiceUri.${moduleId}`;
+  const [manualVoiceUri, setManualVoiceUri] = useState<string | null>(null);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const saved = window.sessionStorage.getItem(voiceOverrideKey);
+    if (saved) setManualVoiceUri(saved);
+  }, [voiceOverrideKey]);
+  function handlePickVoice(uri: string | null) {
+    setManualVoiceUri(uri);
+    if (typeof window === "undefined") return;
+    if (uri) window.sessionStorage.setItem(voiceOverrideKey, uri);
+    else window.sessionStorage.removeItem(voiceOverrideKey);
+  }
+  const voice = useVoiceMode({
+    enabled: voiceMode,
+    voiceGender: personaGender,
+    voiceUri: manualVoiceUri,
+    onTranscript: (text) => {
+      // The hook calls this when STT finishes a chunk. Stick it
+      // straight into the composer and auto-submit so the loop
+      // closes — learner speaks → we send → AI streams → we TTS → loop.
+      setInput(text);
+      void sendText(text);
+    },
+  });
+
+  // Auto-flow ("demo conversation") — when on, the player runs the
+  // entire roleplay hands-off: persona speaks → a short beat → hint
+  // is fetched → hint is spoken back in a DIFFERENT voice (the
+  // learner voice) → hint is auto-submitted as the trainee's turn
+  // → persona responds → loop. Lets the trainee watch and listen to
+  // a model conversation instead of having to drive every turn.
+  const [autoFlow, setAutoFlow] = useState(false);
+  const autoFlowRef = useRef(autoFlow);
+  autoFlowRef.current = autoFlow;
+  // Pick a "learner" voice that's distinct from the persona's so the
+  // two sides of the conversation sound like different people. Falls
+  // through to null (the picker's selected voice) when nothing matches.
+  const learnerVoiceUri = useMemo(() => {
+    if (voice.availableVoices.length === 0) return null;
+    const want =
+      personaGender === "female"
+        ? "male"
+        : personaGender === "male"
+          ? "female"
+          : null;
+    if (!want) return null;
+    const match = voice.availableVoices.find(
+      (v) => v.gender === want && v.uri !== voice.selectedVoiceUri,
+    );
+    return match?.uri ?? null;
+  }, [voice.availableVoices, voice.selectedVoiceUri, personaGender]);
+  const learnerVoiceUriRef = useRef<string | null>(null);
+  learnerVoiceUriRef.current = learnerVoiceUri;
+  const avatar = useStreamingAvatar({
+    enabled: voiceMode && avatarMode,
+    moduleId,
+  });
+  // Refs so the bubble-effect can read live values without re-running.
+  const avatarRef = useRef(avatar);
+  avatarRef.current = avatar;
+  // Track which bubbles we've already spoken so a re-render doesn't
+  // make the avatar repeat itself.
+  const spokenIdxRef = useRef<Set<number>>(new Set());
+  // Live cursor into the streaming persona bubble — how many chars have
+  // already been pushed to avatar.speak(). Lets us flush completed
+  // sentences as they arrive instead of waiting for the whole message.
+  const streamingPersonaIdxRef = useRef<number>(-1);
+  const streamingContentRef = useRef<string>("");
+  const incrementalSpokenLenRef = useRef<Map<number, number>>(new Map());
+  // Pause the auto-listen loop while ending so we don't trigger a mic
+  // session after the player has already navigated away.
+  const stoppingRef = useRef(false);
+
+  useEffect(() => {
+    if (startedRef.current) return;
+    if (sessionGated) return;
+    startedRef.current = true;
+    (async () => {
+      try {
+        const res = await fetch("/api/roleplay/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            moduleId,
+            // Persist the language the trainee picked at the gate so
+            // the results page can show what was actually selected
+            // rather than the persona's first configured option.
+            language: chosenLanguage ?? undefined,
+          }),
+        });
+        if (!res.ok) {
+          const data = (await res.json().catch(() => ({}))) as {
+            error?: string;
+            used?: number;
+            limit?: number;
+          };
+          if (data.error === "attempt_limit_reached") {
+            throw new Error(
+              `Attempt limit reached — you've used ${data.used} of ${data.limit}.`,
+            );
+          }
+          throw new Error(data.error ?? `start failed: ${res.status}`);
+        }
+        const data: { sessionId: string; opening: string | null } =
+          await res.json();
+        setSessionId(data.sessionId);
+        // When the admin set "Start Roleplay By" = User, the start
+        // route returns opening=null and the trainee speaks first.
+        if (data.opening) {
+          setBubbles([{ role: "persona", content: data.opening }]);
+        } else {
+          setBubbles([]);
+        }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to start");
+      }
+    })();
+  }, [moduleId, sessionGated]);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({
+      top: scrollRef.current.scrollHeight,
+      behavior: "smooth",
+    });
+  }, [bubbles]);
+
+  // When the admin set "Start Roleplay By" = User the start route
+  // returns opening=null, so the speak-then-listen effect below never
+  // fires (no persona bubble to speak). Open the mic once on session
+  // start so the trainee's first line gets captured automatically
+  // instead of waiting for them to click the mic icon.
+  const userStartListenedRef = useRef(false);
+  useEffect(() => {
+    if (userStartListenedRef.current) return;
+    if (!sessionId) return;
+    if (bubbles.length !== 0) return;
+    if (!voiceMode || !voice.sttSupported) return;
+    userStartListenedRef.current = true;
+    voice.startListening();
+  }, [sessionId, bubbles.length, voiceMode, voice]);
+
+  async function send() {
+    if (!input.trim()) return;
+    await sendText(input.trim());
+  }
+
+  // Push every complete sentence in the current streaming bubble that
+  // hasn't been spoken yet to the avatar. Cheap to call after every
+  // network chunk — it walks the new tail, slices off sentences with
+  // terminal punctuation, and advances the per-bubble cursor.
+  // Only fires when the live D-ID avatar is the target — browser TTS
+  // (voice.speak) still runs in the post-stream effect because it
+  // can't lip-sync mid-stream the way D-ID can.
+  function pushIncrementalSpeak(bubbleIdx: number) {
+    if (!voiceMode || !avatarMode) return;
+    const av = avatarRef.current;
+    const offset = incrementalSpokenLenRef.current.get(bubbleIdx) ?? 0;
+    const full = streamingContentRef.current;
+    const tail = full.slice(offset);
+    const sentences = splitCompleteSentences(tail);
+    if (sentences.length === 0) return;
+    const consumed = sentences.reduce((sum, s) => sum + s.length, 0);
+    incrementalSpokenLenRef.current.set(bubbleIdx, offset + consumed);
+    for (const s of sentences) void av.speak(s);
+  }
+
+  // End-of-stream flush. Sends any final un-terminated text (e.g. the
+  // model dropped the last sentence without a period) and marks the
+  // bubble as fully spoken so the post-stream voice-loop effect skips
+  // it instead of double-speaking the whole thing.
+  function flushFinalSpeak(bubbleIdx: number) {
+    if (!voiceMode || !avatarMode) return;
+    const av = avatarRef.current;
+    const offset = incrementalSpokenLenRef.current.get(bubbleIdx) ?? 0;
+    const remainder = streamingContentRef.current.slice(offset).trim();
+    if (remainder) void av.speak(remainder);
+    spokenIdxRef.current.add(bubbleIdx);
+  }
+
+  async function sendText(userMessage: string) {
+    if (!sessionId || streaming || !userMessage.trim()) return;
+    setInput("");
+    setError(null);
+
+    // Track the persona bubble idx so we can push completed sentences
+    // to the avatar as they stream — index = current length + 1
+    // (we're about to append [learner, persona]).
+    const personaIdx = bubbles.length + 1;
+    streamingPersonaIdxRef.current = personaIdx;
+    streamingContentRef.current = "";
+    incrementalSpokenLenRef.current.set(personaIdx, 0);
+
+    setBubbles((b) => [
+      ...b,
+      { role: "learner", content: userMessage },
+      { role: "persona", content: "" },
+    ]);
+    setStreaming(true);
+
+    try {
+      const res = await fetch("/api/roleplay/turn", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId, userMessage }),
+      });
+      if (!res.ok || !res.body) throw new Error(`turn failed: ${res.status}`);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        streamingContentRef.current += chunk;
+        setBubbles((b) => {
+          const next = [...b];
+          const last = next[next.length - 1];
+          if (last && last.role === "persona") {
+            next[next.length - 1] = {
+              role: "persona",
+              content: last.content + chunk,
+            };
+          }
+          return next;
+        });
+        pushIncrementalSpeak(personaIdx);
+      }
+      flushFinalSpeak(personaIdx);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to send");
+      setBubbles((b) =>
+        b[b.length - 1]?.role === "persona" && b[b.length - 1]?.content === ""
+          ? b.slice(0, -1)
+          : b,
+      );
+    } finally {
+      setStreaming(false);
+      // Live coach: poll the fast model after every *other* learner turn.
+      // Fire-and-forget — coach failures never block the player.
+      const learnerTurns =
+        bubbles.filter((b) => b.role === "learner").length + 1;
+      if (learnerTurns >= 2 && learnerTurns % 2 === 0) {
+        void pollCoach(learnerTurns);
+      }
+    }
+  }
+
+  // Voice loop: when a persona bubble finishes streaming, speak it,
+  // then either (a) open the mic for the trainee or (b) trigger the
+  // auto-flow step that speaks the suggested reply and submits it.
+  // Skips bubbles we've already spoken so re-renders don't make the
+  // avatar repeat.
+  useEffect(() => {
+    if (!voiceMode || streaming || stoppingRef.current) return;
+    const lastIdx = bubbles.length - 1;
+    if (lastIdx < 0) return;
+    const last = bubbles[lastIdx];
+    if (last.role !== "persona") return;
+    if (last.content.trim().length === 0) return;
+    if (spokenIdxRef.current.has(lastIdx)) return;
+    spokenIdxRef.current.add(lastIdx);
+    (async () => {
+      // If the streaming avatar is connected, push text to HeyGen so
+      // the avatar speaks it (and we don't double-up with browser TTS).
+      // Otherwise fall back to the browser SpeechSynthesis.
+      const av = avatarRef.current;
+      if (av.state === "ready" || av.state === "speaking") {
+        // Sentence-by-sentence so D-ID can start the first one before
+        // the rest are even queued. Mid-stream chunks are already
+        // flushed by pushIncrementalSpeak; this branch only fires for
+        // non-streamed bubbles (the opening, or replays after errors).
+        const sentences = splitCompleteSentences(last.content);
+        if (sentences.length === 0) {
+          await av.speak(last.content);
+        } else {
+          for (const s of sentences) await av.speak(s);
+          const consumed = sentences.reduce((sum, s) => sum + s.length, 0);
+          const tail = last.content.slice(consumed).trim();
+          if (tail) await av.speak(tail);
+        }
+      } else {
+        await voice.speak(last.content);
+      }
+      // Branch: auto-flow takes over the trainee's turn; manual mode
+      // opens the mic so the trainee can speak themselves.
+      if (autoFlowRef.current) {
+        void runAutoFlowAfterPersona();
+        return;
+      }
+      // Speak resolves even when TTS isn't supported / cancelled.
+      // Only auto-listen if we're still in voice mode + nothing's
+      // happening. Skip when STT isn't supported (Firefox) — the
+      // user can still type.
+      if (
+        voiceMode &&
+        !stoppingRef.current &&
+        voice.sttSupported &&
+        !streaming
+      ) {
+        voice.startListening();
+      }
+    })();
+    // runAutoFlowAfterPersona is read via ref-stable closures (autoFlowRef,
+    // learnerVoiceUriRef) so it doesn't need to be in deps.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bubbles, voiceMode, streaming, voice]);
+
+  async function pollCoach(currentTurn: number) {
+    if (!sessionId) return;
+    setCoachLoading(true);
+    try {
+      const res = await fetch("/api/roleplay/coach", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId }),
+      });
+      if (!res.ok) return;
+      const data: { hint: string | null; tone: "tip" | "warn" } =
+        await res.json();
+      if (data.hint) {
+        setCoachHint({ hint: data.hint, tone: data.tone, turn: currentTurn });
+      }
+    } catch {
+      // silent — coach is optional UX
+    } finally {
+      setCoachLoading(false);
+    }
+  }
+
+  // ───────── Audio recording (recordAv) ─────────
+  // Captures the trainee-side microphone for the duration of the
+  // session and uploads the blob right before /api/roleplay/end fires.
+  // Uses MediaRecorder + getUserMedia({audio:true}) — a fresh stream
+  // independent of the voice-mode STT pipeline so the two don't fight
+  // over track ownership. Declared above end() so end() can call
+  // flushRecording() in source order (function hoisting works at
+  // runtime, but the linter prefers explicit ordering).
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recordStreamRef = useRef<MediaStream | null>(null);
+  const recordChunksRef = useRef<Blob[]>([]);
+  const recordingStartedRef = useRef(false);
+  const [recordingStatus, setRecordingStatus] = useState<
+    "idle" | "recording" | "uploading" | "saved" | "failed"
+  >("idle");
+
+  useEffect(() => {
+    if (!recordAv || !sessionId || recordingStartedRef.current) return;
+    if (typeof window === "undefined") return;
+    if (typeof MediaRecorder === "undefined") {
+      // Older browser — recording silently disabled. Don't block the
+      // session; the admin can adjust the setting if needed.
+      return;
+    }
+    recordingStartedRef.current = true;
+    (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+        });
+        recordStreamRef.current = stream;
+        const mime = pickRecorderMime();
+        const recorder = mime
+          ? new MediaRecorder(stream, { mimeType: mime })
+          : new MediaRecorder(stream);
+        recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) recordChunksRef.current.push(e.data);
+        };
+        // 1-second timeslices so a sudden tab close still leaves the
+        // first few seconds in memory for the next upload attempt.
+        recorder.start(1000);
+        recorderRef.current = recorder;
+        setRecordingStatus("recording");
+      } catch (e) {
+        // Mic denied or unavailable — keep the session going. The
+        // recording feature degrades gracefully; admins should not
+        // tie completion logic to its presence.
+        console.warn("[recording] start failed:", e);
+        setRecordingStatus("failed");
+      }
+    })();
+    return () => {
+      const r = recorderRef.current;
+      if (r && r.state !== "inactive") {
+        try {
+          r.stop();
+        } catch {
+          /* ignore — already stopped */
+        }
+      }
+      const s = recordStreamRef.current;
+      if (s) s.getTracks().forEach((t) => t.stop());
+    };
+  }, [recordAv, sessionId]);
+
+  async function flushRecording(): Promise<void> {
+    if (!sessionId) return;
+    const recorder = recorderRef.current;
+    if (!recorder || recorder.state === "inactive") return;
+    setRecordingStatus("uploading");
+    await new Promise<void>((resolve) => {
+      recorder.onstop = () => resolve();
+      try {
+        recorder.stop();
+      } catch {
+        resolve();
+      }
+    });
+    const stream = recordStreamRef.current;
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    const chunks = recordChunksRef.current;
+    if (chunks.length === 0) {
+      setRecordingStatus("failed");
+      return;
+    }
+    const blob = new Blob(chunks, { type: chunks[0].type || "audio/webm" });
+    recordChunksRef.current = [];
+    const ext = blob.type.includes("webm")
+      ? "webm"
+      : blob.type.includes("ogg")
+        ? "ogg"
+        : blob.type.includes("mp4")
+          ? "m4a"
+          : "webm";
+    const fd = new FormData();
+    fd.set("sessionId", sessionId);
+    fd.set("file", blob, `roleplay-${sessionId}.${ext}`);
+    try {
+      const res = await fetch("/api/roleplay/recording", {
+        method: "POST",
+        body: fd,
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as {
+          error?: string;
+        };
+        throw new Error(data.error ?? `upload failed: ${res.status}`);
+      }
+      setRecordingStatus("saved");
+    } catch (e) {
+      console.warn("[recording] upload failed:", e);
+      setRecordingStatus("failed");
+    }
+  }
+
+  function end() {
+    if (!sessionId || ending) return;
+    // Pause the voice loop so a queued TTS-then-listen cycle doesn't
+    // fire after the player has already navigated away.
+    stoppingRef.current = true;
+    voice.cancelSpeech();
+    voice.stopListening();
+    startEnd(async () => {
+      try {
+        // Upload the audio recording (if recording was active) BEFORE
+        // hitting /end. Failures here are non-fatal — the session
+        // ends either way; only the playback affordance is lost.
+        if (recordAv) {
+          await flushRecording();
+        }
+        const res = await fetch("/api/roleplay/end", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId }),
+        });
+        if (!res.ok) throw new Error(`end failed: ${res.status}`);
+        const data: { redirect: string } = await res.json();
+        router.push(data.redirect);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to end");
+        stoppingRef.current = false;
+      }
+    });
+  }
+
+  // Auto-disconnect when the duration cap is hit. Skips if the admin
+  // didn't opt in or the cap is already past — we don't want repeated
+  // end() calls if the user is mid-navigation.
+  const endedFiredRef = useRef(false);
+  useEffect(() => {
+    if (!duration?.autoDisconnect) return;
+    if (!sessionId || ending || endedFiredRef.current) return;
+    if (!maxReached) return;
+    endedFiredRef.current = true;
+    end();
+    // end() is stable for the duration of the session; ESLint can't see
+    // that, so we deliberately scope deps to the trigger inputs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [maxReached, sessionId, ending, duration?.autoDisconnect]);
+
+  // Bump the activity ref every time a turn lands — either side counts.
+  useEffect(() => {
+    lastActivityRef.current = Date.now();
+  }, [bubbles.length]);
+
+  // Inactivity watchdog. 30s idle in a non-streaming state ends the
+  // session. Only active when the admin enabled it AND the session has
+  // started AND we're not already mid-end.
+  useEffect(() => {
+    if (!duration?.disconnectOnInactivity) return;
+    if (!sessionId || ending || endedFiredRef.current) return;
+    const t = setInterval(() => {
+      if (streaming || lastActivityRef.current === null) {
+        lastActivityRef.current = Date.now();
+        return;
+      }
+      const idleMs = Date.now() - lastActivityRef.current;
+      if (idleMs >= 30_000) {
+        endedFiredRef.current = true;
+        end();
+      }
+    }, 5_000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, ending, streaming, duration?.disconnectOnInactivity]);
+
+  // ───────── Hints ─────────
+  // Track the count of trainee-requested hints used in this attempt
+  // (separate from the auto-coach hints, which always populate
+  // coachHint regardless of the admin's hint setting). The current
+  // hint string is rendered in its own card so a trainee can always
+  // re-read it while typing their next reply.
+  const [hintsUsed, setHintsUsed] = useState(0);
+  const [currentHint, setCurrentHint] = useState<string | null>(null);
+  const [hintLoading, setHintLoading] = useState(false);
+  const [hintError, setHintError] = useState<string | null>(null);
+
+  const hintsAllowed = hints && hints.kind !== "no";
+  const hintsLimited = hints?.kind === "limited";
+  const hintsRemaining = hintsLimited ? hints.limit - hintsUsed : Infinity;
+  const hintsExhausted = hintsLimited && hintsRemaining <= 0;
+
+  async function requestHint() {
+    if (!sessionId || hintLoading || !hintsAllowed || hintsExhausted) return;
+    setHintError(null);
+    setHintLoading(true);
+    try {
+      const res = await fetch("/api/roleplay/hint", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId,
+          type: hints?.type ?? "complete",
+        }),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(data.error ?? `hint failed: ${res.status}`);
+      }
+      const data = (await res.json()) as { hint: string };
+      setCurrentHint(data.hint);
+      setHintsUsed((n) => n + 1);
+    } catch (e) {
+      setHintError(e instanceof Error ? e.message : "Failed");
+    } finally {
+      setHintLoading(false);
+    }
+  }
+
+  // Auto-load the first hint so the trainee can read the exact words
+  // to say without hunting for the button. Two firing conditions cover
+  // both flows:
+  //   - AI starts: wait for the persona's opening line to finish, then
+  //     fetch a response suggestion grounded in what they just said.
+  //   - User starts: fire immediately on session ready — the hint API
+  //     handles the "no turns yet" case and returns an opening line.
+  // Fires once per session, respects hint-limit caps, and skips
+  // entirely if the admin disabled hints.
+  const autoHintFiredRef = useRef(false);
+  useEffect(() => {
+    if (autoHintFiredRef.current) return;
+    if (!sessionId) return;
+    if (!hintsAllowed || hintsExhausted) return;
+    if (streaming || hintLoading) return;
+    if (currentHint) return;
+    const last = bubbles[bubbles.length - 1];
+    const personaOpened =
+      last && last.role === "persona" && last.content.trim().length > 0;
+    const userStartsEmpty =
+      flow?.startBy === "user" && bubbles.length === 0;
+    if (!personaOpened && !userStartsEmpty) return;
+    autoHintFiredRef.current = true;
+    void requestHint();
+    // requestHint is stable enough for this single-shot trigger; deps
+    // intentionally omit it to avoid re-running on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    sessionId,
+    bubbles,
+    streaming,
+    hintsAllowed,
+    hintsExhausted,
+    hintLoading,
+    currentHint,
+    flow?.startBy,
+  ]);
+
+  // ───────── Auto-flow orchestrator ─────────
+  // Drives the hands-off conversation: after the persona finishes
+  // speaking we wait a beat, pull a fresh hint, speak it back in the
+  // learner voice, and submit it as the trainee's turn. Each call is
+  // gated by a running-ref so a re-trigger mid-step doesn't fork.
+  const autoFlowRunningRef = useRef(false);
+
+  async function fetchHintNow(): Promise<string | null> {
+    if (!sessionId || !hintsAllowed || hintsExhausted) return null;
+    setHintError(null);
+    setHintLoading(true);
+    try {
+      const res = await fetch("/api/roleplay/hint", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId,
+          type: hints?.type ?? "complete",
+        }),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(data.error ?? `hint failed: ${res.status}`);
+      }
+      const data = (await res.json()) as { hint: string };
+      setCurrentHint(data.hint);
+      setHintsUsed((n) => n + 1);
+      return data.hint;
+    } catch (e) {
+      setHintError(e instanceof Error ? e.message : "Failed");
+      return null;
+    } finally {
+      setHintLoading(false);
+    }
+  }
+
+  async function runAutoFlowAfterPersona() {
+    if (autoFlowRunningRef.current) return;
+    if (!autoFlowRef.current || stoppingRef.current) return;
+    autoFlowRunningRef.current = true;
+    let bailed = false;
+    try {
+      // Make sure the mic isn't capturing the AI voice while we drive
+      // the conversation.
+      voice.stopListening();
+
+      // Pause briefly so the conversation doesn't feel robotic.
+      await new Promise((r) => setTimeout(r, 700));
+      if (!autoFlowRef.current || stoppingRef.current) {
+        bailed = true;
+        return;
+      }
+
+      // Need a hint to speak as the learner's reply. Hints disabled or
+      // exhausted? Fall back to opening the mic so the trainee can
+      // continue manually instead of stalling.
+      if (!hintsAllowed || hintsExhausted) {
+        if (voice.sttSupported && !stoppingRef.current) {
+          voice.startListening();
+        }
+        return;
+      }
+      const hint = await fetchHintNow();
+      if (!hint || !autoFlowRef.current || stoppingRef.current) {
+        bailed = true;
+        return;
+      }
+
+      // Speak the hint in the learner voice so the two sides sound
+      // like different people. Falls back to the default voice when
+      // the browser doesn't have a contrasting voice available.
+      await voice.speak(hint, { voiceUri: learnerVoiceUriRef.current });
+      if (!autoFlowRef.current || stoppingRef.current) {
+        bailed = true;
+        return;
+      }
+
+      // Tiny beat before submitting so the persona's reply doesn't
+      // clobber the tail of the spoken hint.
+      await new Promise((r) => setTimeout(r, 400));
+      if (!autoFlowRef.current || stoppingRef.current) {
+        bailed = true;
+        return;
+      }
+
+      await sendText(hint);
+    } finally {
+      autoFlowRunningRef.current = false;
+      // If we bailed because the trainee turned auto-flow off mid-step,
+      // hand the mic back so they can speak immediately instead of
+      // sitting on a dead screen waiting to click.
+      if (
+        bailed &&
+        !autoFlowRef.current &&
+        !stoppingRef.current &&
+        voiceMode &&
+        voice.sttSupported
+      ) {
+        voice.startListening();
+      }
+    }
+  }
+
+  // User-starts flow + auto-flow: there's no persona bubble to trigger
+  // off, so kick the first auto-flow step the moment the session is
+  // live. The persona-TTS effect handles all subsequent turns.
+  const autoFlowKickedRef = useRef(false);
+  useEffect(() => {
+    if (!autoFlow) {
+      autoFlowKickedRef.current = false;
+      return;
+    }
+    if (autoFlowKickedRef.current) return;
+    if (!sessionId || streaming) return;
+    if (flow?.startBy !== "user") return;
+    if (bubbles.length !== 0) return;
+    autoFlowKickedRef.current = true;
+    void runAutoFlowAfterPersona();
+    // runAutoFlowAfterPersona reads live values via refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoFlow, sessionId, streaming, bubbles.length, flow?.startBy]);
+
+  // Toggle-transition handler — covers the modes the persona-TTS effect
+  // can't see (it only fires on bubble change). When the trainee flips
+  // OFF→ON between turns, kick the orchestrator now so the next reply
+  // doesn't sit waiting for the next bubble. When they flip ON→OFF,
+  // make sure TTS is silenced and the mic opens if the persona has
+  // already spoken.
+  const prevAutoFlowRef = useRef(false);
+  useEffect(() => {
+    const prev = prevAutoFlowRef.current;
+    if (prev === autoFlow) return;
+    prevAutoFlowRef.current = autoFlow;
+
+    if (autoFlow) {
+      // OFF → ON: silence any open mic and, if the persona has already
+      // finished its last line, drive the next learner turn now.
+      voice.stopListening();
+      if (
+        !autoFlowRunningRef.current &&
+        sessionId &&
+        !streaming &&
+        !stoppingRef.current
+      ) {
+        const last = bubbles[bubbles.length - 1];
+        if (last?.role === "persona" && last.content.trim().length > 0) {
+          void runAutoFlowAfterPersona();
+        }
+      }
+    } else {
+      // ON → OFF: stop any in-flight TTS, then hand the mic back if
+      // we're between turns. If the orchestrator is mid-step, its
+      // `finally` bail-out opens the mic — don't double-fire here.
+      voice.cancelSpeech();
+      if (
+        !autoFlowRunningRef.current &&
+        sessionId &&
+        !streaming &&
+        !stoppingRef.current &&
+        voiceMode &&
+        voice.sttSupported
+      ) {
+        const last = bubbles[bubbles.length - 1];
+        if (last?.role === "persona") {
+          voice.startListening();
+        }
+      }
+    }
+    // runAutoFlowAfterPersona reads live values via refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoFlow, sessionId, streaming, voiceMode, bubbles]);
+
+  function handleToggleAutoFlow() {
+    const next = !autoFlow;
+    setAutoFlow(next);
+    // Auto-flow needs TTS to run; flip voice mode on if it's off so the
+    // first persona line speaks aloud instead of just rendering as text.
+    // The transition effect above handles silencing / mic hand-off so
+    // we don't duplicate that logic here.
+    if (next && !voiceMode) {
+      setVoiceMode(true);
+    }
+  }
+
+  function handleEndClick() {
+    if (
+      duration?.failBelowMin &&
+      duration.minMin > 0 &&
+      !minReached &&
+      sessionId
+    ) {
+      const remaining = Math.max(0, minSec - elapsedSec);
+      const mm = Math.floor(remaining / 60);
+      const ss = remaining % 60;
+      const ok = window.confirm(
+        `You're below the ${duration.minMin}-minute minimum (${mm}:${ss
+          .toString()
+          .padStart(2, "0")} left). Ending now will mark this attempt as failed. Continue anyway?`,
+      );
+      if (!ok) return;
+    }
+    end();
+  }
+
+  const turnsTaken = Math.floor(
+    bubbles.filter((b) => b.role === "learner").length,
+  );
+
+  if (sessionGated) {
+    return (
+      <PreSessionGate
+        moduleName={moduleName}
+        introGif={scenarioIntroGif}
+        introDismissed={introDismissed}
+        onDismissIntro={() => setIntroDismissed(true)}
+        needsModePick={needsModePick}
+        availableModes={availableModes}
+        chosenMode={chosenMode}
+        onPickMode={handlePickMode}
+        needsLanguagePick={needsLanguagePick}
+        availableLanguages={availableLanguages}
+        chosenLanguage={chosenLanguage}
+        onPickLanguage={setChosenLanguage}
+      />
+    );
+  }
+
+  // Latest persona bubble drives the Caption panel — the trainee
+  // always sees what the AI just said (or is currently streaming).
+  const lastPersonaBubble = [...bubbles]
+    .reverse()
+    .find((b) => b.role === "persona");
+  const captionText = lastPersonaBubble?.content ?? "";
+  const captionThinking =
+    streaming &&
+    bubbles[bubbles.length - 1]?.role === "persona" &&
+    bubbles[bubbles.length - 1]?.content === "";
+
+  const personaShort = personaName.split(",")[0];
+  const personaRole = derivePersonaRole(personaName);
+  const showMicListening =
+    voiceMode && voice.sttSupported && voice.state === "listening";
+
+  return (
+    <div className="space-y-4 pb-24">
+      {/* Header — Role Play title + timer (left), module/scenario tags (right) */}
+      <header className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-3 min-w-0">
+          <h1
+            className="font-display text-[22px] leading-none -tracking-[0.01em]"
+            style={{ color: "#5b2eea" }}
+          >
+            Role Play
+          </h1>
+          {duration ? (
+            <TimerPill
+              elapsedSec={elapsedSec}
+              maxSec={maxSec}
+              maxReached={maxReached}
+            />
+          ) : null}
+          {attemptInfo ? (
+            <span
+              className="text-[11px] font-semibold uppercase tracking-[0.08em] px-2 py-[3px] rounded-sm border bg-surface-2 text-ink-2 border-border"
+              title="Attempts used of the trainer's cap"
+            >
+              Attempt {attemptInfo.used + 1} / {attemptInfo.limit}
+            </span>
+          ) : null}
+          {recordAv ? (
+            <span
+              className={cn(
+                "inline-flex items-center gap-1 text-[10.5px] font-semibold uppercase tracking-[0.08em] px-2 py-[3px] rounded-sm border",
+                recordingStatus === "recording"
+                  ? "bg-bad-pale text-bad border-bad/20"
+                  : recordingStatus === "uploading"
+                    ? "bg-warn-pale text-warn border-warn/20"
+                    : recordingStatus === "saved"
+                      ? "bg-good-pale text-good border-good/20"
+                      : "bg-surface-2 text-ink-3 border-border",
+              )}
+              title={
+                recordingStatus === "recording"
+                  ? "Audio is being recorded — uploaded when the session ends."
+                  : recordingStatus === "uploading"
+                    ? "Uploading the recording…"
+                    : recordingStatus === "saved"
+                      ? "Recording saved to your results page."
+                      : recordingStatus === "failed"
+                        ? "Recording unavailable (mic denied or upload failed)."
+                        : "Recording…"
+              }
+            >
+              <span
+                className={cn(
+                  "inline-block w-1.5 h-1.5 rounded-full",
+                  recordingStatus === "recording"
+                    ? "bg-bad animate-pulse"
+                    : "bg-current",
+                )}
+                aria-hidden
+              />
+              REC
+            </span>
+          ) : null}
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          {trainingTitle ? (
+            <TopicPill icon="training" label={trainingTitle} />
+          ) : null}
+          <TopicPill icon="layers" label={moduleName} />
+        </div>
+      </header>
+
+      {/* Body — left video tiles + right Caption/Hint panels */}
+      <div
+        className="grid gap-4 items-start"
+        style={{ gridTemplateColumns: "360px minmax(0, 1fr)" }}
+      >
+        {/* Left column — stacked video tiles */}
+        <div className="space-y-4">
+          <VideoTile
+            label={personaRole || personaShort}
+            isActive={!streaming && captionText.length > 0}
+            cornerAction={
+              avatarMode ? (
+                <button
+                  type="button"
+                  onClick={() => setAvatarMode(false)}
+                  suppressHydrationWarning
+                  className="px-2.5 py-[5px] rounded-md text-[10.5px] font-semibold text-white"
+                  style={{ background: "#5b2eea" }}
+                >
+                  Show Audio Only
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setAvatarMode(true)}
+                  suppressHydrationWarning
+                  className="px-2.5 py-[5px] rounded-md text-[10.5px] font-semibold text-white"
+                  style={{ background: "#5b2eea" }}
+                >
+                  Show Video
+                </button>
+              )
+            }
+          >
+            {avatarMode ? (
+              <PersonaVideoSurface
+                attach={avatar.attach}
+                state={avatar.state}
+                error={avatar.error}
+                fallbackName={personaShort}
+              />
+            ) : (
+              <PersonaAudioSurface
+                speaking={voice.state === "speaking" || streaming}
+                name={personaShort}
+                portraitUrl={personaPortraitUrl}
+              />
+            )}
+          </VideoTile>
+
+          <VideoTile label="You" isActive={showMicListening}>
+            {userVideoOn ? (
+              <UserVideoSurface />
+            ) : (
+              <UserAvatarSurface
+                listening={showMicListening}
+                name="You"
+              />
+            )}
+          </VideoTile>
+        </div>
+
+        {/* Right column — Caption (tabs) + Hint */}
+        <div className="space-y-4">
+          <CaptionPanel
+            captionText={captionText}
+            captionThinking={captionThinking}
+            personaName={personaName}
+            personaBlurb={personaBlurb}
+            personaShort={personaShort}
+            scenario={scenario}
+            sessionWaiting={!sessionId}
+            flowStartByUser={flow?.startBy === "user"}
+          />
+
+          {hintsAllowed ? (
+            <HintPanel
+              hint={currentHint}
+              hintType={hints?.type ?? "complete"}
+              loading={hintLoading}
+              error={hintError}
+              exhausted={hintsExhausted}
+              onRequest={requestHint}
+              disabled={!sessionId || hintLoading || hintsExhausted}
+              hintsUsed={hintsUsed}
+              hintsLimit={hintsLimited ? hints!.limit : null}
+            />
+          ) : null}
+
+          {coachHint ? (
+            <CoachInline hint={coachHint} loading={coachLoading} />
+          ) : null}
+
+          {/* Text composer — voice/avatar modes hide this in favor of the mic */}
+          {!voiceMode ? (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                void send();
+              }}
+              className="rounded-[14px] border border-border bg-surface px-4 py-3 flex items-end gap-2"
+            >
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void send();
+                  }
+                }}
+                placeholder={
+                  sessionId
+                    ? `Reply to ${personaShort}… (Enter to send)`
+                    : "Waiting for opening…"
+                }
+                disabled={!sessionId || streaming}
+                rows={2}
+                className={cn(
+                  "flex-1 resize-none bg-surface border border-border-strong rounded-md",
+                  "px-3 py-[9px] text-[13px] focus:outline-none focus:border-accent",
+                  "disabled:opacity-60",
+                )}
+                suppressHydrationWarning
+              />
+              <Button
+                variant="accent"
+                size="md"
+                type="submit"
+                disabled={!sessionId || streaming || !input.trim()}
+              >
+                <Icon name="play" size={12} />
+                Send
+              </Button>
+            </form>
+          ) : null}
+        </div>
+      </div>
+
+      {/* Bottom inline status — turns, rubric link, AI-ends note */}
+      <div className="flex items-center justify-center gap-3 text-[11.5px] text-ink-3 font-mono">
+        <span>{turnsTaken} {turnsTaken === 1 ? "turn" : "turns"}</span>
+        {flow?.endBy === "ai" ? (
+          <span title="The persona ends this roleplay — wait for them to wrap up.">
+            · AI ends the call
+          </span>
+        ) : null}
+        <ModePill mode={mode} />
+      </div>
+
+      {error ? (
+        <div className="text-[12px] text-bad font-mono text-center">
+          {error}
+        </div>
+      ) : null}
+
+      {/* Floating call controls — mic + end-call, centered */}
+      <CallControlsBar
+        voiceMode={voiceMode}
+        voiceState={voice.state}
+        voiceSttSupported={voice.sttSupported}
+        voiceTtsSupported={voice.ttsSupported}
+        streaming={streaming}
+        sessionReady={!!sessionId}
+        ending={ending}
+        availableVoices={voice.availableVoices}
+        selectedVoiceUri={voice.selectedVoiceUri}
+        onPickVoice={handlePickVoice}
+        autoFlow={autoFlow}
+        autoFlowAvailable={Boolean(hintsAllowed) && voice.ttsSupported}
+        onToggleAutoFlow={handleToggleAutoFlow}
+        onToggleVoice={() => {
+          const next = !voiceMode;
+          setVoiceMode(next);
+          if (!next) {
+            voice.cancelSpeech();
+            voice.stopListening();
+          }
+        }}
+        onStartListen={voice.startListening}
+        onStopListen={voice.stopListening}
+        onEnd={handleEndClick}
+      />
+
+      {/* Scoring rubric — collapsed under the fold, kept available */}
+      {rubric.criteria.length > 0 ? (
+        <details className="rounded-[14px] border border-border bg-surface p-4">
+          <summary className="cursor-pointer text-[11px] font-bold uppercase tracking-[0.1em] text-ink-3">
+            What we&apos;re scoring
+          </summary>
+          <div className="mt-3 space-y-2">
+            {rubric.criteria.map((c, i) => (
+              <CoachCard
+                key={c.id || c.label || i}
+                label={c.label}
+                body={c.description}
+                weight={c.weight}
+                tone={i === 0 ? "tip" : "neutral"}
+              />
+            ))}
+            {rubric.pass_score != null ? (
+              <div className="text-[12.5px] text-ink-2 pt-1">
+                Aim for{" "}
+                <span className="font-semibold text-ink">
+                  {rubric.pass_score}+
+                </span>{" "}
+                across the criteria.
+              </div>
+            ) : null}
+          </div>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
+function derivePersonaRole(persona: string): string {
+  const firstSentence = persona.split(/\.\s/)[0] ?? persona;
+  const afterComma = firstSentence.split(",").slice(1).join(",").trim();
+  if (!afterComma) return "";
+  // "CFO at Acme Corp" → "CFO"; "Senior Buyer" → "Senior Buyer"
+  const atIdx = afterComma.toLowerCase().indexOf(" at ");
+  const role = atIdx >= 0 ? afterComma.slice(0, atIdx) : afterComma;
+  return role.length > 40 ? role.slice(0, 40) + "…" : role;
+}
+
+// Heuristics for choosing a TTS voice — explicit pronouns win, then
+// salutations, then the first name itself (suffix endings are a weak
+// signal). Returns null when nothing matches so the hook keeps the
+// browser default rather than guessing wrong.
+function derivePersonaGender(
+  personaName: string,
+  personaBlurb: string,
+): "female" | "male" | null {
+  const blob = `${personaName} ${personaBlurb}`.toLowerCase();
+
+  // Strong signals — explicit pronouns / salutations in the blurb.
+  if (
+    /\b(she|her|hers|herself|ms\.?|mrs\.?|miss|madam|ma'am)\b/.test(blob)
+  ) {
+    return "female";
+  }
+  if (/\b(he|him|his|himself|mr\.?|sir|mister)\b/.test(blob)) {
+    return "male";
+  }
+
+  // First-name lookup. Lists are intentionally small — only the most
+  // common names. Anything we don't recognise falls through to the
+  // suffix heuristic and finally to null.
+  const firstName = personaName.split(/[\s,]/)[0]?.toLowerCase() ?? "";
+  const FEMALE_NAMES = new Set([
+    "priya", "neha", "aditi", "ananya", "deepa", "divya", "kavya",
+    "lakshmi", "meena", "pooja", "radha", "sneha", "sunita", "swati",
+    "veena", "vidya", "anjali", "kiran", "shruti", "rekha", "asha",
+    "ritu", "ritika", "sara", "sarah", "emma", "olivia", "sophia",
+    "isabella", "ava", "mia", "amelia", "harper", "evelyn", "abigail",
+    "emily", "elizabeth", "lily", "grace", "ella", "chloe", "victoria",
+    "linda", "susan", "karen", "patricia", "jennifer", "lisa", "nancy",
+    "michelle", "amanda", "melissa", "rachel", "jessica", "ashley",
+    "stephanie", "rebecca", "laura", "rachel", "anna", "maria", "fatima",
+  ]);
+  const MALE_NAMES = new Set([
+    "ravi", "rohit", "amit", "anil", "arjun", "vikram", "raj", "rajesh",
+    "rahul", "rohan", "sanjay", "sandeep", "vinod", "vikash", "deepak",
+    "hari", "krishna", "kumar", "manoj", "naveen", "prakash", "ramesh",
+    "suresh", "vijay", "abhishek", "marcus", "michael", "david", "john",
+    "james", "robert", "william", "thomas", "charles", "joseph", "daniel",
+    "matthew", "andrew", "ryan", "kevin", "brian", "scott", "eric",
+    "steven", "richard", "anthony", "mark", "paul", "george", "edward",
+    "henry", "carlos", "luis", "mohammed", "ahmed", "ali",
+  ]);
+  if (FEMALE_NAMES.has(firstName)) return "female";
+  if (MALE_NAMES.has(firstName)) return "male";
+
+  // Last-resort suffix heuristic — common for Indian female names
+  // ("Priya", "Aditi") but very lossy. Only apply when nothing else
+  // matched and the name looks long enough to be meaningful.
+  if (firstName.length >= 4 && /[aei]$/.test(firstName)) {
+    return "female";
+  }
+  return null;
+}
+
+// ─────────────── pane primitives ───────────────
+
+function CoachCard({
+  label,
+  body,
+  weight,
+  tone,
+}: {
+  label: string;
+  body: string;
+  weight: number;
+  tone: "tip" | "alert" | "neutral";
+}) {
+  const cls =
+    tone === "tip"
+      ? "bg-good-pale border-[#bfe2cd]"
+      : tone === "alert"
+        ? "bg-warn-pale border-[#f1d9aa]"
+        : "bg-surface border-border";
+  const labelCls =
+    tone === "tip"
+      ? "text-good"
+      : tone === "alert"
+        ? "text-warn"
+        : "text-ink";
+  return (
+    <div
+      className={cn(
+        "rounded-sm border p-3",
+        cls,
+      )}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <div
+          className={cn(
+            "flex items-center gap-1.5 text-[12px] font-semibold",
+            labelCls,
+          )}
+        >
+          <Icon
+            name={tone === "tip" ? "ai-sparkle" : "chart"}
+            size={11}
+          />
+          {label}
+        </div>
+        {weight > 0 ? (
+          <span className="font-mono text-[10.5px] text-ink-3">
+            {Math.round(weight * 100)}%
+          </span>
+        ) : null}
+      </div>
+      {body ? (
+        <div className="text-[12px] text-ink-2 mt-1 leading-[1.45]">
+          {body}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ModePill({ mode }: { mode: "text" | "voice" | "video" }) {
+  const cls =
+    mode === "text"
+      ? "bg-surface-2 text-ink-2 border-border"
+      : mode === "voice"
+        ? "bg-accent-pale text-accent-strong border-accent/20"
+        : "bg-warn-pale text-warn border-warn/20";
+  return (
+    <span
+      className={cn(
+        "text-[10px] font-semibold uppercase tracking-[0.08em] px-[6px] py-[1px] rounded-sm border whitespace-nowrap",
+        cls,
+      )}
+    >
+      {mode}
+    </span>
+  );
+}
+
+// ─────────────── Pre-session gate ───────────────
+// Renders the Scenario Intro GIF and/or the trainee mode picker before
+// we fire /api/roleplay/start. Once the trainee proceeds (and, if
+// applicable, picks a mode), the gate dismisses itself and the player
+// flows into its normal three-panel layout.
+
+function PreSessionGate({
+  moduleName,
+  introGif,
+  introDismissed,
+  onDismissIntro,
+  needsModePick,
+  availableModes,
+  chosenMode,
+  onPickMode,
+  needsLanguagePick,
+  availableLanguages,
+  chosenLanguage,
+  onPickLanguage,
+}: {
+  moduleName: string;
+  introGif: { name: string; dataUrl: string } | null;
+  introDismissed: boolean;
+  onDismissIntro: () => void;
+  needsModePick: boolean;
+  availableModes: PlayerMode[];
+  chosenMode: PlayerMode | null;
+  onPickMode: (m: PlayerMode) => void;
+  needsLanguagePick: boolean;
+  availableLanguages: string[];
+  chosenLanguage: string | null;
+  onPickLanguage: (lang: string) => void;
+}) {
+  const showIntro = !introDismissed && introGif !== null;
+  const showModePick = !showIntro && needsModePick;
+  // Language pick comes last so the trainee isn't choosing a language
+  // for a mode they haven't picked yet.
+  const showLanguagePick = !showIntro && !showModePick && needsLanguagePick;
+  return (
+    <div className="max-w-[640px] mx-auto py-8">
+      <div className="text-[10.5px] font-bold uppercase tracking-[0.12em] text-ink-3 mb-2">
+        Roleplay
+      </div>
+      <h1 className="font-display text-[26px] leading-tight mb-5 -tracking-[0.01em]">
+        {moduleName}
+      </h1>
+
+      {showIntro && introGif ? (
+        <div className="rounded-[14px] border border-border bg-surface overflow-hidden">
+          <div className="px-5 pt-4 pb-2">
+            <div className="text-[10.5px] font-semibold uppercase tracking-[0.1em] text-ink-3">
+              Scenario brief
+            </div>
+            <p className="text-[12.5px] text-ink-2 mt-1 leading-[1.5]">
+              Watch the scene before you begin — this sets up what you&apos;re
+              walking into.
+            </p>
+          </div>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={introGif.dataUrl}
+            alt={introGif.name}
+            className="w-full object-cover max-h-[420px] bg-surface-2"
+          />
+          <div className="flex justify-end px-5 py-3 border-t border-border">
+            <Button variant="accent" size="md" onClick={onDismissIntro}>
+              {needsModePick || needsLanguagePick ? "Continue" : "Start session"}
+              <Icon name="chevron-right" size={12} />
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
+      {showModePick ? (
+        <div className="rounded-[14px] border border-border bg-surface overflow-hidden">
+          <div className="px-5 pt-4 pb-3">
+            <div className="text-[10.5px] font-semibold uppercase tracking-[0.1em] text-ink-3">
+              Pick your mode
+            </div>
+            <p className="text-[12.5px] text-ink-2 mt-1 leading-[1.5]">
+              The trainer left this up to you — choose how the conversation
+              should run. You can&apos;t change it once the session starts.
+            </p>
+          </div>
+          <div className="px-5 py-3 space-y-2">
+            {availableModes.map((m) => {
+              const selected = chosenMode === m;
+              return (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => onPickMode(m)}
+                  suppressHydrationWarning
+                  className={cn(
+                    "w-full text-left rounded-[10px] border p-3 transition-colors",
+                    selected
+                      ? "border-accent bg-accent-pale/30"
+                      : "border-border bg-surface hover:border-accent-pale",
+                  )}
+                >
+                  <div className="flex items-start gap-3">
+                    <div
+                      className={cn(
+                        "w-4 h-4 rounded-full border-2 grid place-items-center mt-0.5 shrink-0",
+                        selected ? "border-accent" : "border-border-strong",
+                      )}
+                    >
+                      {selected ? (
+                        <span className="w-2 h-2 rounded-full bg-accent" />
+                      ) : null}
+                    </div>
+                    <div className="min-w-0">
+                      <div className="text-[13.5px] font-semibold text-ink">
+                        {MODE_LABELS[m]}
+                      </div>
+                      <div className="text-[12px] text-ink-3 mt-0.5 leading-[1.5]">
+                        {MODE_DESCRIPTIONS[m]}
+                      </div>
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+          <div className="flex justify-end px-5 py-3 border-t border-border">
+            <Button
+              variant="accent"
+              size="md"
+              onClick={() => {
+                // The "Continue" button is enabled once a mode is chosen;
+                // clicking it commits — chosenMode is already in state, so
+                // the gate flips closed by re-render.
+                if (chosenMode !== null) onPickMode(chosenMode);
+              }}
+              disabled={chosenMode === null}
+            >
+              {needsLanguagePick ? "Continue" : "Start session"}
+              <Icon name="chevron-right" size={12} />
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
+      {showLanguagePick ? (
+        <div className="rounded-[14px] border border-border bg-surface overflow-hidden">
+          <div className="px-5 pt-4 pb-3">
+            <div className="text-[10.5px] font-semibold uppercase tracking-[0.1em] text-ink-3">
+              Pick your language
+            </div>
+            <p className="text-[12.5px] text-ink-2 mt-1 leading-[1.5]">
+              The trainer enabled multiple languages for this scenario. Pick
+              the one you want to roleplay in — this is recorded on your
+              results.
+            </p>
+          </div>
+          <div className="px-5 py-3 space-y-2">
+            {availableLanguages.map((lang) => {
+              const selected = chosenLanguage === lang;
+              return (
+                <button
+                  key={lang}
+                  type="button"
+                  onClick={() => onPickLanguage(lang)}
+                  suppressHydrationWarning
+                  className={cn(
+                    "w-full text-left rounded-[10px] border p-3 transition-colors flex items-center gap-3",
+                    selected
+                      ? "border-accent bg-accent-pale/30"
+                      : "border-border bg-surface hover:border-accent-pale",
+                  )}
+                >
+                  <div
+                    className={cn(
+                      "w-4 h-4 rounded-full border-2 grid place-items-center shrink-0",
+                      selected ? "border-accent" : "border-border-strong",
+                    )}
+                  >
+                    {selected ? (
+                      <span className="w-2 h-2 rounded-full bg-accent" />
+                    ) : null}
+                  </div>
+                  <span className="text-[13.5px] font-semibold text-ink">
+                    {lang}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <div className="flex justify-end px-5 py-3 border-t border-border">
+            <Button
+              variant="accent"
+              size="md"
+              onClick={() => {
+                if (chosenLanguage !== null) onPickLanguage(chosenLanguage);
+              }}
+              disabled={chosenLanguage === null}
+            >
+              Start session
+              <Icon name="chevron-right" size={12} />
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
+      {!showIntro && !showModePick && !showLanguagePick ? (
+        <div className="text-[12.5px] text-ink-3">Loading…</div>
+      ) : null}
+    </div>
+  );
+}
+
+// ─────────────── MediaRecorder MIME picker ───────────────
+// Chrome / Firefox emit audio/webm; Safari leans on audio/mp4. We
+// probe in priority order and fall back to "" (browser default) so
+// MediaRecorder doesn't throw on an unsupported mime string.
+
+function pickRecorderMime(): string {
+  if (typeof MediaRecorder === "undefined") return "";
+  if (typeof MediaRecorder.isTypeSupported !== "function") return "";
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/mp4",
+  ];
+  for (const m of candidates) {
+    if (MediaRecorder.isTypeSupported(m)) return m;
+  }
+  return "";
+}
+
+function fmtMmSs(s: number): string {
+  if (!Number.isFinite(s) || s < 0) s = 0;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${r.toString().padStart(2, "0")}`;
+}
+
+// ─────────────── Mode resolver ───────────────
+// Maps the admin's chosen trainee mode to the three flags the existing
+// player loop consumes. Falls back to the module-level mode (the
+// admin's earlier `roleplayConfig.mode`) when nothing was picked.
+
+function resolvePlayerFlags(
+  chosen: PlayerMode | null,
+  fallbackMode: "text" | "voice" | "video",
+): { voiceMode: boolean; avatarMode: boolean; userVideo: boolean } {
+  if (chosen === "video")
+    return { voiceMode: true, avatarMode: true, userVideo: true };
+  if (chosen === "onlyAiVideo")
+    return { voiceMode: true, avatarMode: true, userVideo: false };
+  if (chosen === "onlyUserVideo")
+    return { voiceMode: true, avatarMode: false, userVideo: true };
+  if (chosen === "audio")
+    return { voiceMode: true, avatarMode: false, userVideo: false };
+  // No mode chosen — preserve the legacy behaviour driven by the
+  // module-level mode flag so older modules without additionalSettings
+  // keep working.
+  return {
+    voiceMode: fallbackMode !== "text",
+    avatarMode: fallbackMode === "video",
+    userVideo: false,
+  };
+}
+
+// ─────────────── Header bits ───────────────
+
+function TimerPill({
+  elapsedSec,
+  maxSec,
+  maxReached,
+}: {
+  elapsedSec: number;
+  maxSec: number;
+  maxReached: boolean;
+}) {
+  const hasCap = maxSec > 0;
+  return (
+    <span
+      className="inline-flex items-center px-3 py-[5px] rounded-md text-[13px] font-semibold tabular-nums text-white"
+      style={{ background: maxReached ? "#c5392f" : "#5b2eea" }}
+    >
+      {fmtMmSs(elapsedSec)}
+      {hasCap ? <span className="opacity-70 mx-1">/</span> : null}
+      {hasCap ? <span>{fmtMmSs(maxSec)}</span> : null}
+    </span>
+  );
+}
+
+function TopicPill({
+  icon,
+  label,
+}: {
+  icon: "training" | "layers" | "book";
+  label: string;
+}) {
+  return (
+    <span
+      className="inline-flex items-center gap-2 px-3 py-[6px] rounded-full border bg-surface text-ink text-[12.5px] font-semibold max-w-[280px]"
+      style={{ borderColor: "var(--border-strong)" }}
+      title={label}
+    >
+      <span
+        className="w-[18px] h-[18px] rounded-[5px] grid place-items-center shrink-0"
+        style={{ background: "#ede7fb", color: "#5b2eea" }}
+        aria-hidden
+      >
+        <Icon name={icon} size={11} />
+      </span>
+      <span className="truncate">{label}</span>
+    </span>
+  );
+}
+
+// ─────────────── Video tile shell ───────────────
+
+function VideoTile({
+  label,
+  isActive = false,
+  cornerAction,
+  children,
+}: {
+  label: string;
+  isActive?: boolean;
+  cornerAction?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      className={cn(
+        "relative rounded-[18px] overflow-hidden bg-surface-2",
+        "aspect-[4/3]",
+        isActive ? "ring-2 ring-offset-0" : "border border-border",
+      )}
+      style={isActive ? { boxShadow: "0 0 0 2px #5b2eea" } : undefined}
+    >
+      <div className="absolute inset-0">{children}</div>
+      <span
+        className="absolute left-3 bottom-3 px-2.5 py-[3px] rounded-md text-[11.5px] font-semibold bg-white/85 text-ink backdrop-blur"
+      >
+        {label}
+      </span>
+      {cornerAction ? (
+        <div className="absolute right-3 bottom-3">{cornerAction}</div>
+      ) : null}
+    </div>
+  );
+}
+
+// ─────────────── Persona / user surfaces ───────────────
+// Each tile fills its parent. The persona surface either renders the
+// HeyGen avatar <video> or a quiet "audio only" gradient w/ initials
+// when the trainee toggles the camera off. The user surface mirrors
+// the same shape — getUserMedia preview, or initials placeholder when
+// the mode doesn't include the trainee's webcam.
+
+function PersonaVideoSurface({
+  attach,
+  state,
+  error,
+  fallbackName,
+}: {
+  attach: (el: HTMLMediaElement | null) => void;
+  state: "idle" | "connecting" | "ready" | "speaking" | "failed";
+  error: string | null;
+  fallbackName: string;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const playing = state === "ready" || state === "speaking";
+
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    attach(v);
+    return () => attach(null);
+  }, [attach]);
+
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (playing) v.play().catch(() => {});
+  }, [playing]);
+
+  return (
+    <div
+      className="absolute inset-0"
+      style={{
+        background:
+          "linear-gradient(140deg, #e6e3f9 0%, #d8d4f3 60%, #cdc8ec 100%)",
+      }}
+    >
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        className={cn(
+          "absolute inset-0 w-full h-full object-cover transition-opacity",
+          playing ? "opacity-100" : "opacity-0",
+        )}
+      />
+      {!playing ? (
+        <div className="absolute inset-0 grid place-items-center text-center px-3">
+          {state === "failed" ? (
+            <div className="text-[11.5px] text-bad leading-relaxed">
+              <div className="font-semibold mb-1">Avatar failed</div>
+              <div className="text-[10.5px] font-mono opacity-80">
+                {error ?? "Unknown error"}
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col items-center gap-2">
+              <PersonaInitialsCircle name={fallbackName} pulse={state === "connecting"} />
+              {state === "connecting" || state === "idle" ? (
+                <div className="text-[10.5px] font-mono text-ink-3 uppercase tracking-[0.1em]">
+                  {state === "connecting"
+                    ? "Connecting avatar…"
+                    : "Loading…"}
+                </div>
+              ) : null}
+            </div>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function PersonaAudioSurface({
+  speaking,
+  name,
+  portraitUrl,
+}: {
+  speaking: boolean;
+  name: string;
+  portraitUrl?: string | null;
+}) {
+  // When a real portrait is available, render it as the tile background
+  // and overlay a subtle "Speaking…" pill + a glowing ring while the AI
+  // is talking. Without lip-sync the ring is what tells the trainee
+  // somebody is on the line.
+  if (portraitUrl) {
+    return (
+      <div className="absolute inset-0 overflow-hidden bg-[#1a1f2a]">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={portraitUrl}
+          alt={name}
+          className="absolute inset-0 w-full h-full object-cover"
+        />
+        <div
+          className={cn(
+            "absolute inset-0 ring-inset ring-4 transition-all duration-300",
+            speaking
+              ? "ring-[#5b2eea] shadow-[inset_0_0_60px_rgba(91,46,234,0.55)]"
+              : "ring-transparent",
+          )}
+        />
+        <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between gap-2 pointer-events-none">
+          <div className="bg-black/55 text-white text-[10.5px] font-mono uppercase tracking-[0.1em] px-2 py-1 rounded-md backdrop-blur-sm">
+            {speaking ? "Speaking…" : "Audio only"}
+          </div>
+        </div>
+      </div>
+    );
+  }
+  // Fallback: original initials gradient. Used when no portrait has
+  // been saved for this persona yet, or for non-D-ID providers like
+  // HeyGen overrides that don't carry a still image.
+  return (
+    <div
+      className="absolute inset-0 grid place-items-center"
+      style={{
+        background:
+          "linear-gradient(140deg, #efeaff 0%, #ddd5f8 60%, #c8bdef 100%)",
+      }}
+    >
+      <div className="flex flex-col items-center gap-2">
+        <PersonaInitialsCircle name={name} pulse={speaking} />
+        <div className="text-[11px] font-mono text-ink-2 uppercase tracking-[0.1em]">
+          {speaking ? "Speaking…" : "Audio only"}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PersonaInitialsCircle({
+  name,
+  pulse = false,
+}: {
+  name: string;
+  pulse?: boolean;
+}) {
+  const initials = name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((s) => s[0]?.toUpperCase() ?? "")
+    .join("");
+  return (
+    <div
+      className={cn(
+        "w-[88px] h-[88px] rounded-full grid place-items-center text-white font-display text-[28px]",
+        pulse ? "animate-pulse" : "",
+      )}
+      style={{ background: "#5b2eea" }}
+    >
+      {initials || "P"}
+    </div>
+  );
+}
+
+function UserVideoSurface() {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    let stream: MediaStream | null = null;
+    let cancelled = false;
+    (async () => {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false,
+        });
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          await videoRef.current.play().catch(() => {});
+          setReady(true);
+        }
+      } catch (e) {
+        setError(
+          e instanceof Error && e.name === "NotAllowedError"
+            ? "Camera blocked — allow access in your browser."
+            : e instanceof Error
+              ? e.message
+              : "Camera unavailable.",
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+    };
+  }, []);
+
+  return (
+    <div
+      className="absolute inset-0"
+      style={{
+        background:
+          "linear-gradient(140deg, #ecebe8 0%, #d8d6d1 60%, #c6c4be 100%)",
+      }}
+    >
+      <video
+        ref={videoRef}
+        autoPlay
+        muted
+        playsInline
+        className={cn(
+          "absolute inset-0 w-full h-full object-cover transition-opacity",
+          ready ? "opacity-100" : "opacity-0",
+        )}
+      />
+      {error ? (
+        <div className="absolute inset-0 grid place-items-center text-center px-3">
+          <div className="text-[11.5px] text-bad leading-relaxed">
+            <div className="font-semibold mb-1">Camera off</div>
+            <div className="text-[10.5px] font-mono opacity-80">{error}</div>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function UserAvatarSurface({
+  listening,
+  name,
+}: {
+  listening: boolean;
+  name: string;
+}) {
+  return (
+    <div
+      className="absolute inset-0 grid place-items-center"
+      style={{
+        background:
+          "linear-gradient(140deg, #f3f2ee 0%, #e4e2dc 60%, #d2cfc7 100%)",
+      }}
+    >
+      <div
+        className={cn(
+          "w-[88px] h-[88px] rounded-full grid place-items-center text-white font-display text-[28px]",
+          listening ? "animate-pulse" : "",
+        )}
+        style={{ background: "#9a9892" }}
+      >
+        {name[0]?.toUpperCase() ?? "Y"}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────── Caption + Hint panels ───────────────
+
+function CaptionPanel({
+  captionText,
+  captionThinking,
+  personaName,
+  personaBlurb,
+  personaShort,
+  scenario,
+  sessionWaiting,
+  flowStartByUser,
+}: {
+  captionText: string;
+  captionThinking: boolean;
+  personaName: string;
+  personaBlurb: string;
+  personaShort: string;
+  scenario: string;
+  sessionWaiting: boolean;
+  flowStartByUser: boolean;
+}) {
+  const [tab, setTab] = useState<"caption" | "scenario">("caption");
+  return (
+    <div className="rounded-[18px] border border-border bg-surface overflow-hidden">
+      <div className="px-5 pt-4">
+        <div className="inline-flex p-[3px] rounded-md bg-surface-2">
+          <TabBtn active={tab === "caption"} onClick={() => setTab("caption")}>
+            Caption
+          </TabBtn>
+          <TabBtn
+            active={tab === "scenario"}
+            onClick={() => setTab("scenario")}
+          >
+            Scenario
+          </TabBtn>
+        </div>
+      </div>
+      <div className="px-5 py-4 min-h-[160px]">
+        {tab === "caption" ? (
+          captionText ? (
+            <p className="text-[14.5px] text-ink leading-[1.55] font-medium whitespace-pre-wrap">
+              {captionText}
+              {captionThinking ? (
+                <span className="text-ink-3 font-mono ml-1">…</span>
+              ) : null}
+            </p>
+          ) : (
+            <p className="text-[12.5px] text-ink-3 italic">
+              {sessionWaiting
+                ? `Connecting to ${personaShort}…`
+                : flowStartByUser
+                  ? `You start — say something to ${personaShort}.`
+                  : `Waiting for ${personaShort}…`}
+            </p>
+          )
+        ) : (
+          <div className="space-y-3">
+            <div>
+              <div className="text-[10.5px] font-semibold uppercase tracking-[0.1em] text-ink-3 mb-1">
+                Persona
+              </div>
+              <div className="text-[13.5px] font-semibold text-ink leading-snug">
+                {personaName}
+              </div>
+              {personaBlurb ? (
+                <p className="text-[12.5px] text-ink-2 mt-1 leading-[1.5]">
+                  {personaBlurb}
+                </p>
+              ) : null}
+            </div>
+            <div>
+              <div className="text-[10.5px] font-semibold uppercase tracking-[0.1em] text-ink-3 mb-1">
+                Scenario
+              </div>
+              <p className="text-[13px] text-ink-2 leading-[1.6] whitespace-pre-wrap">
+                {scenario}
+              </p>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TabBtn({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      suppressHydrationWarning
+      className={cn(
+        "px-3.5 py-1.5 rounded-md text-[12.5px] font-semibold transition-colors",
+        active ? "text-white" : "text-ink-2 hover:text-ink",
+      )}
+      style={active ? { background: "#5b2eea" } : undefined}
+    >
+      {children}
+    </button>
+  );
+}
+
+function HintPanel({
+  hint,
+  hintType,
+  loading,
+  error,
+  exhausted,
+  onRequest,
+  disabled,
+  hintsUsed,
+  hintsLimit,
+}: {
+  hint: string | null;
+  hintType: "complete" | "bullet";
+  loading: boolean;
+  error: string | null;
+  exhausted: boolean;
+  onRequest: () => void;
+  disabled: boolean;
+  hintsUsed: number;
+  hintsLimit: number | null;
+}) {
+  const lines =
+    hint && hintType === "bullet"
+      ? hint
+          .split(/\n+/)
+          .map((l) => l.replace(/^[•\-*]\s*/, "").trim())
+          .filter(Boolean)
+      : null;
+  return (
+    <div
+      className="rounded-[18px] border overflow-hidden"
+      style={{
+        background: "#fbf3df",
+        borderColor: "#f1e2b3",
+      }}
+    >
+      <div className="px-5 pt-4 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <span
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-bold uppercase tracking-[0.1em] text-white"
+            style={{ background: "#5b2eea" }}
+          >
+            <Icon name="ai-sparkle" size={10} />
+            Say this
+          </span>
+          <span className="text-[11px] text-ink-3">
+            Suggested reply you can read aloud
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          {hintsLimit !== null ? (
+            <span className="text-[11px] font-mono text-ink-3">
+              {hintsUsed} / {hintsLimit}
+            </span>
+          ) : null}
+          <button
+            type="button"
+            onClick={onRequest}
+            disabled={disabled || exhausted}
+            suppressHydrationWarning
+            className={cn(
+              "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[12px] font-semibold transition-opacity disabled:opacity-60",
+              hint
+                ? "border border-border bg-surface text-ink-2 hover:text-ink"
+                : "text-white",
+            )}
+            style={hint ? undefined : { background: "#5b2eea" }}
+            title={
+              exhausted
+                ? "You've used all your hints for this attempt."
+                : hint
+                  ? "Get a fresh suggestion"
+                  : "Get the words to say next"
+            }
+          >
+            <Icon name="ai-sparkle" size={11} />
+            {loading
+              ? "Drafting…"
+              : hint
+                ? "Try another"
+                : "Show me"}
+          </button>
+        </div>
+      </div>
+      <div className="px-5 py-4 min-h-[140px]">
+        {hint ? (
+          lines && lines.length > 0 ? (
+            <ul className="space-y-1.5">
+              {lines.map((l, i) => (
+                <li key={i} className="text-[14px] text-ink leading-[1.55]">
+                  <span className="text-[#5b2eea] mr-1.5">•</span>
+                  {l}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-[14.5px] text-ink leading-[1.55] font-medium whitespace-pre-wrap">
+              {hint}
+            </p>
+          )
+        ) : (
+          <p className="text-[12.5px] text-ink-2 italic">
+            {loading
+              ? "Drafting the exact words you should say next…"
+              : "Your suggested line will appear here in a moment."}
+          </p>
+        )}
+        {error ? (
+          <p className="text-[11px] text-bad font-mono break-words mt-2">
+            {error}
+          </p>
+        ) : null}
+        {exhausted ? (
+          <p className="text-[11px] text-ink-3 italic mt-2">
+            You&apos;ve used all your hints for this attempt.
+          </p>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function CoachInline({
+  hint,
+  loading,
+}: {
+  hint: CoachHint;
+  loading: boolean;
+}) {
+  const isWarn = hint.tone === "warn";
+  return (
+    <div
+      className="rounded-[14px] border px-4 py-3"
+      style={{
+        background: isWarn
+          ? "linear-gradient(135deg, #fef3ec, #fbe7e2)"
+          : "linear-gradient(135deg, #f3eafa, #fce8f0)",
+        borderColor: isWarn ? "#f1c6b1" : "#e6d2f1",
+      }}
+    >
+      <div className="flex items-center gap-1.5 mb-1">
+        <div
+          className="w-[22px] h-[22px] rounded-[6px] grid place-items-center text-white shrink-0"
+          style={{
+            background: isWarn
+              ? "linear-gradient(135deg, #ea580c, #db2777)"
+              : "linear-gradient(135deg, #a855f7, #ec4899)",
+          }}
+          aria-hidden
+        >
+          <Icon name="ai-sparkle" size={10} />
+        </div>
+        <span
+          className="text-[10px] font-bold uppercase tracking-[0.1em]"
+          style={{ color: isWarn ? "#c2410c" : "#6d4ad9" }}
+        >
+          {isWarn ? "Heads-up" : "Live coach"}
+        </span>
+        <span className="ml-auto text-[10px] font-mono text-ink-3">
+          turn {hint.turn}
+          {loading ? " · refreshing…" : ""}
+        </span>
+      </div>
+      <p className="text-[13px] text-ink leading-[1.5]">{hint.hint}</p>
+    </div>
+  );
+}
+
+// ─────────────── Floating call controls ───────────────
+// Bottom-centered round buttons — mic toggle + end-call. Matches the
+// "Click to interrupt" treatment in the spec screen. Renders fixed
+// so the controls stay reachable while the trainee scrolls through
+// the rubric collapsible.
+
+function CallControlsBar({
+  voiceMode,
+  voiceState,
+  voiceSttSupported,
+  voiceTtsSupported,
+  streaming,
+  sessionReady,
+  ending,
+  availableVoices,
+  selectedVoiceUri,
+  onPickVoice,
+  autoFlow,
+  autoFlowAvailable,
+  onToggleAutoFlow,
+  onToggleVoice,
+  onStartListen,
+  onStopListen,
+  onEnd,
+}: {
+  voiceMode: boolean;
+  voiceState: "idle" | "listening" | "speaking";
+  voiceSttSupported: boolean;
+  voiceTtsSupported: boolean;
+  streaming: boolean;
+  sessionReady: boolean;
+  ending: boolean;
+  availableVoices: VoiceOption[];
+  selectedVoiceUri: string | null;
+  onPickVoice: (uri: string | null) => void;
+  autoFlow: boolean;
+  autoFlowAvailable: boolean;
+  onToggleAutoFlow: () => void;
+  onToggleVoice: () => void;
+  onStartListen: () => void;
+  onStopListen: () => void;
+  onEnd: () => void;
+}) {
+  const voiceAvailable = voiceSttSupported || voiceTtsSupported;
+  const listening = voiceMode && voiceState === "listening";
+  const tooltip = autoFlow
+    ? "Auto-flow on — listening to a model conversation"
+    : !voiceMode
+      ? "Turn on voice"
+      : listening
+        ? "Click to interrupt"
+        : streaming
+          ? "Persona is replying…"
+          : "Tap to talk";
+
+  function handleMicClick() {
+    if (!voiceAvailable) return;
+    if (!voiceMode) {
+      onToggleVoice();
+      return;
+    }
+    if (listening) {
+      onStopListen();
+    } else if (!streaming && sessionReady && voiceSttSupported) {
+      onStartListen();
+    }
+  }
+
+  return (
+    <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-30 flex flex-col items-center gap-2">
+      <span
+        className="px-2.5 py-1 rounded-md text-[11.5px] text-white"
+        style={{ background: "#1a1a1a" }}
+      >
+        {tooltip}
+      </span>
+      <div className="flex items-center gap-3">
+        {voiceTtsSupported && availableVoices.length > 0 ? (
+          <VoicePicker
+            voices={availableVoices}
+            selectedUri={selectedVoiceUri}
+            onPick={onPickVoice}
+          />
+        ) : null}
+        <button
+          type="button"
+          onClick={onToggleAutoFlow}
+          disabled={!autoFlowAvailable}
+          suppressHydrationWarning
+          aria-pressed={autoFlow}
+          aria-label={autoFlow ? "Stop auto-flow" : "Start auto-flow"}
+          title={
+            autoFlowAvailable
+              ? autoFlow
+                ? "Pause the demo conversation"
+                : "Let the AI run a model conversation — both sides spoken aloud"
+              : "Auto-flow needs hints enabled and TTS support"
+          }
+          className="inline-flex items-center gap-1.5 h-[36px] px-3 rounded-full text-[11.5px] font-semibold text-white shadow-md disabled:opacity-60"
+          style={{
+            background: autoFlow ? "#2a7d4f" : "#1a1a1a",
+          }}
+        >
+          <Icon name="ai-sparkle" size={11} />
+          {autoFlow ? "Auto on" : "Auto-flow"}
+        </button>
+        <button
+          type="button"
+          onClick={handleMicClick}
+          disabled={!voiceAvailable || autoFlow}
+          suppressHydrationWarning
+          aria-label={listening ? "Mute mic" : "Unmute mic"}
+          className="w-[52px] h-[52px] rounded-full grid place-items-center text-white shadow-md disabled:opacity-60"
+          style={{
+            background: listening ? "#c5392f" : "#5b2eea",
+          }}
+        >
+          <Icon name="mic" size={18} />
+        </button>
+        <button
+          type="button"
+          onClick={onEnd}
+          disabled={!sessionReady || ending}
+          suppressHydrationWarning
+          aria-label="End call"
+          className="w-[52px] h-[52px] rounded-full grid place-items-center text-white shadow-md disabled:opacity-60"
+          style={{ background: "#c5392f" }}
+          title="End the roleplay"
+        >
+          <svg
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            style={{ transform: "rotate(135deg)" }}
+            aria-hidden
+          >
+            <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.79 19.79 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2.03z" />
+          </svg>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────── Voice picker ───────────────
+// Dropdown that lets the trainee override the auto-picked TTS voice.
+// Click the pill → menu opens with every voice the browser exposes
+// for the persona's language; pick one (or "Auto") and the choice
+// persists in sessionStorage for this module.
+
+function VoicePicker({
+  voices,
+  selectedUri,
+  onPick,
+}: {
+  voices: VoiceOption[];
+  selectedUri: string | null;
+  onPick: (uri: string | null) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onDoc(e: MouseEvent) {
+      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  const current = voices.find((v) => v.uri === selectedUri);
+  const label = current ? shortVoiceName(current.name) : "Auto";
+
+  return (
+    <div ref={rootRef} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        suppressHydrationWarning
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label="Pick voice"
+        className="inline-flex items-center gap-1.5 h-[36px] px-3 rounded-full text-[11.5px] font-semibold text-white shadow-md max-w-[180px]"
+        style={{ background: "#1a1a1a" }}
+        title={current ? `Voice: ${current.name}` : "Voice: Auto"}
+      >
+        <Icon name="settings" size={11} />
+        <span className="truncate">{label}</span>
+        <Icon name="chevron-down" size={10} />
+      </button>
+      {open ? (
+        <div
+          role="listbox"
+          className="absolute bottom-[44px] left-1/2 -translate-x-1/2 w-[280px] max-h-[280px] overflow-y-auto rounded-[10px] border border-border bg-surface shadow-md"
+        >
+          <VoiceOptionRow
+            label="Auto (match persona)"
+            sublabel="Pick the best voice for this persona"
+            active={selectedUri === null}
+            onClick={() => {
+              onPick(null);
+              setOpen(false);
+            }}
+          />
+          <div className="border-t border-border my-1" />
+          {voices.map((v) => (
+            <VoiceOptionRow
+              key={v.uri}
+              label={shortVoiceName(v.name)}
+              sublabel={`${v.lang}${v.gender !== "unknown" ? " · " + v.gender : ""}${v.localService ? " · local" : ""}`}
+              active={v.uri === selectedUri}
+              onClick={() => {
+                onPick(v.uri);
+                setOpen(false);
+              }}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function VoiceOptionRow({
+  label,
+  sublabel,
+  active,
+  onClick,
+}: {
+  label: string;
+  sublabel: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      suppressHydrationWarning
+      role="option"
+      aria-selected={active}
+      className={cn(
+        "w-full text-left px-3 py-2 hover:bg-surface-2 transition-colors",
+        active ? "bg-surface-2" : "",
+      )}
+    >
+      <div className="flex items-center gap-2">
+        <span
+          className={cn(
+            "w-2 h-2 rounded-full shrink-0",
+            active ? "" : "opacity-0",
+          )}
+          style={{ background: "#5b2eea" }}
+          aria-hidden
+        />
+        <span className="text-[12.5px] font-semibold text-ink truncate">
+          {label}
+        </span>
+      </div>
+      <div className="text-[10.5px] text-ink-3 pl-4 mt-0.5">{sublabel}</div>
+    </button>
+  );
+}
+
+function shortVoiceName(name: string): string {
+  // Most browsers expose names like "Microsoft Zira - English (United States)"
+  // or "Google US English". Trim to the meaningful chunk so the picker pill
+  // doesn't overflow.
+  return name
+    .replace(/^Microsoft\s+/i, "")
+    .replace(/^Google\s+/i, "")
+    .replace(/\s+Desktop$/i, "")
+    .replace(/\s+Online\s*\(Natural\)$/i, " · Natural")
+    .replace(/\s+-\s+.*$/, "")
+    .trim();
+}
+
+// Split a paragraph into discrete sentences ending in .!?…  D-ID
+// processes each speak() independently, so pushing one sentence at a
+// time lets it start lip-syncing the first one while later sentences
+// are still being generated upstream. Sentences without terminal
+// punctuation (typically the trailing tail of a still-streaming
+// bubble) are not returned — they'll be flushed by flushFinalSpeak.
+function splitCompleteSentences(text: string): string[] {
+  const matches = text.match(/[^.!?…\n]+[.!?…]+(?=\s|$)/g);
+  return matches ? matches.map((s) => s.trim()).filter(Boolean) : [];
+}
