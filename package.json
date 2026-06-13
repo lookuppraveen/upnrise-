@@ -12,9 +12,6 @@
     "postinstall": "prisma generate",
     "db:studio": "prisma studio"
   },
-  "prisma": {
-    "seed": "tsx prisma/seed.ts"
-  },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.100.1",
     "@heygen/liveavatar-web-sdk": "^0.0.18",
