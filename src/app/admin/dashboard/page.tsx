@@ -178,7 +178,7 @@ export default async function AdminDashboard() {
               {recentTrainings.map((t) => (
                 <Link
                   key={t.id}
-                  href={`/admin/trainings/${t.id}`}
+                  href={`/admin/trainings/${t.id}/edit`}
                   className="flex items-center gap-3 p-2 rounded-md hover:bg-surface-2"
                 >
                   <div className="flex-1 min-w-0">
