@@ -34,12 +34,15 @@ export const ADMIN_SHELL: ShellConfig = {
           icon: "mic",
           ai: true,
         },
-        {
-          label: "Generate with AI",
-          href: "/admin/generate",
-          icon: "wand",
-          ai: true,
-        },
+        // Hidden at launch — requires customer trust ("can I really let AI
+        // draft training my reps will see?"). Better to show in guided
+        // onboarding ~2 weeks in. Route stays live.
+        // {
+        //   label: "Generate with AI",
+        //   href: "/admin/generate",
+        //   icon: "wand",
+        //   ai: true,
+        // },
       ],
     },
     {
@@ -63,7 +66,7 @@ export const ADMIN_SHELL: ShellConfig = {
       ],
     },
     {
-      label: "Insights & AI",
+      label: "Insights",
       items: [
         { label: "Reports", href: "/admin/reports", icon: "chart" },
         {
@@ -79,7 +82,7 @@ export const ADMIN_SHELL: ShellConfig = {
           ai: true,
         },
         {
-          label: "Video Providers",
+          label: "Avatars & Voices",
           href: "/admin/video-providers",
           icon: "play",
           ai: true,
@@ -170,7 +173,7 @@ export const ADMIN_SHELL: ShellConfig = {
     },
     {
       match: "/admin/video-providers",
-      title: "Video Providers",
+      title: "Avatars & Voices",
       subtitle: "Avatar render integrations (HeyGen, Synthesia, D-ID)",
     },
   ],

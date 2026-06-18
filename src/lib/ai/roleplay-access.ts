@@ -49,3 +49,42 @@ export async function loadSessionForUser(user: SessionUser, sessionId: string) {
     },
   });
 }
+
+/**
+ * Admin-side counterpart to loadSessionForUser. An admin can open any
+ * session belonging to a user in their own company — not just their own
+ * (admins don't take roleplay sessions). Tenant scope is enforced via
+ * the joined user.companyId match; no admin can ever peek across
+ * companies even with a guessed session id.
+ *
+ * The session owner is included so the admin page can show "whose
+ * session is this" in the header without a second query.
+ */
+export async function loadSessionForAdmin(user: SessionUser, sessionId: string) {
+  if (!user.companyId || user.role !== "admin") return null;
+  return prisma.roleplaySession.findFirst({
+    where: {
+      id: sessionId,
+      user: { companyId: user.companyId },
+    },
+    include: {
+      user: {
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          team: { select: { name: true } },
+          manager: { select: { name: true, email: true } },
+        },
+      },
+      module: {
+        include: {
+          roleplayConfig: true,
+          training: {
+            select: { id: true, companyId: true, title: true, passingScore: true, feedbackTone: true },
+          },
+        },
+      },
+    },
+  });
+}

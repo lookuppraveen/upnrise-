@@ -111,10 +111,14 @@ export function AdminTrainingsView({
             AI: improve any module
           </button>
         </Link>
-        <Button variant="secondary" size="md">
+        {/* Hidden — no import format / parser / server action exists yet.
+            Re-enable once an import spec lands (SCORM ingest, JSON export
+            round-trip, etc.). Until then the "+ Add Training" and
+            "Generate new training" CTAs cover the create paths. */}
+        {/* <Button variant="secondary" size="md">
           <Icon name="layers" size={13} />
           Import
-        </Button>
+        </Button> */}
         <Link href="/admin/generate">
           <button
             type="button"

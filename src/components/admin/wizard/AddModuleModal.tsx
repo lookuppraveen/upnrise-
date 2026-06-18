@@ -1,11 +1,11 @@
 // "What would you like to create today?" modal.
 //
-// Six type cards × stepper + prompt + Generate. Roleplay and Assessment
-// are wired to the existing roleplay/quiz module types; the other four
-// (PPT Coach, Gamified Activity, Evaluation Questions, WhatsApp MCQ)
-// render disabled "Coming soon" tiles until their underlying types ship
-// (PPT/Gamified) or Phase F lands (Question Bank). Quick-prompts at the
-// bottom seed the prompt textarea.
+// Type cards × stepper + prompt + Generate. Most cards feed counts into
+// the bulk-generate route. PPT Coach is a direct-jump card: clicking it
+// routes to the existing Coach create page (where "PPT" is the default
+// coach type), so the admin can configure usecase / objective / upload
+// the deck before persisting. Quick-prompts at the bottom seed the
+// prompt textarea.
 
 "use client";
 
@@ -26,7 +26,7 @@ type LiveKey =
   | "evaluation_module"
   | "evaluation"
   | "whatsapp_mcq";
-type FutureKey = "ppt_coach";
+type JumpKey = "ppt_coach";
 
 type CardConfig =
   | {
@@ -35,15 +35,15 @@ type CardConfig =
       kind: "Module" | "Question Bank";
       unit: "module" | "question";
       defaultCount: number;
-      live: true;
+      mode: "count";
       accent: string;
       icon: "chart" | "message" | "trophy" | "wand";
     }
   | {
-      key: FutureKey;
+      key: JumpKey;
       label: string;
       kind: "Module" | "Question Bank";
-      live: false;
+      mode: "jump";
       accent: string;
       icon: "chart" | "message" | "trophy" | "wand";
     };
@@ -53,7 +53,7 @@ const CARDS: CardConfig[] = [
     key: "ppt_coach",
     label: "PPT Coach",
     kind: "Module",
-    live: false,
+    mode: "jump",
     accent: "#2563eb",
     icon: "chart",
   },
@@ -63,7 +63,7 @@ const CARDS: CardConfig[] = [
     kind: "Module",
     unit: "module",
     defaultCount: 1,
-    live: true,
+    mode: "count",
     accent: "#7c5cd6",
     icon: "message",
   },
@@ -73,7 +73,7 @@ const CARDS: CardConfig[] = [
     kind: "Module",
     unit: "module",
     defaultCount: 1,
-    live: true,
+    mode: "count",
     accent: "#d4a017",
     icon: "trophy",
   },
@@ -83,7 +83,7 @@ const CARDS: CardConfig[] = [
     kind: "Module",
     unit: "question",
     defaultCount: 5,
-    live: true,
+    mode: "count",
     accent: "#10b981",
     icon: "wand",
   },
@@ -93,7 +93,7 @@ const CARDS: CardConfig[] = [
     kind: "Module",
     unit: "module",
     defaultCount: 0,
-    live: true,
+    mode: "count",
     accent: "#06b6d4",
     icon: "wand",
   },
@@ -103,7 +103,7 @@ const CARDS: CardConfig[] = [
     kind: "Question Bank",
     unit: "question",
     defaultCount: 5,
-    live: true,
+    mode: "count",
     accent: "#7c5cd6",
     icon: "wand",
   },
@@ -113,7 +113,7 @@ const CARDS: CardConfig[] = [
     kind: "Question Bank",
     unit: "question",
     defaultCount: 5,
-    live: true,
+    mode: "count",
     accent: "#10b981",
     icon: "message",
   },
@@ -290,10 +290,21 @@ export function AddModuleModal({
             <ModuleTypeCard
               key={c.key}
               cfg={c}
-              count={c.live ? counts[c.key as LiveKey] : 0}
+              count={c.mode === "count" ? counts[c.key] : 0}
               onBump={(delta) =>
-                c.live ? bump(c.key as LiveKey, delta) : undefined
+                c.mode === "count" ? bump(c.key, delta) : undefined
               }
+              onJump={
+                c.mode === "jump"
+                  ? () => {
+                      onClose();
+                      router.push(
+                        `/admin/trainings/${trainingId}/modules/new/coach`,
+                      );
+                    }
+                  : undefined
+              }
+              pending={pending}
             />
           ))}
         </div>
@@ -384,21 +395,21 @@ function ModuleTypeCard({
   cfg,
   count,
   onBump,
+  onJump,
+  pending,
 }: {
   cfg: CardConfig;
   count: number;
   onBump: (delta: number) => void;
+  onJump?: () => void;
+  pending: boolean;
 }) {
-  const selected = cfg.live && count > 0;
-  const isComingSoon = !cfg.live;
+  const selected = cfg.mode === "count" && count > 0;
   return (
     <div
       className={cn(
         "border rounded-[12px] p-4 transition-colors bg-surface",
-        selected
-          ? "border-accent bg-accent-pale/30"
-          : "border-border",
-        isComingSoon && "opacity-60",
+        selected ? "border-accent bg-accent-pale/30" : "border-border",
       )}
     >
       <div className="flex items-start gap-3 mb-3">
@@ -416,16 +427,19 @@ function ModuleTypeCard({
           <div className="text-[11px] text-ink-3">{cfg.kind}</div>
         </div>
       </div>
-      {cfg.live ? (
-        <Stepper
-          value={count}
-          unit={cfg.unit}
-          onBump={onBump}
-        />
+      {cfg.mode === "count" ? (
+        <Stepper value={count} unit={cfg.unit} onBump={onBump} />
       ) : (
-        <div className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-border bg-surface-2 text-[10.5px] font-bold uppercase tracking-[0.08em] text-ink-3">
-          Coming soon
-        </div>
+        <button
+          type="button"
+          onClick={onJump}
+          disabled={pending}
+          suppressHydrationWarning
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border-strong bg-surface text-[12px] font-semibold text-ink hover:bg-surface-2 disabled:opacity-50"
+        >
+          <Icon name="wand" size={11} />
+          Configure & create
+        </button>
       )}
     </div>
   );

@@ -10,9 +10,11 @@
 //   - "Generate" creates a fresh draft training, calls the existing
 //     bulk-generate route, then redirects into Step 2 of that training.
 //
-// PPT Coach is still parked as "Coming soon" — no schema row for it
-// yet. Everything else (Roleplay, Gamified Activity, Assessment,
-// Evaluation Questions, WhatsApp MCQ) is wired live.
+// PPT Coach is a direct-jump card: clicking it spins up a draft
+// training, then routes into the existing Coach create page (where
+// "PPT" is the default coach type). The other cards (Roleplay,
+// Gamified Activity, Assessment, Evaluation Questions, WhatsApp MCQ)
+// feed counts into the bulk-generate route.
 
 "use client";
 
@@ -35,7 +37,7 @@ type LiveKey =
   | "evaluation_module"
   | "evaluation"
   | "whatsapp_mcq";
-type FutureKey = "ppt_coach";
+type JumpKey = "ppt_coach";
 
 type CardConfig =
   | {
@@ -44,15 +46,15 @@ type CardConfig =
       kind: "Module" | "Question Bank";
       unit: "module" | "question";
       defaultCount: number;
-      live: true;
+      mode: "count";
       accent: string;
       icon: "chart" | "message" | "trophy" | "wand" | "clipboard";
     }
   | {
-      key: FutureKey;
+      key: JumpKey;
       label: string;
       kind: "Module" | "Question Bank";
-      live: false;
+      mode: "jump";
       accent: string;
       icon: "chart" | "message" | "trophy" | "wand" | "clipboard";
     };
@@ -62,7 +64,7 @@ const CARDS: CardConfig[] = [
     key: "ppt_coach",
     label: "PPT Coach",
     kind: "Module",
-    live: false,
+    mode: "jump",
     accent: "#2563eb",
     icon: "chart",
   },
@@ -72,7 +74,7 @@ const CARDS: CardConfig[] = [
     kind: "Module",
     unit: "module",
     defaultCount: 1,
-    live: true,
+    mode: "count",
     accent: "#7c5cd6",
     icon: "message",
   },
@@ -82,7 +84,7 @@ const CARDS: CardConfig[] = [
     kind: "Module",
     unit: "module",
     defaultCount: 1,
-    live: true,
+    mode: "count",
     accent: "#d4a017",
     icon: "trophy",
   },
@@ -92,7 +94,7 @@ const CARDS: CardConfig[] = [
     kind: "Module",
     unit: "question",
     defaultCount: 5,
-    live: true,
+    mode: "count",
     accent: "#10b981",
     icon: "clipboard",
   },
@@ -102,7 +104,7 @@ const CARDS: CardConfig[] = [
     kind: "Question Bank",
     unit: "question",
     defaultCount: 5,
-    live: true,
+    mode: "count",
     accent: "#7c5cd6",
     icon: "wand",
   },
@@ -112,7 +114,7 @@ const CARDS: CardConfig[] = [
     kind: "Question Bank",
     unit: "question",
     defaultCount: 5,
-    live: true,
+    mode: "count",
     accent: "#10b981",
     icon: "message",
   },
@@ -227,6 +229,21 @@ export function GeneratorConsole() {
     }
   }
 
+  // PPT Coach jump path: spin up a draft training, then route into the
+  // existing Coach create page where the admin picks usecase + objective
+  // and uploads the deck. PPT is the default coach type there.
+  async function createPptCoach() {
+    setError(null);
+    setGenerating(true);
+    try {
+      const { id: trainingId } = await createDraftTrainingForGenerator();
+      router.push(`/admin/trainings/${trainingId}/modules/new/coach`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed");
+      setGenerating(false);
+    }
+  }
+
   async function generate() {
     setError(null);
     const total =
@@ -319,10 +336,12 @@ export function GeneratorConsole() {
           <ModuleTypeCard
             key={c.key}
             cfg={c}
-            count={c.live ? counts[c.key as LiveKey] : 0}
+            count={c.mode === "count" ? counts[c.key] : 0}
             onBump={(delta) =>
-              c.live ? bump(c.key as LiveKey, delta) : undefined
+              c.mode === "count" ? bump(c.key, delta) : undefined
             }
+            onJump={c.mode === "jump" ? createPptCoach : undefined}
+            busy={busy}
           />
         ))}
       </div>
@@ -332,9 +351,9 @@ export function GeneratorConsole() {
         <textarea
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
-          rows={6}
+          rows={14}
           placeholder="Ex: A sales negotiation training for a pharmaceutical rep handling a doctor's price objection… AI will use your knowledge base as context."
-          className="w-full bg-surface border border-border-strong rounded-md px-3 py-2.5 text-[13px] focus:outline-none focus:border-accent resize-y leading-[1.5]"
+          className="w-full min-h-[320px] bg-surface border border-border-strong rounded-md px-3 py-2.5 text-[13px] focus:outline-none focus:border-accent resize-y leading-[1.5]"
           suppressHydrationWarning
           disabled={busy}
         />
@@ -439,19 +458,21 @@ function ModuleTypeCard({
   cfg,
   count,
   onBump,
+  onJump,
+  busy,
 }: {
   cfg: CardConfig;
   count: number;
   onBump: (delta: number) => void;
+  onJump?: () => void;
+  busy: boolean;
 }) {
-  const selected = cfg.live && count > 0;
-  const isComingSoon = !cfg.live;
+  const selected = cfg.mode === "count" && count > 0;
   return (
     <div
       className={cn(
         "border rounded-[12px] p-4 transition-colors bg-surface",
         selected ? "border-accent bg-accent-pale/30" : "border-border",
-        isComingSoon && "opacity-60",
       )}
     >
       <div className="flex items-start gap-3 mb-3">
@@ -469,12 +490,19 @@ function ModuleTypeCard({
           <div className="text-[11px] text-ink-3">{cfg.kind}</div>
         </div>
       </div>
-      {cfg.live ? (
+      {cfg.mode === "count" ? (
         <Stepper value={count} unit={cfg.unit} onBump={onBump} />
       ) : (
-        <div className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-border bg-surface-2 text-[10.5px] font-bold uppercase tracking-[0.08em] text-ink-3">
-          Coming soon
-        </div>
+        <button
+          type="button"
+          onClick={onJump}
+          disabled={busy}
+          suppressHydrationWarning
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border-strong bg-surface text-[12px] font-semibold text-ink hover:bg-surface-2 disabled:opacity-50"
+        >
+          <Icon name="wand" size={11} />
+          Configure & create
+        </button>
       )}
     </div>
   );

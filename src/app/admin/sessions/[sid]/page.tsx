@@ -1,14 +1,27 @@
-// Trainee · Roleplay results.
+// Admin · Single roleplay session review.
+//
+// Mirrors the trainee Roleplay Results page so an admin can audit any
+// session in their tenant. Differences from the trainee version:
+//   • role check: admin (loadSessionForAdmin enforces companyId scope)
+//   • session owner is loaded alongside the session row (we need to
+//     show "whose session is this" prominently in the header)
+//   • history + comparative stats use the session OWNER's userId, not
+//     the admin's
+//   • no "Retry session" buttons — admins can't take a trainee's session
+//   • breadcrumb returns to /admin/reports
+//
+// The body markup is intentionally a close copy of /learn/.../results
+// so future tweaks to either page can be ported easily. If/when these
+// diverge further or pick up more pages, extract <SessionResultsView>.
 
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { getSessionUser } from "@/lib/auth/session";
-import { loadSessionForUser } from "@/lib/ai/roleplay-access";
+import { loadSessionForAdmin } from "@/lib/ai/roleplay-access";
 import type { TranscriptTurn } from "@/lib/ai/roleplay";
 import { parseRubric } from "@/lib/ai/scoring";
 import { prisma } from "@/lib/db/client";
 import { Card } from "@/components/ui/Card";
-import { Button } from "@/components/ui/Button";
 import { Icon } from "@/components/ui/Icon";
 import { AIBadge } from "@/components/ui/AIBadge";
 import { cn } from "@/lib/cn";
@@ -31,18 +44,19 @@ import { KeywordCoverageCard } from "@/components/results/KeywordCoverageCard";
 import { ConversationStatsCard } from "@/components/results/ConversationStatsCard";
 import { ComparativeContextCard } from "@/components/results/ComparativeContextCard";
 
-export default async function ResultsPage({
+export default async function AdminSessionPage({
   params,
 }: {
-  params: Promise<{ id: string; mid: string; sid: string }>;
+  params: Promise<{ sid: string }>;
 }) {
-  const { id, mid, sid } = await params;
-  const user = await getSessionUser();
-  if (!user || user.role !== "trainee") notFound();
+  const { sid } = await params;
+  const admin = await getSessionUser();
+  if (!admin || admin.role !== "admin" || !admin.companyId) notFound();
 
-  const session = await loadSessionForUser(user, sid);
+  const session = await loadSessionForAdmin(admin, sid);
   if (!session) notFound();
 
+  const owner = session.user;
   const transcript = session.transcript as unknown as TranscriptTurn[];
   const rubric = session.module.roleplayConfig
     ? parseRubric(session.module.roleplayConfig.rubric)
@@ -52,7 +66,7 @@ export default async function ResultsPage({
 
   const settings = parseAdditionalSettings(session.module.body);
 
-  const [aiFeedback, recordingRow, history, hintsUsed, fullUser, systemNote] =
+  const [aiFeedback, recordingRow, history, hintsUsed, systemNote] =
     await Promise.all([
       prisma.feedback.findFirst({
         where: {
@@ -68,17 +82,8 @@ export default async function ResultsPage({
         select: { body: true },
         orderBy: { createdAt: "desc" },
       }),
-      getAttemptHistory(user.id, session.moduleId, settings.minDurationMin),
+      getAttemptHistory(owner.id, session.moduleId, settings.minDurationMin),
       countHintsUsed(session.id),
-      prisma.user.findUnique({
-        where: { id: user.id },
-        select: {
-          name: true,
-          email: true,
-          team: { select: { name: true } },
-          manager: { select: { name: true, email: true } },
-        },
-      }),
       prisma.feedback.findFirst({
         where: { sessionId: session.id, source: "system" },
         select: { body: true },
@@ -97,17 +102,15 @@ export default async function ResultsPage({
       : [],
   );
   const conversationStats = computeConversationStats(transcript);
-  const comparativeStats = user.companyId
-    ? await getComparativeStats({
-        companyId: user.companyId,
-        userId: user.id,
-        moduleId: session.moduleId,
-        currentScore: session.score,
-        minDurationMin: settings.failBelowMinDuration
-          ? settings.minDurationMin
-          : 0,
-      })
-    : null;
+  const comparativeStats = await getComparativeStats({
+    companyId: admin.companyId,
+    userId: owner.id,
+    moduleId: session.moduleId,
+    currentScore: session.score,
+    minDurationMin: settings.failBelowMinDuration
+      ? settings.minDurationMin
+      : 0,
+  });
 
   const sessionLanguage = (session as { language?: string | null }).language;
   const personaBody = session.module.body as
@@ -118,7 +121,6 @@ export default async function ResultsPage({
     personaBody?.persona?.languages?.[0] ||
     "English";
 
-  const tipsGif = settings.tipsOnReportGif;
   const passScore = rubric?.pass_score ?? 70;
   const overall = session.score;
 
@@ -149,15 +151,18 @@ export default async function ResultsPage({
   const personaFirstName =
     session.module.roleplayConfig?.persona.split(/[,\s]/)[0] ?? "Persona";
 
+  const ownerDisplayName =
+    owner.name?.trim() || owner.email.split("@")[0] || "Trainee";
+
   return (
     <div className="px-7 pt-5 pb-24 max-w-[1280px] mx-auto space-y-6">
       {/* Breadcrumb */}
       <Link
-        href={`/learn/trainings/${id}`}
+        href="/admin/reports"
         className="inline-flex items-center gap-1 text-[12.5px] text-ink-2 hover:text-ink transition-colors"
       >
         <Icon name="chevron-right" size={14} className="rotate-180" />
-        Back to training
+        Back to reports
       </Link>
 
       {/* Auto-fail banner */}
@@ -177,19 +182,28 @@ export default async function ResultsPage({
             </div>
             <p className="text-[12.5px] text-ink-2 leading-snug">
               {systemNote?.body ??
-                `This session ended after ${fmtDuration(session.durationSec)} — below the ${settings.minDurationMin}-minute minimum your trainer set. Retry and stay in the conversation long enough to demonstrate the full flow.`}
+                `This session ended after ${fmtDuration(session.durationSec)} — below the ${settings.minDurationMin}-minute minimum the module enforces.`}
             </p>
           </div>
         </div>
       ) : null}
 
-      {/* Page header */}
-      <header className="flex items-center justify-between gap-4 flex-wrap">
-        <div className="min-w-0">
+      {/* Admin page header — leads with trainee identity */}
+      <header className="flex items-start justify-between gap-4 flex-wrap">
+        <div className="min-w-0 space-y-1.5">
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-accent">
+              Admin Review
+            </span>
+            <span className="text-border-strong">·</span>
+            <span className="text-[10.5px] font-mono text-ink-3">
+              {session.id.slice(0, 8)}
+            </span>
+          </div>
           <h1 className="font-display text-[28px] leading-none uppercase tracking-[0.04em] text-ink">
-            Roleplay Result
+            {ownerDisplayName}&apos;s session
           </h1>
-          <p className="text-[12.5px] text-ink-2 mt-1.5 leading-snug">
+          <p className="text-[12.5px] text-ink-2 leading-snug">
             <span className="text-ink-3">Training:</span>{" "}
             <span className="font-medium text-ink">
               {session.module.training.title}
@@ -204,16 +218,12 @@ export default async function ResultsPage({
             <Icon name="history" size={11} />
             {fmtDuration(session.durationSec)}
           </span>
-          <Link href={`/learn/trainings/${id}/modules/${mid}/play`}>
-            <Button
-              variant="accent"
-              size="md"
-              type="button"
-              suppressHydrationWarning
-            >
-              <Icon name="play" size={11} />
-              Retry session
-            </Button>
+          <Link
+            href={`/admin/employees?search=${encodeURIComponent(owner.email)}`}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border bg-surface text-[11.5px] font-semibold text-ink-2 hover:text-ink"
+          >
+            <Icon name="users" size={11} />
+            View trainee
           </Link>
         </div>
       </header>
@@ -223,7 +233,6 @@ export default async function ResultsPage({
         className="rounded-[var(--r-lg)] border border-border bg-surface overflow-hidden"
         style={{ boxShadow: "var(--shadow-md)" }}
       >
-        {/* Accent top stripe */}
         <div
           className="h-[3px] w-full"
           style={{ background: "var(--ai-grad)" }}
@@ -290,7 +299,6 @@ export default async function ResultsPage({
 
             {/* ── Info column ── */}
             <div className="flex flex-col gap-5 pl-8">
-              {/* Session tags */}
               <div>
                 <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-ink-3 mb-2.5">
                   Session Details
@@ -316,28 +324,27 @@ export default async function ResultsPage({
                 </div>
               </div>
 
-              {/* Divider */}
               <div className="border-t border-border" aria-hidden />
 
-              {/* Meta grid */}
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-4">
                 <MetaCell
                   icon="users"
                   label="Trainee"
-                  value={fullUser?.name || fullUser?.email || "—"}
+                  value={ownerDisplayName}
+                  sub={owner.email}
                 />
                 <MetaCell
                   icon="users"
                   label="Manager"
                   value={
-                    fullUser?.manager?.name ||
-                    fullUser?.manager?.email ||
-                    fullUser?.team?.name ||
+                    owner.manager?.name ||
+                    owner.manager?.email ||
+                    owner.team?.name ||
                     "—"
                   }
                   sub={
-                    fullUser?.manager && fullUser.team?.name
-                      ? `Team · ${fullUser.team.name}`
+                    owner.manager && owner.team?.name
+                      ? `Team · ${owner.team.name}`
                       : undefined
                   }
                 />
@@ -369,7 +376,7 @@ export default async function ResultsPage({
         </div>
       </div>
 
-      {/* ── AI Coaching feedback — prominent, full-width ── */}
+      {/* ── AI Coaching feedback ── */}
       {aiFeedback ? (
         <div
           className="rounded-[var(--r-lg)] border p-6"
@@ -418,19 +425,17 @@ export default async function ResultsPage({
         </div>
       ) : null}
 
-      {/* ── How you compare (peer + personal benchmarks) ── */}
-      {comparativeStats ? (
-        <Card pad="md" className="space-y-4">
-          <SectionHeader
-            title="How you compare"
-            subtitle="Your score in context — peers, history, trend"
-          />
-          <ComparativeContextCard
-            currentScore={session.score}
-            stats={comparativeStats}
-          />
-        </Card>
-      ) : null}
+      {/* ── How they compare (peer + personal benchmarks) ── */}
+      <Card pad="md" className="space-y-4">
+        <SectionHeader
+          title="How they compare"
+          subtitle="This trainee&apos;s score in context — peers, history, trend"
+        />
+        <ComparativeContextCard
+          currentScore={session.score}
+          stats={comparativeStats}
+        />
+      </Card>
 
       {/* ── Evaluation Criteria + Breakdown ── */}
       <div className="grid gap-5 lg:grid-cols-2">
@@ -490,7 +495,7 @@ export default async function ResultsPage({
       <Card pad="md" className="space-y-4">
         <SectionHeader
           title="Conversation Stats"
-          subtitle="What the transcript itself tells us about how you spoke"
+          subtitle="What the transcript itself tells us about how the trainee spoke"
         />
         <ConversationStatsCard stats={conversationStats} />
       </Card>
@@ -500,7 +505,7 @@ export default async function ResultsPage({
         <Card pad="md" className="space-y-4 min-h-[180px]">
           <SectionHeader
             title="Strengths"
-            subtitle="Positive aspects of your performance"
+            subtitle="Positive aspects of the performance"
           />
           <SkillList
             skills={session.strongSkills}
@@ -511,7 +516,7 @@ export default async function ResultsPage({
         <Card pad="md" className="space-y-4 min-h-[180px]">
           <SectionHeader
             title="Improvement Areas"
-            subtitle="Focus points for your next attempt"
+            subtitle="Focus points for the next attempt"
           />
           <SkillList
             skills={session.weakSkills}
@@ -572,22 +577,9 @@ export default async function ResultsPage({
                 className="inline-block w-2.5 h-2.5 rounded-sm"
                 style={{ background: "#f59e0b" }}
               />
-              You
+              Trainee
             </span>
           </div>
-        </Card>
-      ) : null}
-
-      {/* ── Tips GIF ── */}
-      {tipsGif ? (
-        <Card pad="md" className="space-y-3">
-          <SectionHeader title="Tips from your trainer" />
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img
-            src={tipsGif.dataUrl}
-            alt={tipsGif.name}
-            className="max-w-[480px] rounded-md border border-border bg-surface-2 object-cover"
-          />
         </Card>
       ) : null}
 
@@ -599,31 +591,21 @@ export default async function ResultsPage({
         />
         <div className="flex flex-col gap-3">
           {transcript.map((t, i) => (
-            <TranscriptLine key={i} turn={t} personaFirst={personaFirstName} />
+            <TranscriptLine
+              key={i}
+              turn={t}
+              personaFirst={personaFirstName}
+              traineeFirst={ownerDisplayName}
+            />
           ))}
         </div>
       </Card>
-
-      {/* ── Bottom action ── */}
-      <div className="flex justify-end pt-2">
-        <Link href={`/learn/trainings/${id}/modules/${mid}/play`}>
-          <Button
-            variant="accent"
-            size="md"
-            type="button"
-            suppressHydrationWarning
-          >
-            <Icon name="play" size={11} />
-            Retry session
-          </Button>
-        </Link>
-      </div>
     </div>
   );
 }
 
 // ═══════════════════════════════════════════════════════════
-// Layout atoms
+// Layout atoms (mirrors of the trainee page — keep in sync)
 // ═══════════════════════════════════════════════════════════
 
 function SectionHeader({
@@ -763,10 +745,6 @@ function PassFailBadge({
   );
 }
 
-// ═══════════════════════════════════════════════════════════
-// Score rings
-// ═══════════════════════════════════════════════════════════
-
 function FailedRing() {
   const size = 200;
   return (
@@ -834,7 +812,6 @@ function ScoreRing({
         viewBox={`0 0 ${size} ${size}`}
         style={{ display: "block" }}
       >
-        {/* Track ring */}
         <circle
           cx={cx}
           cy={cy}
@@ -843,7 +820,6 @@ function ScoreRing({
           stroke="var(--surface-2)"
           strokeWidth={stroke}
         />
-        {/* Filled arc — rotated so the arc starts at the top (12 o'clock) */}
         <g transform={`rotate(-90, ${cx}, ${cy})`}>
           <circle
             cx={cx}
@@ -858,7 +834,6 @@ function ScoreRing({
           />
         </g>
       </svg>
-      {/* Score number overlay — pure inline style to avoid Tailwind scoping issues */}
       <div
         style={{
           position: "absolute",
@@ -879,10 +854,6 @@ function ScoreRing({
     </div>
   );
 }
-
-// ═══════════════════════════════════════════════════════════
-// Rubric bars
-// ═══════════════════════════════════════════════════════════
 
 function RubricBars({
   criteria,
@@ -1024,10 +995,6 @@ function CriterionDetail({
   );
 }
 
-// ═══════════════════════════════════════════════════════════
-// Skill lists (strengths / improvements)
-// ═══════════════════════════════════════════════════════════
-
 function SkillList({
   skills,
   tone,
@@ -1072,19 +1039,19 @@ function SkillList({
   );
 }
 
-// ═══════════════════════════════════════════════════════════
-// Transcript
-// ═══════════════════════════════════════════════════════════
-
 function TranscriptLine({
   turn,
   personaFirst,
+  traineeFirst,
 }: {
   turn: TranscriptTurn;
   personaFirst: string;
+  traineeFirst: string;
 }) {
   const isPersona = turn.role === "persona";
-  const initial = isPersona ? personaFirst.charAt(0).toUpperCase() : "Y";
+  const initial = isPersona
+    ? personaFirst.charAt(0).toUpperCase()
+    : traineeFirst.charAt(0).toUpperCase();
 
   return (
     <div

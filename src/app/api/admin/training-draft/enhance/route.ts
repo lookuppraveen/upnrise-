@@ -19,7 +19,7 @@ import { getAIConfig } from "@/lib/ai/config";
 const Body = z.object({ prompt: z.string().min(10).max(4000) });
 
 const OutSchema = z.object({
-  prompt: z.string().min(50).max(4000),
+  prompt: z.string().min(50).max(8000),
 });
 
 export async function POST(req: Request) {
@@ -48,37 +48,67 @@ export async function POST(req: Request) {
   ].join("\n");
 
   const ai = await getAIConfig();
-  const result = await anthropic.messages.create({
-    model: ai.fastModel,
-    max_tokens: 1500,
-    system,
-    tools: [
-      {
-        name: "submit_enhanced",
-        description: "Submit the enhanced multi-section training brief.",
-        input_schema: {
-          type: "object",
-          properties: { prompt: { type: "string" } },
-          required: ["prompt"],
+  let result;
+  try {
+    result = await anthropic.messages.create({
+      model: ai.fastModel,
+      max_tokens: 2500,
+      system,
+      tools: [
+        {
+          name: "submit_enhanced",
+          description: "Submit the enhanced multi-section training brief.",
+          input_schema: {
+            type: "object",
+            properties: { prompt: { type: "string" } },
+            required: ["prompt"],
+          },
         },
-      },
-    ],
-    tool_choice: { type: "tool", name: "submit_enhanced" },
-    messages: [
-      {
-        role: "user",
-        content: `## Admin's brief\n${parsed.data.prompt}\n\nRewrite it as a structured training brief.`,
-      },
-    ],
-  });
+      ],
+      tool_choice: { type: "tool", name: "submit_enhanced" },
+      messages: [
+        {
+          role: "user",
+          content: `## Admin's brief\n${parsed.data.prompt}\n\nRewrite it as a structured training brief.`,
+        },
+      ],
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "unknown AI error";
+    console.error("[training-draft/enhance] anthropic call failed:", err);
+    return NextResponse.json(
+      { error: `AI call failed: ${msg}` },
+      { status: 500 },
+    );
+  }
 
   const toolUse = result.content.find((b) => b.type === "tool_use");
   if (!toolUse || toolUse.type !== "tool_use") {
-    return NextResponse.json({ error: "no draft" }, { status: 502 });
+    console.error(
+      "[training-draft/enhance] no tool_use block. stop_reason:",
+      result.stop_reason,
+      "content:",
+      JSON.stringify(result.content).slice(0, 500),
+    );
+    return NextResponse.json(
+      { error: `AI returned no draft (stop_reason: ${result.stop_reason})` },
+      { status: 502 },
+    );
   }
   const validated = OutSchema.safeParse(toolUse.input);
   if (!validated.success) {
-    return NextResponse.json({ error: "invalid draft" }, { status: 502 });
+    console.error(
+      "[training-draft/enhance] schema validation failed:",
+      validated.error.issues,
+      "raw tool input length:",
+      JSON.stringify(toolUse.input).length,
+    );
+    return NextResponse.json(
+      {
+        error: `AI draft did not match schema: ${validated.error.issues[0]?.message ?? "unknown"}`,
+      },
+      { status: 502 },
+    );
   }
   return NextResponse.json(validated.data);
 }

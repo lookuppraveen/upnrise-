@@ -9,6 +9,7 @@
 // and the weekly learning-pattern line chart needs per-day rollups we
 // don't materialize.
 
+import Link from "next/link";
 import { getSessionUser } from "@/lib/auth/session";
 import { prisma } from "@/lib/db/client";
 import {
@@ -793,32 +794,39 @@ function RecentSessions({
                     ? "text-warn"
                     : "text-bad";
             return (
-              <li
-                key={s.id}
-                className="px-5 py-3 flex items-center gap-4"
-              >
-                <span className="font-mono text-[11px] text-ink-3 w-[68px] shrink-0">
-                  {new Date(s.startedAt).toLocaleDateString("en-US", {
-                    month: "short",
-                    day: "numeric",
-                  })}
-                </span>
-                <span className="flex-1 min-w-0">
-                  <span className="block truncate text-[13px] text-ink">
-                    {who} · {s.module.training.title}
-                  </span>
-                  <span className="block truncate text-[11.5px] text-ink-3">
-                    {s.module.name}
-                  </span>
-                </span>
-                <span
-                  className={cn(
-                    "font-display text-[20px] leading-none tabular-nums shrink-0",
-                    scoreTone,
-                  )}
+              <li key={s.id}>
+                <Link
+                  href={`/admin/sessions/${s.id}`}
+                  className="px-5 py-3 flex items-center gap-4 hover:bg-surface-2 transition-colors"
                 >
-                  {s.score ?? "—"}
-                </span>
+                  <span className="font-mono text-[11px] text-ink-3 w-[68px] shrink-0">
+                    {new Date(s.startedAt).toLocaleDateString("en-US", {
+                      month: "short",
+                      day: "numeric",
+                    })}
+                  </span>
+                  <span className="flex-1 min-w-0">
+                    <span className="block truncate text-[13px] text-ink">
+                      {who} · {s.module.training.title}
+                    </span>
+                    <span className="block truncate text-[11.5px] text-ink-3">
+                      {s.module.name}
+                    </span>
+                  </span>
+                  <span
+                    className={cn(
+                      "font-display text-[20px] leading-none tabular-nums shrink-0",
+                      scoreTone,
+                    )}
+                  >
+                    {s.score ?? "—"}
+                  </span>
+                  <Icon
+                    name="chevron-right"
+                    size={14}
+                    className="text-ink-3 shrink-0"
+                  />
+                </Link>
               </li>
             );
           })}

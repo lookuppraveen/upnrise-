@@ -59,7 +59,7 @@ export default async function AdminVideoProvidersPage() {
     <div className="px-7 pt-6 pb-20 max-w-[1100px] space-y-8">
       <header className="space-y-2">
         <h1 className="font-display text-[32px] leading-[1.05] -tracking-[0.015em]">
-          Video Providers
+          Avatars & Voices
         </h1>
         <p className="text-ink-2 text-[13.5px] max-w-[640px] leading-[1.5]">
           Add the API key for your avatar render service. The default
