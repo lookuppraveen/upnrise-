@@ -2,6 +2,22 @@
 // + SpeechRecognition) so the Roleplay player can do mic-in / voice-out
 // without any backend cost.
 //
+// Conversational behavior (Phase J update):
+//   • SpeechRecognition runs in continuous + interimResults mode so
+//     short thinking pauses don't cut the user off.
+//   • Two listening modes:
+//       - "active"     → silence-timer commit. If the user goes quiet
+//                         for `silenceThresholdMs`, we hand the
+//                         accumulated transcript to onTranscript.
+//       - "background" → mic stays open during persona TTS for
+//                         interruption detection. The moment we see
+//                         interim text, we fire `onInterruption`
+//                         (player cancels TTS) and flip to "active"
+//                         so the silence timer takes over.
+//   • The browser's own no-speech end is auto-restarted while the
+//     player wants the mic open, so the listening session feels
+//     continuous even when SpeechRecognition's session timer expires.
+//
 // Browser support snapshot (Apr 2026):
 //   * SpeechSynthesis (TTS) — Chrome, Edge, Safari, Firefox ✅
 //   * SpeechRecognition (STT) — Chrome, Edge, Safari ✅
@@ -16,8 +32,23 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+// Threshold of silence after the user has spoken before we commit
+// the transcript. Long enough to survive a "uhh… let me think" pause,
+// short enough that the AI doesn't sit idle after a clean stop.
+const DEFAULT_SILENCE_MS = 1800;
+
+// Min interim length before we count it as a real interruption. Filters
+// out one-syllable noise / breath that browser STT sometimes emits.
+const INTERRUPTION_MIN_CHARS = 3;
+
+type RecognitionResultEntry = {
+  isFinal: boolean;
+  0: { transcript: string };
+};
+
 type RecognitionResultEvent = {
-  results: ArrayLike<ArrayLike<{ transcript: string }>>;
+  results: ArrayLike<RecognitionResultEntry>;
+  resultIndex: number;
 };
 
 type RecognitionInstance = {
@@ -40,6 +71,7 @@ type WindowWithRecognition = Window & {
 };
 
 export type VoiceState = "idle" | "listening" | "speaking";
+export type ListeningMode = "active" | "background";
 export type VoiceGender = "female" | "male" | null;
 
 export type VoiceOption = {
@@ -60,12 +92,25 @@ export function useVoiceMode(opts: {
    *  this voice manually via the dropdown — honour their choice. */
   voiceUri?: string | null;
   onTranscript: (text: string) => void;
+  /** Fired when interim speech is detected while listening in
+   *  "background" mode (mic-open-during-TTS). The player typically
+   *  cancels persona TTS here; the hook auto-flips to "active" so the
+   *  silence-timer commit takes over from this point. */
+  onInterruption?: () => void;
+  /** ms of consecutive silence before pending transcript is committed
+   *  in active mode. Default 1800. */
+  silenceThresholdMs?: number;
 }): {
   state: VoiceState;
   ttsSupported: boolean;
   sttSupported: boolean;
   speak: (text: string, opts?: { voiceUri?: string | null }) => Promise<void>;
-  startListening: () => void;
+  /** Open the mic. `mode: "background"` listens for interruption only
+   *  (no silence commit); `mode: "active"` (default) commits on silence. */
+  startListening: (opts?: { mode?: ListeningMode }) => void;
+  /** Switch an already-open mic from background → active (or vice
+   *  versa) without restarting the recognition session. */
+  setListeningMode: (mode: ListeningMode) => void;
   stopListening: () => void;
   cancelSpeech: () => void;
   /** The voice URI the hook is currently using, or null if default. */
@@ -80,15 +125,35 @@ export function useVoiceMode(opts: {
     voiceGender = null,
     voiceUri = null,
     onTranscript,
+    onInterruption,
+    silenceThresholdMs = DEFAULT_SILENCE_MS,
   } = opts;
   const [state, setState] = useState<VoiceState>("idle");
   const recognitionRef = useRef<RecognitionInstance | null>(null);
-  // Stash the latest onTranscript so we don't have to recreate the
+  // Stash the latest callbacks so we don't have to recreate the
   // recognition instance every time the parent re-renders.
   const onTranscriptRef = useRef(onTranscript);
+  const onInterruptionRef = useRef(onInterruption);
   useEffect(() => {
     onTranscriptRef.current = onTranscript;
   }, [onTranscript]);
+  useEffect(() => {
+    onInterruptionRef.current = onInterruption;
+  }, [onInterruption]);
+
+  // Live values the recognition handlers read without needing to be
+  // recreated on every parent render.
+  const listeningModeRef = useRef<ListeningMode>("active");
+  // The player's intent — true means "keep restarting recognition
+  // if the browser auto-ends it; we still want the mic open."
+  const wantsListeningRef = useRef(false);
+  const accumulatedFinalRef = useRef("");
+  const interimRef = useRef("");
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const silenceThresholdRef = useRef(silenceThresholdMs);
+  useEffect(() => {
+    silenceThresholdRef.current = silenceThresholdMs;
+  }, [silenceThresholdMs]);
 
   // Browser-API detection has to happen *after* hydration — checking
   // `typeof window` inside render lies during SSR (returns false) but
@@ -105,9 +170,39 @@ export function useVoiceMode(opts: {
     setSttSupported(!!(w.SpeechRecognition || w.webkitSpeechRecognition));
   }, []);
 
-  // Build the SpeechRecognition instance once. Restart it from event
-  // handlers below — `recognition.start()` after a previous run throws
-  // if the instance is busy, hence the state machine.
+  const clearSilenceTimer = useCallback(() => {
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+  }, []);
+
+  // Commit accumulated transcript and stop the recognition session.
+  // The player decides whether to re-open the mic after AI replies.
+  const commitPending = useCallback(() => {
+    clearSilenceTimer();
+    const text = (accumulatedFinalRef.current + " " + interimRef.current)
+      .replace(/\s+/g, " ")
+      .trim();
+    accumulatedFinalRef.current = "";
+    interimRef.current = "";
+    wantsListeningRef.current = false;
+    const rec = recognitionRef.current;
+    if (rec) {
+      try {
+        rec.stop();
+      } catch {
+        /* ignore — already stopped */
+      }
+    }
+    if (text) {
+      onTranscriptRef.current(text);
+    }
+  }, [clearSilenceTimer]);
+
+  // Build the SpeechRecognition instance once per (sttSupported, lang)
+  // pair. continuous: true keeps it alive through pauses; interimResults
+  // lets us light up the silence timer mid-utterance.
   useEffect(() => {
     if (!sttSupported || typeof window === "undefined") return;
     const w = window as WindowWithRecognition;
@@ -115,24 +210,74 @@ export function useVoiceMode(opts: {
     if (!Ctor) return;
     const rec = new Ctor();
     rec.lang = lang;
-    rec.continuous = false;
-    rec.interimResults = false;
+    rec.continuous = true;
+    rec.interimResults = true;
+
     rec.onresult = (e) => {
-      const transcript = e.results?.[0]?.[0]?.transcript ?? "";
-      if (transcript.trim().length > 0) {
-        onTranscriptRef.current(transcript.trim());
+      // Rebuild the full transcript state from event.results — interim
+      // results grow incrementally so a stateful index is brittle.
+      let allFinal = "";
+      let interim = "";
+      const results = e.results;
+      for (let i = 0; i < results.length; i++) {
+        const r = results[i];
+        const t = r[0]?.transcript ?? "";
+        if (r.isFinal) allFinal += t;
+        else interim += t;
       }
-      setState("idle");
+      accumulatedFinalRef.current = allFinal;
+      interimRef.current = interim;
+
+      const combined = (allFinal + " " + interim).trim();
+      const hasContent = combined.length >= INTERRUPTION_MIN_CHARS;
+
+      if (listeningModeRef.current === "background") {
+        // Interruption: a real chunk of speech arrived while persona
+        // TTS was playing. Fire the callback (player cancels TTS) and
+        // flip into active mode so the silence timer takes over from
+        // here.
+        if (hasContent) {
+          listeningModeRef.current = "active";
+          onInterruptionRef.current?.();
+          // Start the silence countdown immediately — the user has
+          // started speaking; we now wait for them to finish.
+          clearSilenceTimer();
+          silenceTimerRef.current = setTimeout(() => {
+            commitPending();
+          }, silenceThresholdRef.current);
+        }
+        return;
+      }
+
+      // Active mode: any new speech postpones the commit.
+      if (combined.length > 0) {
+        clearSilenceTimer();
+        silenceTimerRef.current = setTimeout(() => {
+          commitPending();
+        }, silenceThresholdRef.current);
+      }
     };
+
     rec.onerror = (e) => {
       // `no-speech` and `aborted` are normal — user paused or cancelled.
       // Network / not-allowed are the ones worth surfacing.
       if (e.error !== "no-speech" && e.error !== "aborted") {
         console.warn("[voice] recognition error:", e.error);
       }
-      setState("idle");
     };
+
     rec.onend = () => {
+      // Browsers will auto-end continuous sessions after ~10-60s of
+      // silence. If the player still wants the mic open, restart so
+      // listening feels uninterrupted to the user.
+      if (wantsListeningRef.current && enabled) {
+        try {
+          rec.start();
+          return;
+        } catch {
+          // already starting or transient error — fall through to idle
+        }
+      }
       setState((s) => (s === "listening" ? "idle" : s));
     };
     recognitionRef.current = rec;
@@ -144,6 +289,10 @@ export function useVoiceMode(opts: {
       }
       recognitionRef.current = null;
     };
+    // commitPending + clearSilenceTimer are stable (useCallback). enabled
+    // is read off the live closure inside onend so a toggle doesn't
+    // recreate the recognizer mid-conversation.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sttSupported, lang]);
 
   // Stop any pending speech / mic when the feature flips off so the
@@ -153,9 +302,11 @@ export function useVoiceMode(opts: {
     if (typeof window !== "undefined" && window.speechSynthesis) {
       window.speechSynthesis.cancel();
     }
+    wantsListeningRef.current = false;
+    clearSilenceTimer();
     recognitionRef.current?.abort();
     setState("idle");
-  }, [enabled]);
+  }, [enabled, clearSilenceTimer]);
 
   // Pick a TTS voice. Manual override (`voiceUri`) wins; otherwise we
   // auto-pick by lang + persona gender. Browsers expose voices
@@ -233,11 +384,20 @@ export function useVoiceMode(opts: {
         }
         u.onstart = () => setState("speaking");
         u.onend = () => {
-          setState("idle");
+          // Only flip to idle if we aren't also keeping the mic open
+          // for interruption / commit. The listening state is owned
+          // by the SR onend handler in that case.
+          setState((s) => {
+            if (s !== "speaking") return s;
+            return wantsListeningRef.current ? "listening" : "idle";
+          });
           resolve();
         };
         u.onerror = () => {
-          setState("idle");
+          setState((s) => {
+            if (s !== "speaking") return s;
+            return wantsListeningRef.current ? "listening" : "idle";
+          });
           resolve();
         };
         synth.speak(u);
@@ -245,26 +405,76 @@ export function useVoiceMode(opts: {
     [enabled, ttsSupported, lang],
   );
 
-  const startListening = useCallback(() => {
-    if (!enabled || !sttSupported) return;
-    const rec = recognitionRef.current;
-    if (!rec) return;
-    try {
-      // If TTS is still mid-sentence, cancel it before opening the mic
-      // so the avatar doesn't hear itself.
-      window.speechSynthesis?.cancel();
-      rec.start();
-      setState("listening");
-    } catch (e) {
-      // Calling start() while already started throws. Treat as no-op.
-      console.warn("[voice] start() failed:", e);
+  const startListening = useCallback(
+    (opts?: { mode?: ListeningMode }) => {
+      if (!enabled || !sttSupported) return;
+      const rec = recognitionRef.current;
+      if (!rec) return;
+      listeningModeRef.current = opts?.mode ?? "active";
+      // Reset state for a fresh utterance. Without this, a stale
+      // interim from the previous turn could leak into the commit.
+      accumulatedFinalRef.current = "";
+      interimRef.current = "";
+      clearSilenceTimer();
+      wantsListeningRef.current = true;
+      try {
+        // In background mode the persona is still speaking — DON'T
+        // cancel synth here, that would silence the TTS we want to
+        // interrupt-detect against. In active mode, cancel any
+        // dangling TTS so the avatar doesn't hear itself.
+        if (listeningModeRef.current === "active") {
+          window.speechSynthesis?.cancel();
+        }
+        rec.start();
+        // Only set listening state if TTS isn't currently active.
+        // Otherwise the user sees "speaking" + listening simultaneously
+        // (background mode), which is visually correct as "speaking".
+        setState((s) => (s === "speaking" ? s : "listening"));
+      } catch (e) {
+        // Calling start() while already started throws. That's fine —
+        // we just updated the mode/refs above, which is what callers
+        // care about when "starting" a mode switch on a running rec.
+        console.warn("[voice] start() failed:", e);
+      }
+    },
+    [enabled, sttSupported, clearSilenceTimer],
+  );
+
+  const setListeningMode = useCallback((mode: ListeningMode) => {
+    listeningModeRef.current = mode;
+    // Going active mid-session: kick the silence timer based on
+    // whatever content has already accumulated. If the user has been
+    // silent through the background phase, the timer fires after
+    // the threshold and commits whatever (likely empty) interim
+    // they made — same as the "no speech" pathway in onresult.
+    if (mode === "active") {
+      const combined = (
+        accumulatedFinalRef.current +
+        " " +
+        interimRef.current
+      ).trim();
+      if (combined.length > 0) {
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = setTimeout(() => {
+          commitPending();
+        }, silenceThresholdRef.current);
+      }
+    } else if (silenceTimerRef.current) {
+      // Going background — no auto-commit until interruption flips us
+      // back to active.
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
     }
-  }, [enabled, sttSupported]);
+  }, [commitPending]);
 
   const stopListening = useCallback(() => {
-    recognitionRef.current?.stop();
+    wantsListeningRef.current = false;
+    clearSilenceTimer();
+    accumulatedFinalRef.current = "";
+    interimRef.current = "";
+    recognitionRef.current?.abort();
     setState((s) => (s === "listening" ? "idle" : s));
-  }, []);
+  }, [clearSilenceTimer]);
 
   const cancelSpeech = useCallback(() => {
     if (typeof window !== "undefined" && window.speechSynthesis) {
@@ -279,6 +489,7 @@ export function useVoiceMode(opts: {
     sttSupported,
     speak,
     startListening,
+    setListeningMode,
     stopListening,
     cancelSpeech,
     selectedVoiceUri,

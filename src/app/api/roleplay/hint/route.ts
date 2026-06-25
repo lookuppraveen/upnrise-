@@ -25,6 +25,10 @@ import type { TranscriptTurn } from "@/lib/ai/roleplay";
 const Body = z.object({
   sessionId: z.string().min(1).max(100),
   type: z.enum(["complete", "bullet"]).default("complete"),
+  // auto=true → background refresh after each persona turn. We skip
+  // the Feedback persist and the client skips the hintsUsed bump so
+  // these auto-suggestions don't burn the trainee's hint allowance.
+  auto: z.boolean().default(false),
 });
 
 const Out = z.object({
@@ -120,20 +124,22 @@ export async function POST(req: Request) {
         { status: 502 },
       );
     }
-    // Persist the hint as a Feedback row so the results page can count
-    // hints used and show the "HINT USED" badge. source="hint" keeps it
-    // out of the AI coaching feedback card (results query already
-    // excludes rows where source !== claude/etc).
-    await prisma.feedback.create({
-      data: {
-        recipientId: user.id,
-        sessionId: session.id,
-        trainingId: session.module.training.id,
-        kind: "ai",
-        body: validated.data.hint,
-        source: "hint",
-      },
-    });
+    // Manual hint requests count against the trainee's allowance and
+    // surface on the results page. Auto-suggested replies (rendered
+    // passively after every persona turn) do neither — they're just
+    // teleprompter UX, not coaching the trainee asked for.
+    if (!parsed.data.auto) {
+      await prisma.feedback.create({
+        data: {
+          recipientId: user.id,
+          sessionId: session.id,
+          trainingId: session.module.training.id,
+          kind: "ai",
+          body: validated.data.hint,
+          source: "hint",
+        },
+      });
+    }
     return NextResponse.json(validated.data);
   } catch (e) {
     console.error("[hint] LLM error", e);

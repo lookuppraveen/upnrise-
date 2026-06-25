@@ -224,13 +224,25 @@ export function RoleplayPlayer({
     enabled: voiceMode,
     voiceGender: personaGender,
     voiceUri: manualVoiceUri,
+    // 2000ms of silence → commit. Long enough that brief "uhh let me
+    // think…" pauses don't cut the user off; short enough that a
+    // clean stop doesn't feel laggy.
+    silenceThresholdMs: 2000,
     onTranscript: (text) => {
-      // The hook calls this when STT finishes a chunk. Stick it
-      // straight into the composer and auto-submit so the loop
-      // closes — learner speaks → we send → AI streams → we TTS → loop.
+      // The hook calls this when STT commits a chunk (silence timer or
+      // final result). Stick it straight into the composer and
+      // auto-submit so the loop closes — learner speaks → we send →
+      // AI streams → we TTS → loop.
       setInput(text);
       void sendText(text);
     },
+    // Note: interruption-while-AI-speaks is disabled in this build.
+    // Browser-side echo cancellation isn't reliable enough to keep
+    // the mic open during persona TTS — speaker bleed produces false
+    // interim text that cuts the AI off mid-sentence. The mic only
+    // opens AFTER persona TTS completes. When useStreamingAvatar
+    // grows a stop() method we can re-enable interruption behind a
+    // manual "tap to interrupt" button.
   });
 
   // Auto-flow ("demo conversation") — when on, the player runs the
@@ -455,10 +467,14 @@ export function RoleplayPlayer({
   }
 
   // Voice loop: when a persona bubble finishes streaming, speak it,
-  // then either (a) open the mic for the trainee or (b) trigger the
+  // then either (a) hand the mic to the trainee or (b) trigger the
   // auto-flow step that speaks the suggested reply and submits it.
-  // Skips bubbles we've already spoken so re-renders don't make the
-  // avatar repeat.
+  //
+  // Cadence is shaped to feel like two people talking: persona finishes
+  // its line → ~700ms beat → mic opens. Shorter feels rushed, longer
+  // feels awkward. The mic stays CLOSED during persona TTS — opening
+  // it for interruption-detection produced false interim text from
+  // speaker bleed that cut the AI off mid-sentence.
   useEffect(() => {
     if (!voiceMode || streaming || stoppingRef.current) return;
     const lastIdx = bubbles.length - 1;
@@ -490,23 +506,29 @@ export function RoleplayPlayer({
       } else {
         await voice.speak(last.content);
       }
+
+      // Natural turn-gap before the user's mic opens. This is the
+      // ~half-second beat humans take between speakers — gives the
+      // trainee a moment to absorb what the persona just said.
+      await new Promise((r) => setTimeout(r, 700));
+      if (stoppingRef.current) return;
+
       // Branch: auto-flow takes over the trainee's turn; manual mode
-      // opens the mic so the trainee can speak themselves.
+      // hands the mic over for the user's reply.
       if (autoFlowRef.current) {
         void runAutoFlowAfterPersona();
         return;
       }
-      // Speak resolves even when TTS isn't supported / cancelled.
-      // Only auto-listen if we're still in voice mode + nothing's
-      // happening. Skip when STT isn't supported (Firefox) — the
-      // user can still type.
+      // Open the mic in active mode — silence timer (2000ms) commits
+      // the user's reply when they stop talking. Skip when STT isn't
+      // supported (Firefox) — the user can still type.
       if (
         voiceMode &&
         !stoppingRef.current &&
         voice.sttSupported &&
         !streaming
       ) {
-        voice.startListening();
+        voice.startListening({ mode: "active" });
       }
     })();
     // runAutoFlowAfterPersona is read via ref-stable closures (autoFlowRef,
@@ -731,6 +753,10 @@ export function RoleplayPlayer({
   const [hintsUsed, setHintsUsed] = useState(0);
   const [currentHint, setCurrentHint] = useState<string | null>(null);
   const [hintLoading, setHintLoading] = useState(false);
+  // hintRefreshing = an auto-suggestion is being fetched in the
+  // background while a stale one is still visible. Keeps the previous
+  // hint readable so the trainee isn't stranded mid-conversation.
+  const [hintRefreshing, setHintRefreshing] = useState(false);
   const [hintError, setHintError] = useState<string | null>(null);
 
   const hintsAllowed = hints && hints.kind !== "no";
@@ -758,6 +784,10 @@ export function RoleplayPlayer({
       const data = (await res.json()) as { hint: string };
       setCurrentHint(data.hint);
       setHintsUsed((n) => n + 1);
+      // Drop any deferred auto-hint so a stale background suggestion
+      // doesn't overwrite the manual "Try another" the user just
+      // explicitly asked for.
+      pendingAutoHintRef.current = null;
     } catch (e) {
       setHintError(e instanceof Error ? e.message : "Failed");
     } finally {
@@ -765,41 +795,94 @@ export function RoleplayPlayer({
     }
   }
 
-  // Auto-load the first hint so the trainee can read the exact words
-  // to say without hunting for the button. Two firing conditions cover
-  // both flows:
-  //   - AI starts: wait for the persona's opening line to finish, then
-  //     fetch a response suggestion grounded in what they just said.
-  //   - User starts: fire immediately on session ready — the hint API
-  //     handles the "no turns yet" case and returns an opening line.
-  // Fires once per session, respects hint-limit caps, and skips
-  // entirely if the admin disabled hints.
-  const autoHintFiredRef = useRef(false);
+  // Auto-suggest a reply after EVERY new persona turn so the
+  // teleprompter line always reflects what the customer just said.
+  // Uses the auto=true mode of /api/roleplay/hint, which skips the
+  // Feedback persist and doesn't count toward the trainee's hint cap —
+  // these are background suggestions, not user-requested help.
+  //
+  // Display is DEFERRED while persona TTS is still playing: the fetch
+  // runs in parallel with TTS (so it's ready in time), but the visible
+  // hint only changes after the persona has finished speaking. This
+  // keeps the right panel from visibly updating mid-sentence, which
+  // breaks the illusion of a natural conversation.
+  const lastAutoSuggestedAtRef = useRef(-1);
+  const pendingAutoHintRef = useRef<string | null>(null);
+  // voiceStateRef mirrors voice.state for callback closures that need
+  // a fresh read without re-binding on every render.
+  const voiceStateRef = useRef(voice.state);
   useEffect(() => {
-    if (autoHintFiredRef.current) return;
+    voiceStateRef.current = voice.state;
+  }, [voice.state]);
+
+  async function fetchAutoSuggestion() {
+    if (!sessionId || !hintsAllowed) return;
+    setHintError(null);
+    setHintRefreshing(true);
+    try {
+      const res = await fetch("/api/roleplay/hint", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId,
+          type: hints?.type ?? "complete",
+          auto: true,
+        }),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(data.error ?? `hint failed: ${res.status}`);
+      }
+      const data = (await res.json()) as { hint: string };
+      // If persona TTS is still playing, stash the new hint and let
+      // the voice-state effect promote it to currentHint once the
+      // line finishes. The "updating" badge stays visible in the
+      // meantime so the user has feedback.
+      if (voiceStateRef.current === "speaking") {
+        pendingAutoHintRef.current = data.hint;
+      } else {
+        setCurrentHint(data.hint);
+        setHintRefreshing(false);
+      }
+    } catch (e) {
+      setHintError(e instanceof Error ? e.message : "Failed");
+      setHintRefreshing(false);
+    }
+  }
+
+  // Promote a deferred hint to the visible state as soon as the
+  // persona stops speaking (state transitions away from "speaking").
+  useEffect(() => {
+    if (voice.state === "speaking") return;
+    if (pendingAutoHintRef.current === null) return;
+    setCurrentHint(pendingAutoHintRef.current);
+    pendingAutoHintRef.current = null;
+    setHintRefreshing(false);
+  }, [voice.state]);
+
+  useEffect(() => {
     if (!sessionId) return;
-    if (!hintsAllowed || hintsExhausted) return;
-    if (streaming || hintLoading) return;
-    if (currentHint) return;
+    if (!hintsAllowed) return;
+    if (streaming || hintLoading || hintRefreshing) return;
+    if (lastAutoSuggestedAtRef.current === bubbles.length) return;
     const last = bubbles[bubbles.length - 1];
-    const personaOpened =
+    const personaReady =
       last && last.role === "persona" && last.content.trim().length > 0;
     const userStartsEmpty =
       flow?.startBy === "user" && bubbles.length === 0;
-    if (!personaOpened && !userStartsEmpty) return;
-    autoHintFiredRef.current = true;
-    void requestHint();
-    // requestHint is stable enough for this single-shot trigger; deps
-    // intentionally omit it to avoid re-running on every render.
+    if (!personaReady && !userStartsEmpty) return;
+    lastAutoSuggestedAtRef.current = bubbles.length;
+    void fetchAutoSuggestion();
+    // fetchAutoSuggestion reads live state via setters/refs; safe to
+    // omit from deps.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     sessionId,
     bubbles,
     streaming,
     hintsAllowed,
-    hintsExhausted,
     hintLoading,
-    currentHint,
+    hintRefreshing,
     flow?.startBy,
   ]);
 
@@ -1197,6 +1280,7 @@ export function RoleplayPlayer({
               hint={currentHint}
               hintType={hints?.type ?? "complete"}
               loading={hintLoading}
+              refreshing={hintRefreshing}
               error={hintError}
               exhausted={hintsExhausted}
               onRequest={requestHint}
@@ -2201,6 +2285,7 @@ function TabBtn({
 function HintPanel({
   hint,
   hintType,
+  refreshing = false,
   loading,
   error,
   exhausted,
@@ -2212,6 +2297,7 @@ function HintPanel({
   hint: string | null;
   hintType: "complete" | "bullet";
   loading: boolean;
+  refreshing?: boolean;
   error: string | null;
   exhausted: boolean;
   onRequest: () => void;
@@ -2246,6 +2332,12 @@ function HintPanel({
           <span className="text-[11px] text-ink-3">
             Suggested reply you can read aloud
           </span>
+          {refreshing && hint ? (
+            <span className="inline-flex items-center gap-1 text-[10px] text-ink-3 font-mono uppercase tracking-wider">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-[#5b2eea] animate-pulse" />
+              updating
+            </span>
+          ) : null}
         </div>
         <div className="flex items-center gap-2">
           {hintsLimit !== null ? (

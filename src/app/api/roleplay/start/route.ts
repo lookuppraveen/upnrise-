@@ -12,8 +12,12 @@ import { z } from "zod";
 import { getSessionUser } from "@/lib/auth/session";
 import { prisma } from "@/lib/db/client";
 import { anthropic } from "@/lib/ai/client";
-import { getAIConfig } from "@/lib/ai/config";
 import { loadModuleForUser } from "@/lib/ai/roleplay-access";
+
+// Match the turn route — Sonnet 4.6 for speed without quality loss.
+// Override with ANTHROPIC_MODEL_ROLEPLAY to switch (e.g. Haiku 4.5).
+const ROLEPLAY_MODEL =
+  process.env.ANTHROPIC_MODEL_ROLEPLAY ?? "claude-sonnet-4-6";
 import {
   appendTurn,
   buildSystemPrompt,
@@ -134,11 +138,17 @@ export async function POST(req: Request) {
   if (settings.startRoleplayBy !== "user") {
     // Ask Claude for the persona's opening line. Empty messages array
     // means "you go first" — we instruct it via a primer user message.
-    const ai = await getAIConfig();
+    // Cache the system block; the very next /turn call will hit it.
     const completion = await anthropic.messages.create({
-      model: ai.model,
-      max_tokens: 200,
-      system: systemPrompt,
+      model: ROLEPLAY_MODEL,
+      max_tokens: 180,
+      system: [
+        {
+          type: "text",
+          text: systemPrompt,
+          cache_control: { type: "ephemeral" },
+        },
+      ],
       messages: [
         {
           role: "user",

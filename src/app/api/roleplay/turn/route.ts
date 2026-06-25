@@ -11,8 +11,13 @@ import { z } from "zod";
 import { getSessionUser } from "@/lib/auth/session";
 import { prisma } from "@/lib/db/client";
 import { anthropic } from "@/lib/ai/client";
-import { getAIConfig } from "@/lib/ai/config";
 import { loadSessionForUser } from "@/lib/ai/roleplay-access";
+
+// Sonnet 4.6 is the sweet spot for in-character roleplay turns: ~3× faster than
+// Opus with no meaningful quality loss for conversational scenes. Override with
+// ANTHROPIC_MODEL_ROLEPLAY (e.g. "claude-haiku-4-5-20251001" for max speed).
+const ROLEPLAY_MODEL =
+  process.env.ANTHROPIC_MODEL_ROLEPLAY ?? "claude-sonnet-4-6";
 import {
   appendTurn,
   buildSystemPrompt,
@@ -70,11 +75,22 @@ export async function POST(req: Request) {
     },
   );
 
-  const ai = await getAIConfig();
   const claudeStream = anthropic.messages.stream({
-    model: ai.model,
-    max_tokens: 600,
-    system: systemPrompt,
+    model: ROLEPLAY_MODEL,
+    // 380 = comfortable headroom for the "1-4 sentences" rule without
+    // letting the model ramble. Lower values risk truncating a reply
+    // mid-sentence which is jarring during voice playback.
+    max_tokens: 380,
+    // Cache the system block so turns 2+ in the same session skip
+    // re-processing persona + scenario + ideal conversation. 5-min
+    // ephemeral cache is a natural fit for a single roleplay session.
+    system: [
+      {
+        type: "text",
+        text: systemPrompt,
+        cache_control: { type: "ephemeral" },
+      },
+    ],
     messages: toClaudeMessages(withLearner),
   });
 
