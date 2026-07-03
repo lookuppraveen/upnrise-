@@ -20,6 +20,7 @@ import {
   getAttemptHistory,
 } from "@/lib/roleplay/results";
 import { computeConversationStats } from "@/lib/roleplay/conversation-stats";
+import { computeSpeechDelivery } from "@/lib/roleplay/speech-delivery";
 import { getComparativeStats } from "@/lib/roleplay/comparative-stats";
 import {
   ProgressHistoryChart,
@@ -29,6 +30,7 @@ import {
 } from "@/components/results/ProgressHistoryChart";
 import { KeywordCoverageCard } from "@/components/results/KeywordCoverageCard";
 import { ConversationStatsCard } from "@/components/results/ConversationStatsCard";
+import { SpeechDeliveryCard } from "@/components/results/SpeechDeliveryCard";
 import { ComparativeContextCard } from "@/components/results/ComparativeContextCard";
 
 export default async function ResultsPage({
@@ -97,6 +99,7 @@ export default async function ResultsPage({
       : [],
   );
   const conversationStats = computeConversationStats(transcript);
+  const speechDelivery = computeSpeechDelivery(transcript, session.durationSec);
   const comparativeStats = user.companyId
     ? await getComparativeStats({
         companyId: user.companyId,
@@ -485,6 +488,15 @@ export default async function ResultsPage({
           )}
         </Card>
       </div>
+
+      {/* ── Speech Delivery (pace, fillers, sentence length) ── */}
+      <Card pad="md" className="space-y-4">
+        <SectionHeader
+          title="Speech Delivery"
+          subtitle="How you spoke — pace, fillers, sentence shape"
+        />
+        <SpeechDeliveryCard stats={speechDelivery} />
+      </Card>
 
       {/* ── Conversation Stats (derived from transcript) ── */}
       <Card pad="md" className="space-y-4">

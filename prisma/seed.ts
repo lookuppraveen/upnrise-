@@ -115,29 +115,50 @@ const DISCOVERY_RUBRIC: Prisma.InputJsonValue = {
     {
       id: "rapport",
       label: "Built rapport",
-      weight: 0.2,
+      weight: 0.15,
       description:
         "Opened with warmth, used the buyer's name, mirrored tone.",
     },
     {
       id: "discovery",
       label: "Discovered pain",
-      weight: 0.35,
+      weight: 0.25,
       description:
         "Asked 3+ open-ended questions; named the specific business problem.",
     },
     {
       id: "qualification",
       label: "Qualified BANT",
-      weight: 0.25,
+      weight: 0.15,
       description: "Surfaced budget, authority, need, and timeline.",
     },
     {
       id: "next_step",
       label: "Secured next step",
-      weight: 0.2,
+      weight: 0.15,
       description:
         "Booked a follow-up with a specific time and decision-maker.",
+    },
+    {
+      id: "transparency",
+      label: "Transparency",
+      weight: 0.1,
+      description:
+        "Was upfront about pricing, product limits, and trade-offs; did not dodge hard questions or bury caveats.",
+    },
+    {
+      id: "technical_competency",
+      label: "Technical Competency",
+      weight: 0.1,
+      description:
+        "Answered product / domain questions accurately with correct terminology; showed genuine command of the offering.",
+    },
+    {
+      id: "consultative_approach",
+      label: "Consultative Approach",
+      weight: 0.1,
+      description:
+        "Acted as an advisor — diagnosed the buyer's situation before prescribing; offered options rather than pitching a single answer.",
     },
   ],
 };
@@ -148,27 +169,48 @@ const PRICING_RUBRIC: Prisma.InputJsonValue = {
     {
       id: "acknowledge",
       label: "Acknowledged objection",
-      weight: 0.2,
+      weight: 0.15,
       description: "Did not dismiss; reflected the buyer's concern back.",
     },
     {
       id: "value",
       label: "Reframed value",
-      weight: 0.35,
+      weight: 0.25,
       description:
         "Tied price to a quantified business outcome, not features.",
     },
     {
       id: "anchor",
       label: "Held the anchor",
-      weight: 0.25,
+      weight: 0.15,
       description: "Did not discount on first ask; preserved deal economics.",
     },
     {
       id: "close",
       label: "Asked for the close",
-      weight: 0.2,
+      weight: 0.15,
       description: "Proposed a clear path to signature within 14 days.",
+    },
+    {
+      id: "transparency",
+      label: "Transparency",
+      weight: 0.1,
+      description:
+        "Was upfront about pricing, product limits, and trade-offs; did not dodge hard questions or bury caveats.",
+    },
+    {
+      id: "technical_competency",
+      label: "Technical Competency",
+      weight: 0.1,
+      description:
+        "Answered product / domain questions accurately with correct terminology; showed genuine command of the offering.",
+    },
+    {
+      id: "consultative_approach",
+      label: "Consultative Approach",
+      weight: 0.1,
+      description:
+        "Acted as an advisor — diagnosed the buyer's situation before prescribing; offered options rather than pitching a single answer.",
     },
   ],
 };
