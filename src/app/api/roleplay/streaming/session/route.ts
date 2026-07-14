@@ -76,6 +76,25 @@ function isAvatarOverrideCompatible(
   return true;
 }
 
+// Microsoft/Azure neural voice ids follow the shape xx-XX-NameNeural
+// (e.g. en-IN-NeerjaNeural). Only D-ID accepts these; passing one to
+// HeyGen would 4xx. The PersonaModal preseeds an Indian Microsoft voice
+// as the default liveVoiceId, so this check lets HeyGen-backed tenants
+// silently drop it and fall back to their provider default voice.
+function isMicrosoftNeuralVoice(id: string): boolean {
+  return /^[a-z]{2}-[A-Z]{2}-[A-Za-z]+Neural$/.test(id);
+}
+
+function isVoiceOverrideCompatible(
+  kind: VideoProviderKind,
+  voiceId: string,
+): boolean {
+  const ms = isMicrosoftNeuralVoice(voiceId);
+  if (kind === "did") return ms;
+  if (kind === "heygen") return !ms;
+  return true;
+}
+
 function readPersonaOverride(
   modBody: unknown,
   kind: VideoProviderKind,
@@ -95,10 +114,17 @@ function readPersonaOverride(
     );
     liveAvatarId = null;
   }
-  const liveVoiceId =
+  const rawVoice =
     typeof p.liveVoiceId === "string" && p.liveVoiceId.trim()
       ? p.liveVoiceId.trim()
       : null;
+  let liveVoiceId: string | null = rawVoice;
+  if (rawVoice && !isVoiceOverrideCompatible(kind, rawVoice)) {
+    console.warn(
+      `[streaming/session] dropping persona.liveVoiceId — value ${JSON.stringify(rawVoice)} is not shape-compatible with current default provider (${kind}). Falling back to provider default voice.`,
+    );
+    liveVoiceId = null;
+  }
   return { liveAvatarId, liveVoiceId };
 }
 

@@ -645,6 +645,19 @@ export function RoleplayPlayer({
     }
     const blob = new Blob(chunks, { type: chunks[0].type || "audio/webm" });
     recordChunksRef.current = [];
+    // Skip upload for tiny blobs — a webm container with no audio
+    // frames is ~few hundred bytes and the server can't do anything
+    // useful with it. Sending it also trips the multipart parser on
+    // some browser+dev-server combos and produces the confusing
+    // "bad form data" 400.
+    const MIN_UPLOAD_BYTES = 2048;
+    if (blob.size < MIN_UPLOAD_BYTES) {
+      console.warn(
+        `[recording] skipping upload — blob is only ${blob.size} bytes (min ${MIN_UPLOAD_BYTES}). No audio was captured.`,
+      );
+      setRecordingStatus("failed");
+      return;
+    }
     const ext = blob.type.includes("webm")
       ? "webm"
       : blob.type.includes("ogg")
@@ -656,6 +669,9 @@ export function RoleplayPlayer({
     fd.set("sessionId", sessionId);
     fd.set("file", blob, `roleplay-${sessionId}.${ext}`);
     try {
+      console.info(
+        `[recording] uploading blob size=${blob.size} type=${blob.type || "(none)"}`,
+      );
       const res = await fetch("/api/roleplay/recording", {
         method: "POST",
         body: fd,

@@ -159,43 +159,78 @@ const LANGUAGES = [
   "Urdu",
 ];
 
+// Maps the persona picker's internal voice id to a real D-ID / Microsoft
+// Neural voice that the streaming session route will pass upstream. This
+// is what turns the accordion from a cosmetic label into a load-bearing
+// pick — clicking "Priya" now also seeds liveVoiceId with Neerja so the
+// trainee actually hears her (on D-ID). On HeyGen the shape check drops
+// the Microsoft-format id and falls back to the tenant provider voice.
+const INTERNAL_TO_DID_VOICE: Record<string, { id: string; name: string }> = {
+  "f-warm": { id: "en-IN-NeerjaNeural", name: "Neerja · Female (en-IN)" },
+  "f-bright": { id: "en-IN-AnanyaNeural", name: "Ananya · Female (en-IN)" },
+  "f-formal": { id: "en-IN-KavyaNeural", name: "Kavya · Female (en-IN)" },
+  "f-calm": { id: "hi-IN-SwaraNeural", name: "Swara · Female (hi-IN)" },
+  "m-warm": { id: "en-IN-PrabhatNeural", name: "Prabhat · Male (en-IN)" },
+  "m-deep": { id: "en-IN-AaravNeural", name: "Aarav · Male (en-IN)" },
+  "m-young": { id: "en-IN-KunalNeural", name: "Kunal · Male (en-IN)" },
+  "m-calm": { id: "en-IN-RehaanNeural", name: "Rehaan · Male (en-IN)" },
+  // Neutral fallbacks — Microsoft Neural doesn't ship a true neutral, so
+  // we bias to Neerja / Prabhat which read as the closest cultural match.
+  "n-clear": { id: "en-IN-NeerjaNeural", name: "Neerja · Female (en-IN)" },
+  "n-warm": { id: "en-IN-PrabhatNeural", name: "Prabhat · Male (en-IN)" },
+};
+
+// Voice options for the persona picker. All entries are Indian-accented
+// (en-IN) — the L&D scenarios in this deployment target Indian trainees,
+// and localised voices land better than the previous US/UK generics.
+// Tone hints reflect the accent explicitly so admins can see it at a
+// glance in the picker.
 const VOICES_BY_GENDER: Record<
   "male" | "female" | "neutral",
   { id: string; label: string; tone: string }[]
 > = {
   male: [
-    { id: "m-warm", label: "Arjun", tone: "Warm · mid-pitch" },
-    { id: "m-deep", label: "Vikram", tone: "Deep · authoritative" },
-    { id: "m-young", label: "Rohan", tone: "Energetic · younger" },
-    { id: "m-calm", label: "Aakash", tone: "Calm · clinical" },
+    { id: "m-warm", label: "Arjun", tone: "Warm · Indian, mid-pitch" },
+    { id: "m-deep", label: "Vikram", tone: "Deep · Indian, authoritative" },
+    { id: "m-young", label: "Rohan", tone: "Energetic · Indian, younger" },
+    { id: "m-calm", label: "Aakash", tone: "Calm · Indian, clinical" },
   ],
   female: [
-    { id: "f-warm", label: "Priya", tone: "Warm · empathetic" },
-    { id: "f-bright", label: "Ananya", tone: "Bright · energetic" },
-    { id: "f-formal", label: "Meera", tone: "Formal · measured" },
-    { id: "f-calm", label: "Riya", tone: "Calm · low-pitch" },
+    { id: "f-warm", label: "Priya", tone: "Warm · Indian, empathetic" },
+    { id: "f-bright", label: "Ananya", tone: "Bright · Indian, energetic" },
+    { id: "f-formal", label: "Meera", tone: "Formal · Indian, measured" },
+    { id: "f-calm", label: "Riya", tone: "Calm · Indian, low-pitch" },
   ],
   neutral: [
-    { id: "n-clear", label: "Sam", tone: "Clear · neutral pitch" },
-    { id: "n-warm", label: "Avery", tone: "Warm · approachable" },
+    { id: "n-clear", label: "Kiran", tone: "Clear · Indian, neutral pitch" },
+    { id: "n-warm", label: "Deep", tone: "Warm · Indian, approachable" },
   ],
 };
 
+// Default persona ships with an Indian female voice (Priya) since the
+// primary trainee audience is India-based. Admins can flip gender/voice
+// at any time — this is only the starting state for a fresh persona.
+//
+// liveVoiceId is preseeded to en-IN-NeerjaNeural (D-ID / Microsoft
+// Neural). If the tenant runs on D-ID this is used directly; if the
+// tenant is on HeyGen, the session route detects the shape mismatch and
+// falls back to the tenant's provider-default voice — see
+// isVoiceOverrideCompatible in src/app/api/roleplay/streaming/session.
 export const DEFAULT_PERSONA: PersonaData = {
   title: "",
   behavior: "friendly",
   backgroundDetails: [],
   additionalPrompt: "",
-  avatarGender: "neutral",
+  avatarGender: "female",
   avatarStyle: "animated",
-  avatarId: "n1",
+  avatarId: "f1",
   backgroundId: "office",
   languages: ["English"],
-  voiceId: "n-clear",
+  voiceId: "f-warm",
   liveAvatarId: null,
   liveAvatarName: null,
-  liveVoiceId: null,
-  liveVoiceName: null,
+  liveVoiceId: "en-IN-NeerjaNeural",
+  liveVoiceName: "Neerja · Female (en-IN)",
   liveDisplayUrl: null,
 };
 
@@ -206,6 +241,7 @@ export function PersonaModal({
   person2,
   scenario,
   savedPortraits = [],
+  tenantStreamingProvider = null,
   onClose,
   onSave,
 }: {
@@ -215,6 +251,10 @@ export function PersonaModal({
   person2?: string;
   scenario?: string;
   savedPortraits?: SavedPortrait[];
+  tenantStreamingProvider?: {
+    kind: string;
+    supportsStreaming: boolean;
+  } | null;
   onClose: () => void;
   onSave: (p: PersonaData) => void;
 }) {
@@ -274,7 +314,18 @@ export function PersonaModal({
     setGender(g);
     const list = AVATARS_BY_GENDER[g];
     setAvatarId(list[0]?.id ?? null);
-    setVoiceId(VOICES_BY_GENDER[g][0]?.id ?? null);
+    const nextVoiceId = VOICES_BY_GENDER[g][0]?.id ?? null;
+    setVoiceId(nextVoiceId);
+    // Keep liveVoiceId in sync with the new gender's default voice card
+    // so the runtime voice matches what the accordion shows. Skip when
+    // a HeyGen avatar is picked — that carries its own voice pairing.
+    if (!liveAvatarId && nextVoiceId) {
+      const mapped = INTERNAL_TO_DID_VOICE[nextVoiceId];
+      if (mapped) {
+        setLiveVoiceId(mapped.id);
+        setLiveVoiceName(mapped.name);
+      }
+    }
   }
 
   function addDetail() {
@@ -366,6 +417,16 @@ export function PersonaModal({
       setBackgroundId(draft.backgroundId);
       setLanguages(draft.languages);
       setVoiceId(draft.voiceId);
+      // Mirror the AI-picked voice into liveVoiceId so the runtime voice
+      // matches what the accordion shows. Same skip-on-HeyGen guard as
+      // the manual click handler.
+      if (!liveAvatarId && draft.voiceId) {
+        const mapped = INTERNAL_TO_DID_VOICE[draft.voiceId];
+        if (mapped) {
+          setLiveVoiceId(mapped.id);
+          setLiveVoiceName(mapped.name);
+        }
+      }
     } catch (e) {
       setGenError(e instanceof Error ? e.message : "Failed");
     } finally {
@@ -607,6 +668,36 @@ export function PersonaModal({
 
           {/* LiveAvatar override (streaming) */}
           <div className="bg-surface border border-border rounded-[10px] p-4 space-y-3">
+            {/* Tenant-provider health banner — shown when the tenant
+                default can't stream. Same intent as the roleplay editor
+                banner, but scoped tight to the streaming section so the
+                admin sees it right next to the pickers that will 412. */}
+            {tenantStreamingProvider &&
+            !tenantStreamingProvider.supportsStreaming ? (
+              <div className="flex items-start gap-2 rounded-md border border-[#e6a24a]/50 bg-[#fef3e6] text-[#8a4b12] px-3 py-2 text-[11.5px]">
+                <span aria-hidden className="pt-0.5">
+                  ⚠
+                </span>
+                <div>
+                  Tenant default provider (
+                  <b>{tenantStreamingProvider.kind}</b>) doesn&apos;t support
+                  live avatar streaming. This persona&apos;s streaming picks
+                  will be ignored until you switch the default to HeyGen or
+                  D-ID at Avatars &amp; Voices.
+                </div>
+              </div>
+            ) : null}
+            {!tenantStreamingProvider ? (
+              <div className="flex items-start gap-2 rounded-md border border-bad/40 bg-bad-pale/40 text-bad px-3 py-2 text-[11.5px]">
+                <span aria-hidden className="pt-0.5">
+                  ⚠
+                </span>
+                <div>
+                  No streaming provider configured. The trainee will fall
+                  back to text-only mode regardless of what you pick here.
+                </div>
+              </div>
+            ) : null}
             <div className="flex items-center justify-between gap-3">
               <div className="min-w-0">
                 <div className="text-[13px] font-semibold text-ink">
@@ -672,10 +763,46 @@ export function PersonaModal({
                 ) : null}
               </div>
             ) : (
-              <div className="text-[11.5px] text-ink-3 italic">
-                Using provider default avatar.
+              <div className="rounded-md border border-dashed border-border bg-surface-2/60 px-3 py-2 text-[11.5px] text-ink-2">
+                <div className="font-semibold text-ink">
+                  No streaming avatar picked
+                </div>
+                <div className="text-ink-3 mt-0.5">
+                  The trainee session will fall back to the tenant&apos;s
+                  default avatar. If none is set on the provider row, the
+                  session will fail with a 412 error.
+                </div>
               </div>
             )}
+            {/* Voice status — surfaces the preseeded default Indian voice
+                even when no avatar is picked. Ignored at session-mint if
+                the tenant's default provider is HeyGen (shape mismatch). */}
+            {!liveAvatarId && liveVoiceId ? (
+              <div className="bg-surface-2 border border-border rounded-md px-3 py-2 flex items-center gap-2">
+                <div className="flex-1 min-w-0">
+                  <div className="text-[11px] font-semibold uppercase tracking-[0.06em] text-ink-3">
+                    Voice
+                  </div>
+                  <div className="text-[12.5px] text-ink truncate">
+                    {liveVoiceName ?? liveVoiceId}
+                  </div>
+                  <div className="text-[10.5px] text-ink-3">
+                    Applied when the tenant default provider is D-ID.
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setLiveVoiceId(null);
+                    setLiveVoiceName(null);
+                  }}
+                  suppressHydrationWarning
+                  className="px-2.5 py-1 rounded-md border border-border bg-surface text-[11.5px] font-semibold text-ink-2 hover:text-ink hover:bg-surface-2 shrink-0"
+                >
+                  Clear voice
+                </button>
+              </div>
+            ) : null}
           </div>
 
           {/* Background Images */}
@@ -751,7 +878,21 @@ export function PersonaModal({
                     <button
                       key={v.id}
                       type="button"
-                      onClick={() => setVoiceId(v.id)}
+                      onClick={() => {
+                        setVoiceId(v.id);
+                        // Wire the picker to the runtime — swap the
+                        // preseeded liveVoiceId to whichever D-ID voice
+                        // this card maps to. Skipped if the persona
+                        // already has a hand-picked HeyGen liveAvatarId
+                        // (that route carries its own voice) so we don't
+                        // clobber the admin's explicit choice.
+                        if (liveAvatarId) return;
+                        const mapped = INTERNAL_TO_DID_VOICE[v.id];
+                        if (mapped) {
+                          setLiveVoiceId(mapped.id);
+                          setLiveVoiceName(mapped.name);
+                        }
+                      }}
                       className={cn(
                         "text-left px-3 py-2 rounded-md border transition-colors",
                         selected

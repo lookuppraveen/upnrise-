@@ -38,12 +38,17 @@ export function ModuleEditPage({
   trainingTitle,
   module: m,
   hasDefaultVideoProvider: _hasDefaultVideoProvider,
+  tenantStreamingProvider = null,
   savedPortraits = [],
 }: {
   trainingId: string;
   trainingTitle: string;
   module: EditableModuleForPage;
   hasDefaultVideoProvider: boolean;
+  tenantStreamingProvider?: {
+    kind: string;
+    supportsStreaming: boolean;
+  } | null;
   savedPortraits?: SavedPortrait[];
 }) {
   if (m.type === "roleplay") {
@@ -58,6 +63,7 @@ export function ModuleEditPage({
           body={m.body}
           roleplayConfig={m.roleplayConfig}
           savedPortraits={savedPortraits}
+          tenantStreamingProvider={tenantStreamingProvider}
         />
       </div>
     );

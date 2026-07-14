@@ -12,6 +12,7 @@ import { getSessionUser } from "@/lib/auth/session";
 import { prisma } from "@/lib/db/client";
 import { audit } from "@/lib/audit";
 import { Prisma, type ModuleType } from "@prisma/client";
+import { STANDARD_CRITERIA } from "@/lib/evaluation/criteria-library";
 
 async function requireAdminOwnsTraining(trainingId: string) {
   const user = await getSessionUser();
@@ -878,6 +879,15 @@ const ChecklistItemSchema = z.object({
 const EvalCriterionSchema = z.object({
   id: z.string().max(60),
   label: z.string().min(1).max(200),
+  // Percentage weight. Persisted as 0–100 integer; the AI rubric writer
+  // below normalises to a 0–1 fraction (RubricShape contract).
+  weight: z
+    .number()
+    .int()
+    .min(0)
+    .max(100)
+    .optional()
+    .default(0),
   items: z.array(ChecklistItemSchema).max(20),
 });
 const PersonaSchema = z.object({
@@ -965,21 +975,41 @@ const AdditionalSettingsSchema = z
     path: ["maxDurationMin"],
   });
 
-const RoleplayModuleSchema = z.object({
-  name: z.string().min(1).max(200),
-  published: z.boolean(),
-  person1: z.string().trim().max(500),
-  person2: z.string().trim().max(500),
-  scenario: z.string().max(8000),
-  idealConversation: z.string().max(8000),
-  visualAids: z.array(VisualAidSchema).max(20),
-  keywords: z.array(z.string().min(1).max(80)).max(40),
-  showKeywords: z.boolean(),
-  scoringMode: z.enum(["checklist", "standard"]),
-  evaluationCriteria: z.array(EvalCriterionSchema).max(20),
-  additionalSettings: AdditionalSettingsSchema.optional(),
-  persona: PersonaSchema.optional(),
-});
+const RoleplayModuleSchema = z
+  .object({
+    name: z.string().min(1).max(200),
+    published: z.boolean(),
+    person1: z.string().trim().max(500),
+    person2: z.string().trim().max(500),
+    scenario: z.string().max(8000),
+    idealConversation: z.string().max(8000),
+    visualAids: z.array(VisualAidSchema).max(20),
+    keywords: z.array(z.string().min(1).max(80)).max(40),
+    showKeywords: z.boolean(),
+    scoringMode: z.enum(["checklist", "standard"]),
+    evaluationCriteria: z.array(EvalCriterionSchema).max(20),
+    additionalSettings: AdditionalSettingsSchema.optional(),
+    persona: PersonaSchema.optional(),
+  })
+  .superRefine((d, ctx) => {
+    // Evaluation criteria weightage must sum to 100 when at least one
+    // criterion is present. Empty list is allowed (rubric falls back to
+    // the placeholder for backwards compat). This mirrors the client
+    // check in validateCriteriaWeights so tampered payloads are rejected
+    // server-side too.
+    if (d.evaluationCriteria.length === 0) return;
+    const total = d.evaluationCriteria.reduce(
+      (sum, c) => sum + (c.weight ?? 0),
+      0,
+    );
+    if (total !== 100) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["evaluationCriteria"],
+        message: `Evaluation criteria weightage must total 100% (received ${total}%).`,
+      });
+    }
+  });
 
 // ──────────── Gamified (Activity) module — full save ────────────
 //
@@ -1415,10 +1445,18 @@ export async function saveRoleplayModule(
   // is NOT NULL.
   const persona = parsed.person2 || "Customer";
   const scenarioText = parsed.scenario.trim() || "Replace with the situation.";
+  // Build a runtime rubric from the admin's chosen evaluation criteria
+  // so the AI scorer / hint / coach routes all use the same list the
+  // admin sees. Weights are normalised from 0–100 % to 0–1 fractions
+  // because that's what RubricShape and the scorer expect. If no
+  // criteria are configured we keep the historical PLACEHOLDER_RUBRIC
+  // to preserve behaviour for legacy modules that never touched this
+  // section.
+  const runtimeRubric = buildRuntimeRubric(parsed.evaluationCriteria);
   if (mod.roleplayConfig) {
     await prisma.roleplayConfig.update({
       where: { moduleId },
-      data: { persona, scenario: scenarioText },
+      data: { persona, scenario: scenarioText, rubric: runtimeRubric },
     });
   } else {
     await prisma.roleplayConfig.create({
@@ -1427,7 +1465,7 @@ export async function saveRoleplayModule(
         persona,
         scenario: scenarioText,
         mode: "text",
-        rubric: PLACEHOLDER_RUBRIC,
+        rubric: runtimeRubric,
       },
     });
   }
@@ -1683,3 +1721,31 @@ const PLACEHOLDER_RUBRIC = {
     },
   ],
 };
+
+// Convert the admin-configured evaluationCriteria into the runtime
+// rubric shape the AI scorer / hint / coach routes consume. The saved
+// UI weight is 0–100 (%); the rubric contract wants 0–1 fractions.
+// When the admin hasn't picked anything, we keep PLACEHOLDER_RUBRIC so
+// existing modules continue to score the same way they did before this
+// change.
+function buildRuntimeRubric(
+  criteria: z.infer<typeof EvalCriterionSchema>[],
+): typeof PLACEHOLDER_RUBRIC {
+  if (criteria.length === 0) return PLACEHOLDER_RUBRIC;
+  const standardDesc: Record<string, string> = Object.fromEntries(
+    STANDARD_CRITERIA.map((c) => [c.id, c.description]),
+  );
+  return {
+    pass_score: 70,
+    criteria: criteria.map((c) => ({
+      id: c.id,
+      label: c.label,
+      weight: (c.weight ?? 0) / 100,
+      description:
+        standardDesc[c.id] ??
+        (c.items.length > 0
+          ? `Judge across: ${c.items.map((it) => it.label).join("; ")}`
+          : `Rate the learner on ${c.label}.`),
+    })),
+  };
+}

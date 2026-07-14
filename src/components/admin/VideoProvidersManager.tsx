@@ -51,9 +51,11 @@ type ProviderRow = {
 export function VideoProvidersManager({
   providers,
   savedPortraits = [],
+  envFallbackKinds = [],
 }: {
   providers: ProviderRow[];
   savedPortraits?: SavedPortrait[];
+  envFallbackKinds?: VideoProviderKind[];
 }) {
   return (
     <div className="space-y-5">
@@ -87,7 +89,10 @@ export function VideoProvidersManager({
         )}
       </section>
 
-      <AddProviderCard savedPortraits={savedPortraits} />
+      <AddProviderCard
+        savedPortraits={savedPortraits}
+        envFallbackKinds={envFallbackKinds}
+      />
     </div>
   );
 }
@@ -399,8 +404,10 @@ function ProviderCard({
 
 function AddProviderCard({
   savedPortraits,
+  envFallbackKinds,
 }: {
   savedPortraits: SavedPortrait[];
+  envFallbackKinds: VideoProviderKind[];
 }) {
   const [kind, setKind] = useState<VideoProviderKind>("heygen");
   const [label, setLabel] = useState("");
@@ -413,6 +420,7 @@ function AddProviderCard({
 
   const canPickAvatar = kind === "heygen";
   const canPickDidPortrait = kind === "did" && savedPortraits.length > 0;
+  const hasEnvFallback = envFallbackKinds.includes(kind);
 
   function handlePick(a: PickerAvatar) {
     setAvatarId(a.id);
@@ -430,7 +438,12 @@ function AddProviderCard({
 
   function submit() {
     setError(null);
-    if (apiKey.trim().length < 8) {
+    const trimmed = apiKey.trim();
+    if (!trimmed && !hasEnvFallback) {
+      setError("API key is required");
+      return;
+    }
+    if (trimmed && trimmed.length < 8) {
       setError("API key looks too short");
       return;
     }
@@ -499,15 +512,21 @@ function AddProviderCard({
             suppressHydrationWarning
           />
         </Field>
-        <Field label="API key">
+        <Field label={hasEnvFallback ? "API key (optional)" : "API key"}>
           <input
             type="password"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
-            placeholder="paste secret"
+            placeholder={hasEnvFallback ? "leave blank to use server env" : "paste secret"}
             className="w-full bg-surface-2 border border-border rounded-md px-3 py-2 text-[12.5px] font-mono focus:outline-none focus:border-accent"
             suppressHydrationWarning
           />
+          {hasEnvFallback ? (
+            <span className="block text-[11px] text-ink-3 mt-1">
+              Server env var is set — leave blank to use it, or paste to
+              override for this tenant.
+            </span>
+          ) : null}
         </Field>
         <Field label="Default avatar ID (optional)">
           <div className="flex items-stretch gap-2">
@@ -567,7 +586,11 @@ function AddProviderCard({
         <button
           type="button"
           onClick={submit}
-          disabled={pending || apiKey.trim().length < 8}
+          disabled={
+            pending ||
+            (apiKey.trim().length < 8 &&
+              !(hasEnvFallback && apiKey.trim().length === 0))
+          }
           suppressHydrationWarning
           className={cn(
             "inline-flex items-center gap-1.5 px-4 py-2 rounded-md",

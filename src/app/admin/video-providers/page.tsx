@@ -10,6 +10,7 @@ import { getSessionUser } from "@/lib/auth/session";
 import { prisma } from "@/lib/db/client";
 import { VideoProvidersManager } from "@/components/admin/VideoProvidersManager";
 import { SavedPortraitsManager } from "@/components/admin/SavedPortraitsManager";
+import { getEnvFallbackKinds } from "@/lib/video/env-fallback";
 
 export default async function AdminVideoProvidersPage() {
   const user = (await getSessionUser())!;
@@ -81,6 +82,7 @@ export default async function AdminVideoProvidersPage() {
           createdAt: p.createdAt.toISOString(),
         }))}
         savedPortraits={portraitRows}
+        envFallbackKinds={getEnvFallbackKinds()}
       />
 
       <SavedPortraitsManager portraits={portraitRows} />

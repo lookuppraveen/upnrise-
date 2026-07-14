@@ -39,8 +39,22 @@ export async function POST(req: Request) {
   let formData: FormData;
   try {
     formData = await req.formData();
-  } catch {
-    return NextResponse.json({ error: "bad form data" }, { status: 400 });
+  } catch (e) {
+    // Surface the underlying parser message + the request's declared
+    // content-type / length so an admin looking at a 400 in the browser
+    // network tab can immediately see why formData() choked (empty
+    // body, wrong boundary, multipart truncation, etc.) instead of a
+    // generic "bad form data".
+    const detail = e instanceof Error ? e.message : String(e);
+    const ct = req.headers.get("content-type") ?? "(missing)";
+    const len = req.headers.get("content-length") ?? "(missing)";
+    console.warn(
+      `[recording] formData() failed — content-type=${ct} content-length=${len} error=${detail}`,
+    );
+    return NextResponse.json(
+      { error: `bad form data: ${detail}` },
+      { status: 400 },
+    );
   }
 
   const sessionIdRaw = String(formData.get("sessionId") ?? "").trim();

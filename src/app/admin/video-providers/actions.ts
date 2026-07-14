@@ -16,6 +16,10 @@ import {
   isValidDidSourceUrl,
   isValidHeygenAvatarId,
 } from "@/lib/video";
+import {
+  ENV_FALLBACK_VARS,
+  resolveEnvFallback,
+} from "@/lib/video/env-fallback";
 import { uploadToStorage } from "@/lib/storage/supabase-storage";
 
 async function requireAdmin() {
@@ -30,7 +34,7 @@ const CreateSchema = z
   .object({
     kind: z.nativeEnum(VideoProviderKind),
     label: z.string().max(80).optional().nullable(),
-    apiKey: z.string().min(8).max(500),
+    apiKey: z.string().max(500).optional().default(""),
     avatarId: z.string().max(2000).optional().nullable(),
     voiceId: z.string().max(120).optional().nullable(),
     isDefault: z.boolean().default(true),
@@ -60,6 +64,27 @@ export async function createVideoProvider(
   const user = await requireAdmin();
   const parsed = CreateSchema.parse(data);
 
+  // Resolve the effective key. If the admin left the field blank and this
+  // kind supports an env fallback (ElevenLabs → ELEVENLABS_API_KEY), pull
+  // from process.env at create time so the DB row still holds a real key.
+  // Rotating the env var later requires re-saving the row.
+  const typedKey = parsed.apiKey.trim();
+  let effectiveKey = typedKey;
+  if (!effectiveKey) {
+    const envKey = resolveEnvFallback(parsed.kind);
+    if (!envKey) {
+      const varName = ENV_FALLBACK_VARS[parsed.kind];
+      throw new Error(
+        varName
+          ? `API key is required. Paste one, or set ${varName} in .env and reload the server.`
+          : "API key is required.",
+      );
+    }
+    effectiveKey = envKey;
+  } else if (effectiveKey.length < 8) {
+    throw new Error("API key looks too short (min 8 chars).");
+  }
+
   await prisma.$transaction(async (tx) => {
     if (parsed.isDefault) {
       await tx.videoProvider.updateMany({
@@ -72,7 +97,7 @@ export async function createVideoProvider(
         companyId: user.companyId!,
         kind: parsed.kind,
         label: parsed.label?.trim() || null,
-        apiKey: parsed.apiKey.trim(),
+        apiKey: effectiveKey,
         avatarId: parsed.avatarId?.trim() || null,
         voiceId: parsed.voiceId?.trim() || null,
         isDefault: parsed.isDefault,
@@ -81,6 +106,7 @@ export async function createVideoProvider(
   });
   revalidatePath("/admin/video-providers");
 }
+
 
 const UpdateSchema = z.object({
   id: z.string().uuid(),

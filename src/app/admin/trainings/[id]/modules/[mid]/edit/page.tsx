@@ -8,6 +8,7 @@ import { notFound, redirect } from "next/navigation";
 import { getSessionUser } from "@/lib/auth/session";
 import { prisma } from "@/lib/db/client";
 import { ModuleEditPage } from "@/components/admin/ModuleEditPage";
+import { PROVIDER_SUPPORTS_STREAMING } from "@/lib/video";
 
 export const dynamic = "force-dynamic";
 
@@ -37,12 +38,11 @@ export default async function ModuleEditRoute({
   if (!training || training.modules.length === 0) notFound();
   const m = training.modules[0];
 
-  const [hasDefaultVideoProvider, portraits] = await Promise.all([
-    prisma.videoProvider
-      .count({
-        where: { companyId: training.companyId, isDefault: true },
-      })
-      .then((n) => n > 0),
+  const [defaultProvider, portraits] = await Promise.all([
+    prisma.videoProvider.findFirst({
+      where: { companyId: training.companyId, isDefault: true },
+      select: { kind: true },
+    }),
     prisma.didPortrait.findMany({
       where: { companyId: training.companyId },
       orderBy: { createdAt: "desc" },
@@ -79,7 +79,16 @@ export default async function ModuleEditRoute({
             }
           : null,
       }}
-      hasDefaultVideoProvider={hasDefaultVideoProvider}
+      hasDefaultVideoProvider={Boolean(defaultProvider)}
+      tenantStreamingProvider={
+        defaultProvider
+          ? {
+              kind: defaultProvider.kind,
+              supportsStreaming:
+                PROVIDER_SUPPORTS_STREAMING[defaultProvider.kind],
+            }
+          : null
+      }
       savedPortraits={portraits}
     />
   );

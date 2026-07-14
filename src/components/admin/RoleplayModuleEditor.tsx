@@ -44,11 +44,24 @@ import {
   DEFAULT_ADDITIONAL_SETTINGS,
   type AdditionalSettings,
 } from "@/components/admin/AdditionalSettingsModal";
+import {
+  CriteriaMultiSelect,
+  validateCriteriaWeights,
+} from "@/components/admin/CriteriaMultiSelect";
+import { lookupStandardCriterion } from "@/lib/evaluation/criteria-library";
 import { cn } from "@/lib/cn";
 
 type VisualAid = { name: string; url: string };
 type ChecklistItem = { id: string; label: string; visible: boolean };
-type EvalCriterion = { id: string; label: string; items: ChecklistItem[] };
+// weight is a percentage (0–100). Legacy modules saved before the
+// weightage feature landed will parse weight as 0; the UI surfaces the
+// invalid-total warning until an admin re-saves with real weights.
+type EvalCriterion = {
+  id: string;
+  label: string;
+  weight: number;
+  items: ChecklistItem[];
+};
 
 type RoleplayBody = {
   person1?: string;
@@ -73,6 +86,7 @@ export function RoleplayModuleEditor({
   body,
   roleplayConfig,
   savedPortraits = [],
+  tenantStreamingProvider = null,
 }: {
   trainingId: string;
   trainingTitle: string;
@@ -82,6 +96,10 @@ export function RoleplayModuleEditor({
   body: Record<string, unknown> | null;
   roleplayConfig: { persona: string; scenario: string } | null;
   savedPortraits?: SavedPortrait[];
+  tenantStreamingProvider?: {
+    kind: string;
+    supportsStreaming: boolean;
+  } | null;
 }) {
   const initial = useMemo(() => {
     const b = (body ?? {}) as RoleplayBody;
@@ -94,7 +112,15 @@ export function RoleplayModuleEditor({
       keywords: b.keywords ?? [],
       showKeywords: b.showKeywords ?? true,
       scoringMode: b.scoringMode ?? "checklist",
-      evaluationCriteria: b.evaluationCriteria ?? [],
+      // Normalise legacy criteria that were saved before `weight` was a
+      // field — parse whatever is stored, default missing weights to 0.
+      // The picker's total-100 check will nudge the admin to fix them.
+      evaluationCriteria: (b.evaluationCriteria ?? []).map((c) => ({
+        id: c.id,
+        label: c.label,
+        weight: typeof c.weight === "number" ? c.weight : 0,
+        items: Array.isArray(c.items) ? c.items : [],
+      })),
       // Merge stored persona over defaults so modules saved before the
       // LiveAvatar override fields landed still parse cleanly — without
       // this `initial.liveAvatarId` is undefined and useState binds to
@@ -174,6 +200,14 @@ export function RoleplayModuleEditor({
 
   async function save(thenBack: boolean) {
     setError(null);
+    const weightError = validateCriteriaWeights(
+      criteria.map((c) => ({ id: c.id, label: c.label, weight: c.weight })),
+    );
+    if (weightError) {
+      setError(weightError);
+      toast.error("Fix criteria weightage", weightError);
+      return;
+    }
     return new Promise<void>((resolve, reject) => {
       startTransition(async () => {
         try {
@@ -363,6 +397,11 @@ export function RoleplayModuleEditor({
         </div>
       </div>
 
+      {/* Streaming provider warning — surfaces at the top so admins
+          notice the problem before configuring a persona that will
+          silently 412 at runtime. */}
+      <StreamingProviderBanner provider={tenantStreamingProvider} />
+
       {/* Name + Status row */}
       <div className="grid gap-5 md:grid-cols-[1fr_auto]">
         <label className="block space-y-1.5">
@@ -530,7 +569,8 @@ export function RoleplayModuleEditor({
         <Card>
           <CardTitle>Evaluation Criteria</CardTitle>
           <p className="text-[12px] text-ink-3 mt-1">
-            Add Skills &amp; Checklist items on which user will be evaluated
+            Pick from the standard library, or add a custom criterion. Set
+            a weightage per criterion — the totals must add up to 100%.
           </p>
           <div className="mt-3 space-y-2">
             <div className="text-[10.5px] font-bold uppercase tracking-[0.08em] text-ink-3">
@@ -543,11 +583,38 @@ export function RoleplayModuleEditor({
                 : "Score each criterion on a 0–100 scale; no per-item checklist."}
             </p>
           </div>
-          <CriteriaList
-            scoringMode={scoringMode}
-            criteria={criteria}
-            onChange={setCriteria}
+          <CriteriaMultiSelect
+            selected={criteria.map((c) => ({
+              id: c.id,
+              label: c.label,
+              weight: c.weight,
+            }))}
+            onChange={(next) => {
+              // Preserve any existing checklist items when the picker
+              // rebalances weights or adds/removes entries. New entries
+              // get an empty items[] which the checklist editor below
+              // will grow when scoringMode === "checklist".
+              const byId = new Map(criteria.map((c) => [c.id, c] as const));
+              setCriteria(
+                next.map((n) => {
+                  const prev = byId.get(n.id);
+                  return {
+                    id: n.id,
+                    label: n.label,
+                    weight: n.weight,
+                    items: prev?.items ?? [],
+                  };
+                }),
+              );
+            }}
           />
+          {scoringMode === "checklist" && criteria.length > 0 ? (
+            <CriteriaChecklists
+              criteria={criteria}
+              onChange={setCriteria}
+              moduleId={moduleId}
+            />
+          ) : null}
         </Card>
 
         <div>
@@ -633,6 +700,7 @@ export function RoleplayModuleEditor({
           person2={person2}
           scenario={scenario}
           savedPortraits={savedPortraits}
+          tenantStreamingProvider={tenantStreamingProvider}
           onClose={() => setShowPersona(false)}
           onSave={(p) => {
             setPersona(p);
@@ -1038,72 +1106,180 @@ function ScoringToggle({
   );
 }
 
-// ─────────────── Criteria list ───────────────
+// ─────────────── Criteria checklists ───────────────
+//
+// Rendered under the CriteriaMultiSelect when scoringMode === "checklist".
+// Criteria labels + weights are owned by the picker above; this component
+// only manages the per-criterion checklist items (used by the AI scorer
+// as "sub-signals" underneath each criterion).
 
-function CriteriaList({
-  scoringMode,
+function CriteriaChecklists({
   criteria,
   onChange,
+  moduleId,
 }: {
-  scoringMode: "checklist" | "standard";
   criteria: EvalCriterion[];
   onChange: (c: EvalCriterion[]) => void;
+  moduleId: string;
 }) {
-  function addCriterion() {
-    const id = `c_${Date.now().toString(36)}`;
-    onChange([...criteria, { id, label: "New criterion", items: [] }]);
-  }
-  function update(i: number, patch: Partial<EvalCriterion>) {
-    onChange(criteria.map((c, idx) => (idx === i ? { ...c, ...patch } : c)));
-  }
-  function remove(i: number) {
-    onChange(criteria.filter((_, idx) => idx !== i));
+  // Per-criterion "Suggest with AI" state. Keyed by criterion id so
+  // multiple criteria can request in parallel without stomping each
+  // other. Cleared to null (idle) when there's neither a request in
+  // flight nor an error to surface.
+  const [aiState, setAiState] = useState<
+    Record<
+      string,
+      | { kind: "idle" }
+      | { kind: "loading" }
+      | { kind: "ready"; items: string[] }
+      | { kind: "error"; message: string }
+    >
+  >({});
+
+  function updateAt(ci: number, patch: Partial<EvalCriterion>) {
+    onChange(criteria.map((c, idx) => (idx === ci ? { ...c, ...patch } : c)));
   }
   function addItem(ci: number) {
     const id = `i_${Date.now().toString(36)}`;
-    update(ci, {
+    updateAt(ci, {
       items: [
         ...criteria[ci].items,
         { id, label: "New checklist item", visible: true },
       ],
     });
   }
+  function addSuggestedItem(ci: number, label: string) {
+    const id = `i_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`;
+    updateAt(ci, {
+      items: [...criteria[ci].items, { id, label, visible: true }],
+    });
+  }
+  function addAllSuggested(ci: number, labels: string[]) {
+    const existing = new Set(
+      criteria[ci].items.map((it) => it.label.trim().toLowerCase()),
+    );
+    const toAdd = labels.filter(
+      (l) => !existing.has(l.trim().toLowerCase()),
+    );
+    if (toAdd.length === 0) return;
+    const stamp = Date.now().toString(36);
+    updateAt(ci, {
+      items: [
+        ...criteria[ci].items,
+        ...toAdd.map((label, i) => ({
+          id: `i_${stamp}_${i}`,
+          label,
+          visible: true,
+        })),
+      ],
+    });
+  }
   function updateItem(ci: number, ii: number, patch: Partial<ChecklistItem>) {
-    update(ci, {
+    updateAt(ci, {
       items: criteria[ci].items.map((it, idx) =>
         idx === ii ? { ...it, ...patch } : it,
       ),
     });
   }
   function removeItem(ci: number, ii: number) {
-    update(ci, {
+    updateAt(ci, {
       items: criteria[ci].items.filter((_, idx) => idx !== ii),
     });
   }
+  async function requestAiSuggestions(ci: number) {
+    const c = criteria[ci];
+    setAiState((prev) => ({ ...prev, [c.id]: { kind: "loading" } }));
+    try {
+      const std = lookupStandardCriterion(c.id);
+      const res = await fetch("/api/admin/criteria-suggestions/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          moduleId,
+          criterionLabel: c.label,
+          criterionDescription: std?.description ?? "",
+          existingItems: c.items.map((it) => it.label),
+        }),
+      });
+      const json = (await res.json().catch(() => ({}))) as {
+        items?: string[];
+        error?: string;
+      };
+      if (!res.ok || !json.items || json.items.length === 0) {
+        throw new Error(json.error || `AI suggest failed (${res.status})`);
+      }
+      setAiState((prev) => ({
+        ...prev,
+        [c.id]: { kind: "ready", items: json.items! },
+      }));
+    } catch (e) {
+      setAiState((prev) => ({
+        ...prev,
+        [c.id]: {
+          kind: "error",
+          message: e instanceof Error ? e.message : "AI suggest failed",
+        },
+      }));
+    }
+  }
+  function acceptAiSuggestion(criterionId: string, label: string) {
+    const ci = criteria.findIndex((c) => c.id === criterionId);
+    if (ci < 0) return;
+    addSuggestedItem(ci, label);
+    setAiState((prev) => {
+      const cur = prev[criterionId];
+      if (!cur || cur.kind !== "ready") return prev;
+      const remaining = cur.items.filter((s) => s !== label);
+      return {
+        ...prev,
+        [criterionId]:
+          remaining.length > 0
+            ? { kind: "ready", items: remaining }
+            : { kind: "idle" },
+      };
+    });
+  }
+  function acceptAllAiSuggestions(criterionId: string) {
+    const cur = aiState[criterionId];
+    if (!cur || cur.kind !== "ready") return;
+    const ci = criteria.findIndex((c) => c.id === criterionId);
+    if (ci < 0) return;
+    addAllSuggested(ci, cur.items);
+    setAiState((prev) => ({ ...prev, [criterionId]: { kind: "idle" } }));
+  }
+  function dismissAiSuggestions(criterionId: string) {
+    setAiState((prev) => ({ ...prev, [criterionId]: { kind: "idle" } }));
+  }
   return (
-    <div className="mt-4 space-y-2">
-      {criteria.map((c, ci) => (
-        <div
-          key={c.id}
-          className="border border-border rounded-md p-3 bg-surface-2/50 space-y-2"
-        >
-          <div className="flex items-center gap-2">
-            <input
-              value={c.label}
-              onChange={(e) => update(ci, { label: e.target.value })}
-              className="flex-1 bg-surface border border-border rounded-md px-2.5 py-1.5 text-[12.5px] font-semibold focus:outline-none focus:border-accent"
-              suppressHydrationWarning
-            />
-            <button
-              type="button"
-              onClick={() => remove(ci)}
-              aria-label="Remove criterion"
-              className="w-7 h-7 grid place-items-center rounded-md text-ink-3 hover:text-bad"
-            >
-              ×
-            </button>
-          </div>
-          {scoringMode === "checklist" ? (
+    <div className="mt-4 space-y-3">
+      <div className="text-[10.5px] font-bold uppercase tracking-[0.08em] text-ink-3">
+        Checklist items per criterion
+      </div>
+      {criteria.map((c, ci) => {
+        // Suggested items come from the standard library (custom criteria
+        // won't have any). Hide suggestions the admin has already added
+        // — matched by case-insensitive label — so the pill row shrinks
+        // as they build the list out.
+        const std = lookupStandardCriterion(c.id);
+        const usedLabels = new Set(
+          c.items.map((it) => it.label.trim().toLowerCase()),
+        );
+        const remainingSuggestions = (std?.suggestedItems ?? []).filter(
+          (s) => !usedLabels.has(s.trim().toLowerCase()),
+        );
+        return (
+          <div
+            key={c.id}
+            className="border border-border rounded-md p-3 bg-surface-2/50 space-y-2"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-[12.5px] font-semibold text-ink truncate">
+                {c.label}
+              </div>
+              <div className="text-[11px] text-ink-3 font-mono shrink-0">
+                {c.weight}%
+              </div>
+            </div>
             <div className="space-y-1.5 pl-2">
               {c.items.map((it, ii) => (
                 <div key={it.id} className="flex items-center gap-2">
@@ -1140,25 +1316,242 @@ function CriteriaList({
                   </button>
                 </div>
               ))}
-              <button
-                type="button"
-                onClick={() => addItem(ci)}
-                className="text-[11.5px] font-semibold text-accent hover:text-accent-strong"
-              >
-                + Add checklist item
-              </button>
+              {remainingSuggestions.length > 0 ? (
+                <div className="pt-1.5 space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-[10.5px] font-bold uppercase tracking-[0.08em] text-ink-3">
+                      Suggested items
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        addAllSuggested(ci, remainingSuggestions)
+                      }
+                      className="text-[10.5px] font-semibold text-accent hover:text-accent-strong"
+                    >
+                      Add all
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {remainingSuggestions.map((s) => (
+                      <button
+                        key={s}
+                        type="button"
+                        onClick={() => addSuggestedItem(ci, s)}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-dashed border-accent-pale bg-accent-pale/20 text-accent text-[11.5px] hover:bg-accent-pale/40"
+                        title={`Add "${s}" as a checklist item`}
+                      >
+                        <span aria-hidden>+</span>
+                        <span>{s}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+              <AiSuggestBlock
+                state={aiState[c.id] ?? { kind: "idle" }}
+                onRequest={() => requestAiSuggestions(ci)}
+                onAccept={(label) => acceptAiSuggestion(c.id, label)}
+                onAcceptAll={() => acceptAllAiSuggestions(c.id)}
+                onDismiss={() => dismissAiSuggestions(c.id)}
+              />
+              {/* Actions row — separates the AI affordance from the
+                  plain "add a blank row" fallback with a divider so the
+                  two don't visually merge into one hyperlink smear. */}
+              <div className="pt-2 mt-1 border-t border-border/60 flex items-center justify-between gap-2">
+                <span className="text-[10.5px] text-ink-3 uppercase tracking-[0.06em]">
+                  Or add your own
+                </span>
+                <button
+                  type="button"
+                  onClick={() => addItem(ci)}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-border bg-surface text-[11.5px] font-semibold text-ink-2 hover:text-ink hover:bg-surface-2"
+                >
+                  + Add custom item
+                </button>
+              </div>
             </div>
-          ) : null}
-        </div>
-      ))}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─────────────── Streaming provider banner ───────────────
+//
+// Shown at the top of the Roleplay editor. Three states:
+//   1. No provider configured        → red: trainee will not get an avatar
+//   2. Provider is render-only       → amber: streaming will 412 at runtime
+//   3. Provider supports streaming   → nothing rendered
+// Every message links to /admin/video-providers so the fix is one click.
+
+function StreamingProviderBanner({
+  provider,
+}: {
+  provider: { kind: string; supportsStreaming: boolean } | null;
+}) {
+  if (provider && provider.supportsStreaming) return null;
+
+  const isNoProvider = !provider;
+  const tone = isNoProvider
+    ? "border-bad/40 bg-bad-pale/40 text-bad"
+    : "border-[#e6a24a]/50 bg-[#fef3e6] text-[#8a4b12]";
+
+  return (
+    <div
+      className={cn(
+        "flex items-start gap-2.5 rounded-md border px-3.5 py-2.5 text-[12.5px]",
+        tone,
+      )}
+      role="alert"
+    >
+      <span aria-hidden className="text-[14px] leading-none pt-0.5">
+        ⚠
+      </span>
+      <div className="min-w-0 space-y-0.5">
+        {isNoProvider ? (
+          <>
+            <div className="font-semibold">
+              No streaming provider configured
+            </div>
+            <div className="text-[11.5px]">
+              Trainees will play this roleplay in text-only mode. Add a HeyGen
+              or D-ID row and mark it default at{" "}
+              <Link
+                href="/admin/video-providers"
+                className="underline font-semibold"
+              >
+                Avatars &amp; Voices
+              </Link>
+              .
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="font-semibold">
+              Default provider ({provider.kind}) doesn&apos;t support live
+              avatar streaming
+            </div>
+            <div className="text-[11.5px]">
+              Streaming will fail at runtime. Switch the default to HeyGen or
+              D-ID at{" "}
+              <Link
+                href="/admin/video-providers"
+                className="underline font-semibold"
+              >
+                Avatars &amp; Voices
+              </Link>{" "}
+              to enable live avatar mode.
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────── AI suggest block ───────────────
+//
+// Renders the "Suggest with AI" affordance inside each criterion card.
+// Idle: just the button. Loading: disabled + spinner. Ready: pill row
+// (same visual as static suggestions) + "Add all" / "Dismiss". Error:
+// inline red message with a retry button.
+
+type AiSuggestState =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "ready"; items: string[] }
+  | { kind: "error"; message: string };
+
+function AiSuggestBlock({
+  state,
+  onRequest,
+  onAccept,
+  onAcceptAll,
+  onDismiss,
+}: {
+  state: AiSuggestState;
+  onRequest: () => void;
+  onAccept: (label: string) => void;
+  onAcceptAll: () => void;
+  onDismiss: () => void;
+}) {
+  if (state.kind === "idle") {
+    return (
       <button
         type="button"
-        onClick={addCriterion}
-        suppressHydrationWarning
-        className="inline-flex items-center gap-1 px-3 py-1.5 rounded-md border border-dashed border-accent text-accent text-[12.5px] font-semibold hover:bg-accent-pale/20"
+        onClick={onRequest}
+        className="inline-flex items-center gap-1.5 text-[11.5px] font-semibold text-accent hover:text-accent-strong"
+        title="Ask AI for scenario-tailored checklist items"
       >
-        + Add Evaluation
+        <Icon name="ai-sparkle" size={11} />
+        Suggest with AI
       </button>
+    );
+  }
+  if (state.kind === "loading") {
+    return (
+      <div className="inline-flex items-center gap-1.5 text-[11.5px] font-semibold text-ink-3">
+        <Icon name="ai-sparkle" size={11} />
+        Generating suggestions…
+      </div>
+    );
+  }
+  if (state.kind === "error") {
+    return (
+      <div className="space-y-1">
+        <p className="text-[11.5px] text-bad font-mono break-words">
+          {state.message}
+        </p>
+        <button
+          type="button"
+          onClick={onRequest}
+          className="text-[11.5px] font-semibold text-accent hover:text-accent-strong"
+        >
+          Try again
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div className="pt-1.5 space-y-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <div className="inline-flex items-center gap-1 text-[10.5px] font-bold uppercase tracking-[0.08em] text-accent">
+          <Icon name="ai-sparkle" size={10} />
+          AI suggestions
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onAcceptAll}
+            className="text-[10.5px] font-semibold text-accent hover:text-accent-strong"
+          >
+            Add all
+          </button>
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="text-[10.5px] font-semibold text-ink-3 hover:text-ink"
+          >
+            Dismiss
+          </button>
+        </div>
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {state.items.map((s) => (
+          <button
+            key={s}
+            type="button"
+            onClick={() => onAccept(s)}
+            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-dashed border-accent bg-accent/10 text-accent text-[11.5px] hover:bg-accent/20"
+            title={`Add "${s}" as a checklist item`}
+          >
+            <span aria-hidden>+</span>
+            <span>{s}</span>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
