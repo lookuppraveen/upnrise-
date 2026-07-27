@@ -31,6 +31,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useElevenLabsTTS } from "./useElevenLabsTTS";
 
 // Threshold of silence after the user has spoken before we commit
 // the transcript. Long enough to survive a "uhh… let me think" pause,
@@ -91,6 +92,12 @@ export function useVoiceMode(opts: {
   /** When set, takes precedence over voiceGender. The trainee picked
    *  this voice manually via the dropdown — honour their choice. */
   voiceUri?: string | null;
+  /** ElevenLabs voice id for the persona. When set, `speak()` fetches
+   *  from `/api/roleplay/tts` and plays the returned audio; failures
+   *  fall back to window.speechSynthesis for the current utterance
+   *  AND flip a session-scoped kill switch so we don't hammer the
+   *  provider for the rest of the session. */
+  elevenLabsVoiceId?: string | null;
   onTranscript: (text: string) => void;
   /** Fired when interim speech is detected while listening in
    *  "background" mode (mic-open-during-TTS). The player typically
@@ -124,11 +131,21 @@ export function useVoiceMode(opts: {
     lang = "en-US",
     voiceGender = null,
     voiceUri = null,
+    elevenLabsVoiceId = null,
     onTranscript,
     onInterruption,
     silenceThresholdMs = DEFAULT_SILENCE_MS,
   } = opts;
   const [state, setState] = useState<VoiceState>("idle");
+
+  // ElevenLabs TTS driver — always instantiated so the hook shape
+  // stays stable. `speak()` below decides whether to call it based on
+  // elevenLabsVoiceId + the session kill switch.
+  const elevenLabs = useElevenLabsTTS();
+  // Session-scoped kill switch: once ElevenLabs fails once, we skip
+  // it for the rest of this player instance. Avoids retry-storming a
+  // dead provider and keeps the trainee's session usable on browser TTS.
+  const elevenLabsFailedRef = useRef(false);
   const recognitionRef = useRef<RecognitionInstance | null>(null);
   // Stash the latest callbacks so we don't have to recreate the
   // recognition instance every time the parent re-renders.
@@ -302,11 +319,12 @@ export function useVoiceMode(opts: {
     if (typeof window !== "undefined" && window.speechSynthesis) {
       window.speechSynthesis.cancel();
     }
+    elevenLabs.cancel();
     wantsListeningRef.current = false;
     clearSilenceTimer();
     recognitionRef.current?.abort();
     setState("idle");
-  }, [enabled, clearSilenceTimer]);
+  }, [enabled, clearSilenceTimer, elevenLabs]);
 
   // Pick a TTS voice. Manual override (`voiceUri`) wins; otherwise we
   // auto-pick by lang + persona gender. Browsers expose voices
@@ -354,7 +372,10 @@ export function useVoiceMode(opts: {
     };
   }, [lang, voiceGender, voiceUri]);
 
-  const speak = useCallback(
+  // Browser TTS (SpeechSynthesis) — the always-available fallback.
+  // Extracted so the ElevenLabs path can call into it on error without
+  // duplicating the utterance-lifecycle wiring.
+  const speakWithBrowser = useCallback(
     (text: string, opts?: { voiceUri?: string | null }) =>
       new Promise<void>((resolve) => {
         if (!enabled || !ttsSupported || !text.trim()) {
@@ -362,15 +383,11 @@ export function useVoiceMode(opts: {
           return;
         }
         const synth = window.speechSynthesis;
-        // Cancel any in-flight utterance so we don't queue up backlogs
-        // if the AI streams two chunks back-to-back.
         synth.cancel();
         const u = new SpeechSynthesisUtterance(text);
         u.lang = lang;
         u.rate = 1.0;
         u.pitch = 1.0;
-        // Per-call override (auto-flow uses this for the learner voice).
-        // Falls through to the hook-level selection when not provided.
         const override = opts?.voiceUri
           ? allVoicesRef.current.find((v) => v.voiceURI === opts.voiceUri) ??
             null
@@ -378,15 +395,10 @@ export function useVoiceMode(opts: {
         const chosen = override ?? selectedVoiceRef.current;
         if (chosen) {
           u.voice = chosen;
-          // Some browsers ignore u.lang when a voice is set; align it
-          // with the picked voice's lang so the right engine fires.
           u.lang = chosen.lang || lang;
         }
         u.onstart = () => setState("speaking");
         u.onend = () => {
-          // Only flip to idle if we aren't also keeping the mic open
-          // for interruption / commit. The listening state is owned
-          // by the SR onend handler in that case.
           setState((s) => {
             if (s !== "speaking") return s;
             return wantsListeningRef.current ? "listening" : "idle";
@@ -403,6 +415,47 @@ export function useVoiceMode(opts: {
         synth.speak(u);
       }),
     [enabled, ttsSupported, lang],
+  );
+
+  const speak = useCallback(
+    async (text: string, opts?: { voiceUri?: string | null }): Promise<void> => {
+      if (!enabled || !text.trim()) return;
+
+      // Route to browser TTS when:
+      //   • ElevenLabs isn't configured for this session
+      //   • The auto-flow "learner" voice is speaking (opts.voiceUri set)
+      //     — that path needs the browser's voice roster to pick a
+      //     distinct-sounding voice, not the persona's ElevenLabs voice
+      //   • ElevenLabs already failed this session (kill switch)
+      const useEleven =
+        !!elevenLabsVoiceId && !opts?.voiceUri && !elevenLabsFailedRef.current;
+
+      if (!useEleven) {
+        return speakWithBrowser(text, opts);
+      }
+
+      // Cancel any browser TTS from a prior turn so we don't overlap.
+      if (ttsSupported) window.speechSynthesis?.cancel();
+      setState("speaking");
+      try {
+        await elevenLabs.speak(text, { voiceId: elevenLabsVoiceId! });
+        setState((s) => {
+          if (s !== "speaking") return s;
+          return wantsListeningRef.current ? "listening" : "idle";
+        });
+      } catch (err) {
+        // Log once and fall back to browser TTS for the current utterance
+        // AND every subsequent one this session. Trainees never see a
+        // silent persona because of a provider outage.
+        console.warn(
+          "[voice] ElevenLabs speak failed, falling back to browser TTS:",
+          err instanceof Error ? err.message : err,
+        );
+        elevenLabsFailedRef.current = true;
+        await speakWithBrowser(text, opts);
+      }
+    },
+    [enabled, ttsSupported, elevenLabsVoiceId, elevenLabs, speakWithBrowser],
   );
 
   const startListening = useCallback(
@@ -480,8 +533,11 @@ export function useVoiceMode(opts: {
     if (typeof window !== "undefined" && window.speechSynthesis) {
       window.speechSynthesis.cancel();
     }
+    // ElevenLabs audio needs an explicit pause + fetch abort — the
+    // browser synth cancel above doesn't touch <audio> elements.
+    elevenLabs.cancel();
     setState((s) => (s === "speaking" ? "idle" : s));
-  }, []);
+  }, [elevenLabs]);
 
   return {
     state,

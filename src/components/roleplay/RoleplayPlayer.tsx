@@ -27,6 +27,7 @@ import {
   MODE_LABELS,
   type PlayerMode,
 } from "@/lib/roleplay/additional-settings";
+import { pickDefaultVoice } from "@/lib/voice/voice-catalog";
 
 type Bubble = { role: "persona" | "learner"; content: string };
 
@@ -220,10 +221,23 @@ export function RoleplayPlayer({
     if (uri) window.sessionStorage.setItem(voiceOverrideKey, uri);
     else window.sessionStorage.removeItem(voiceOverrideKey);
   }
+  // Phase 1: auto-pick an ElevenLabs voice from persona gender. The
+  // useVoiceMode `speak()` will hit /api/roleplay/tts for this voice
+  // and fall back to browser TTS if the server returns 503 (kill
+  // switch, missing key) or 502 (upstream error).
+  // Phase 3 will let admins pick a specific voice_id in the module
+  // editor and pass it in here — until then, this default gives every
+  // trainee a natural-sounding persona voice out of the box.
+  const elevenLabsVoiceId = useMemo(
+    () => pickDefaultVoice(personaGender).id,
+    [personaGender],
+  );
+
   const voice = useVoiceMode({
     enabled: voiceMode,
     voiceGender: personaGender,
     voiceUri: manualVoiceUri,
+    elevenLabsVoiceId,
     // 1000ms of silence → commit. Tuned down from 2000ms because the
     // longer window made every turn feel dead — trainees stopped
     // speaking and stared at nothing for a full two seconds before
