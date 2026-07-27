@@ -18,6 +18,7 @@ import {
   signInviteToken,
 } from "@/lib/auth/invite-token";
 import { prisma } from "@/lib/db/client";
+import { invalidateEmployees } from "@/lib/db/invalidate";
 
 const InviteSchema = z.object({
   email: z.string().trim().toLowerCase().email().max(200),
@@ -177,6 +178,7 @@ export async function inviteTrainee(
   });
 
   revalidatePath("/admin/employees");
+  invalidateEmployees(session.companyId);
   return {
     ok: true,
     userId,
@@ -274,6 +276,7 @@ export async function updateEmployee(
   });
 
   revalidatePath("/admin/employees");
+  invalidateEmployees(session.companyId);
   return { ok: true };
 }
 
@@ -314,5 +317,6 @@ export async function deleteEmployee(
   });
 
   revalidatePath("/admin/employees");
+  invalidateEmployees(session.companyId);
   return { ok: true };
 }

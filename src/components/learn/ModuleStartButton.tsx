@@ -1,9 +1,21 @@
 "use client";
 
 import { useState } from "react";
+import dynamic from "next/dynamic";
 import { Button } from "@/components/ui/Button";
-import { PreSessionModal } from "@/components/roleplay/PreSessionModal";
 import type { PlayerMode } from "@/lib/roleplay/additional-settings";
+
+// PreSessionModal enumerates media devices via navigator.mediaDevices
+// on mount; there's no reason to ship it (or run it) on the training
+// detail page until the trainee actually clicks Start. Dynamic-import
+// with ssr:false so it never lands in the initial page bundle.
+const PreSessionModal = dynamic(
+  () =>
+    import("@/components/roleplay/PreSessionModal").then(
+      (m) => m.PreSessionModal,
+    ),
+  { ssr: false },
+);
 
 type Props = {
   trainingId: string;
@@ -53,24 +65,26 @@ export function ModuleStartButton({
         {hasAttempts ? "Retry" : "Start"}
       </Button>
 
-      <PreSessionModal
-        open={open}
-        onClose={() => setOpen(false)}
-        trainingId={trainingId}
-        moduleId={moduleId}
-        moduleName={moduleName}
-        scenario={scenario}
-        keywords={keywords}
-        minDurationMin={minDurationMin}
-        maxDurationMin={maxDurationMin}
-        attemptsKind={attemptsKind}
-        attemptsLimit={attemptsLimit}
-        attemptsUsed={attemptsUsed}
-        hintsKind={hintsKind}
-        hintsLimit={hintsLimit}
-        availableModes={availableModes}
-        availableLanguages={availableLanguages}
-      />
+      {open ? (
+        <PreSessionModal
+          open={open}
+          onClose={() => setOpen(false)}
+          trainingId={trainingId}
+          moduleId={moduleId}
+          moduleName={moduleName}
+          scenario={scenario}
+          keywords={keywords}
+          minDurationMin={minDurationMin}
+          maxDurationMin={maxDurationMin}
+          attemptsKind={attemptsKind}
+          attemptsLimit={attemptsLimit}
+          attemptsUsed={attemptsUsed}
+          hintsKind={hintsKind}
+          hintsLimit={hintsLimit}
+          availableModes={availableModes}
+          availableLanguages={availableLanguages}
+        />
+      ) : null}
     </>
   );
 }

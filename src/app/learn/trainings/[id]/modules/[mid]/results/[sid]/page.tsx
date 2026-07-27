@@ -32,6 +32,7 @@ import { KeywordCoverageCard } from "@/components/results/KeywordCoverageCard";
 import { ConversationStatsCard } from "@/components/results/ConversationStatsCard";
 import { SpeechDeliveryCard } from "@/components/results/SpeechDeliveryCard";
 import { ComparativeContextCard } from "@/components/results/ComparativeContextCard";
+import { GradingPoll } from "@/components/results/GradingPoll";
 
 export default async function ResultsPage({
   params,
@@ -162,6 +163,12 @@ export default async function ResultsPage({
         <Icon name="chevron-right" size={14} className="rotate-180" />
         Back to training
       </Link>
+
+      {/* Grading-in-progress poll — /end returns immediately and scores
+          via Next 16 after(), so score/rubric can still be null on the
+          first render. This client component reloads the page every 2s
+          until scoring lands. */}
+      <GradingPoll scored={autoFailed || overall != null} />
 
       {/* Auto-fail banner */}
       {autoFailed ? (

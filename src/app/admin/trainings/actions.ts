@@ -13,6 +13,7 @@ import { prisma } from "@/lib/db/client";
 import { audit } from "@/lib/audit";
 import { Prisma, type ModuleType } from "@prisma/client";
 import { STANDARD_CRITERIA } from "@/lib/evaluation/criteria-library";
+import { invalidateTrainings } from "@/lib/db/invalidate";
 
 async function requireAdminOwnsTraining(trainingId: string) {
   const user = await getSessionUser();
@@ -44,6 +45,7 @@ export async function createDraftTraining() {
     select: { id: true },
   });
   revalidatePath("/admin/trainings");
+  invalidateTrainings(user.companyId);
   redirect(`/admin/trainings/${draft.id}/edit?step=1`);
 }
 
@@ -65,6 +67,7 @@ export async function createDraftTrainingForGenerator(): Promise<{ id: string }>
     select: { id: true },
   });
   revalidatePath("/admin/trainings");
+  invalidateTrainings(user.companyId);
   return { id: draft.id };
 }
 
@@ -83,7 +86,7 @@ export async function saveBasicDetails(
 ) {
   const parsed = BasicSchema.safeParse(data);
   if (!parsed.success) throw new Error("invalid input");
-  await requireAdminOwnsTraining(trainingId);
+  const { training } = await requireAdminOwnsTraining(trainingId);
 
   await prisma.training.update({
     where: { id: trainingId },
@@ -94,6 +97,7 @@ export async function saveBasicDetails(
     },
   });
   revalidatePath(`/admin/trainings/${trainingId}/edit`);
+  invalidateTrainings(training.companyId);
   if (next) redirect(`/admin/trainings/${trainingId}/edit?step=2`);
 }
 
@@ -856,6 +860,7 @@ export async function deleteTraining(trainingId: string) {
     target: `training:${trainingId}`,
   });
   revalidatePath("/admin/trainings");
+  if (user.companyId) invalidateTrainings(user.companyId);
 }
 
 // ──────────── Roleplay module — full save ────────────
@@ -1479,12 +1484,13 @@ export async function saveRoleplayModule(
  * "N published" toast / pill. Idempotent: re-calling does nothing.
  */
 export async function publishAllModules(trainingId: string): Promise<number> {
-  await requireAdminOwnsTraining(trainingId);
+  const { training } = await requireAdminOwnsTraining(trainingId);
   const result = await prisma.trainingModule.updateMany({
     where: { trainingId, published: false },
     data: { published: true },
   });
   revalidatePath(`/admin/trainings/${trainingId}/edit`);
+  invalidateTrainings(training.companyId);
   return result.count;
 }
 

@@ -8,7 +8,7 @@
 import { getSessionUser } from "@/lib/auth/session";
 import {
   listTrainingsForCompany,
-  getTrainingProgressForUser,
+  getTrainingProgressForManyForUser,
 } from "@/lib/db/queries";
 import { Card } from "@/components/ui/Card";
 import {
@@ -25,17 +25,23 @@ export default async function TrainingsList() {
   }
   const trainings = await listTrainingsForCompany(user.companyId);
 
-  const withProgress: CatalogItem[] = await Promise.all(
-    trainings.map(async (t) => ({
-      id: t.id,
-      title: t.title,
-      description: t.description,
-      categories: t.categories,
-      thumbnailUrl: t.thumbnailUrl,
-      progress: await getTrainingProgressForUser(user.id, t.id),
-      _count: t._count,
-    })),
+  // Previously fired N × 3 queries (one getTrainingProgressForUser per
+  // training). Now: three total queries, one groupBy + one findMany +
+  // one module fetch, no matter how many trainings the tenant has.
+  const progressByTraining = await getTrainingProgressForManyForUser(
+    user.id,
+    trainings.map((t) => t.id),
   );
+
+  const withProgress: CatalogItem[] = trainings.map((t) => ({
+    id: t.id,
+    title: t.title,
+    description: t.description,
+    categories: t.categories,
+    thumbnailUrl: t.thumbnailUrl,
+    progress: progressByTraining.get(t.id) ?? 0,
+    _count: t._count,
+  }));
 
   const cutoff = Date.now() - NEW_DAYS * 24 * 60 * 60 * 1000;
   const newlyAdded = withProgress.filter(

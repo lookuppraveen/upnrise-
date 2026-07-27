@@ -55,15 +55,27 @@ export default async function PlayPage({
   const availableModes = resolveAvailableModes(settings.modes);
   const userChoiceMode = settings.modes.userChoice && availableModes.length > 1;
 
-  // Count prior attempts so we can render either a "limit reached"
-  // screen or an inline counter. The start route enforces the cap
-  // again — this is just nicer UX, not the authoritative check.
   const limited = settings.attempts.kind === "limited";
-  const attemptsUsed = limited
-    ? await prisma.roleplaySession.count({
-        where: { userId: user.id, moduleId: mod.id },
-      })
-    : 0;
+  const personaOverride = (
+    mod.body as { persona?: { liveDisplayUrl?: string | null } } | null
+  )?.persona;
+
+  // Fire attempt count + persona-portrait lookup in parallel — they
+  // don't depend on each other. Previously these were four sequential
+  // awaits (count → videoProvider → didPortrait) that stacked on top of
+  // loadModuleForUser, so the play page took ~4 round-trips of latency
+  // before the player HTML could stream.
+  const [attemptsUsed, personaPortraitUrl] = await Promise.all([
+    limited
+      ? prisma.roleplaySession.count({
+          where: { userId: user.id, moduleId: mod.id },
+        })
+      : Promise.resolve(0),
+    resolvePersonaPortraitUrl({
+      companyId: user.companyId!,
+      overrideUrl: personaOverride?.liveDisplayUrl ?? null,
+    }),
+  ]);
   const attemptsExhausted = limited && attemptsUsed >= settings.attempts.limit;
 
   if (attemptsExhausted) {
@@ -145,38 +157,6 @@ export default async function PlayPage({
   const filteredUserChoiceMode =
     filteredModes.length > 1 ? userChoiceMode : false;
 
-  // Resolve the portrait URL the audio-only surface should render.
-  // Order of precedence:
-  //   1. persona.liveDisplayUrl on this module (admin picked a saved
-  //      D-ID portrait via the persona editor)
-  //   2. companyId's first D-ID portrait that matches the provider's
-  //      default sourceUrl (so the tenant default also gets a face)
-  //   3. null  → surface falls back to initials circle
-  const personaOverride = (
-    mod.body as { persona?: { liveDisplayUrl?: string | null } } | null
-  )?.persona;
-  let personaPortraitUrl: string | null = personaOverride?.liveDisplayUrl ?? null;
-  if (!personaPortraitUrl) {
-    const providerDefault = await prisma.videoProvider.findFirst({
-      where: {
-        companyId: user.companyId!,
-        kind: "did",
-        isDefault: true,
-      },
-      select: { avatarId: true },
-    });
-    if (providerDefault?.avatarId) {
-      const match = await prisma.didPortrait.findFirst({
-        where: {
-          companyId: user.companyId!,
-          sourceUrl: providerDefault.avatarId,
-        },
-        select: { displayUrl: true },
-      });
-      personaPortraitUrl = match?.displayUrl ?? null;
-    }
-  }
-
   return (
     <div className="px-7 pt-5 pb-8 max-w-[1280px] mx-auto">
       <RoleplayPlayer
@@ -218,6 +198,32 @@ function afterPersonaName(persona: string): string {
   const idx = persona.indexOf(". ");
   if (idx === -1) return "";
   return persona.slice(idx + 2).trim();
+}
+
+// Resolve the portrait URL the audio-only surface should render.
+// Order of precedence:
+//   1. persona.liveDisplayUrl on this module (admin picked a saved
+//      D-ID portrait via the persona editor)
+//   2. companyId's first D-ID portrait that matches the provider's
+//      default sourceUrl (so the tenant default also gets a face)
+//   3. null  → surface falls back to initials circle
+async function resolvePersonaPortraitUrl(args: {
+  companyId: string;
+  overrideUrl: string | null;
+}): Promise<string | null> {
+  if (args.overrideUrl) return args.overrideUrl;
+
+  const providerDefault = await prisma.videoProvider.findFirst({
+    where: { companyId: args.companyId, kind: "did", isDefault: true },
+    select: { avatarId: true },
+  });
+  if (!providerDefault?.avatarId) return null;
+
+  const match = await prisma.didPortrait.findFirst({
+    where: { companyId: args.companyId, sourceUrl: providerDefault.avatarId },
+    select: { displayUrl: true },
+  });
+  return match?.displayUrl ?? null;
 }
 
 function parseRubric(raw: unknown): Rubric {

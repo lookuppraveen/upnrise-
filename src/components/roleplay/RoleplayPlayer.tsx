@@ -224,10 +224,13 @@ export function RoleplayPlayer({
     enabled: voiceMode,
     voiceGender: personaGender,
     voiceUri: manualVoiceUri,
-    // 2000ms of silence → commit. Long enough that brief "uhh let me
-    // think…" pauses don't cut the user off; short enough that a
-    // clean stop doesn't feel laggy.
-    silenceThresholdMs: 2000,
+    // 1000ms of silence → commit. Tuned down from 2000ms because the
+    // longer window made every turn feel dead — trainees stopped
+    // speaking and stared at nothing for a full two seconds before
+    // the AI reacted. A one-second gap is still long enough to
+    // tolerate brief "uhh…" pauses while feeling like a real
+    // conversation.
+    silenceThresholdMs: 1000,
     onTranscript: (text) => {
       // The hook calls this when STT commits a chunk (silence timer or
       // final result). Stick it straight into the composer and
@@ -507,10 +510,11 @@ export function RoleplayPlayer({
         await voice.speak(last.content);
       }
 
-      // Natural turn-gap before the user's mic opens. This is the
-      // ~half-second beat humans take between speakers — gives the
-      // trainee a moment to absorb what the persona just said.
-      await new Promise((r) => setTimeout(r, 700));
+      // Short turn-gap before the user's mic opens. 700ms felt like a
+      // walkie-talkie — after every persona line the trainee waited
+      // most of a second before they could reply. 150ms is enough to
+      // separate the two speakers without stalling the exchange.
+      await new Promise((r) => setTimeout(r, 150));
       if (stoppingRef.current) return;
 
       // Branch: auto-flow takes over the trainee's turn; manual mode
@@ -876,6 +880,16 @@ export function RoleplayPlayer({
     setHintRefreshing(false);
   }, [voice.state]);
 
+  // Auto-suggest the next hint, but debounced: give the trainee a
+  // window to start typing/speaking themselves before we spend an LLM
+  // call on a suggestion they don't need. If the composer picks up
+  // any input during the wait, we cancel and don't fire at all.
+  //
+  // Previously this fired synchronously as soon as `bubbles` grew,
+  // meaning every single persona turn triggered a /api/roleplay/hint
+  // request that competed with the main streaming reply and the
+  // periodic coach poll for tokens/rate limits.
+  const AUTO_HINT_DELAY_MS = 2500;
   useEffect(() => {
     if (!sessionId) return;
     if (!hintsAllowed) return;
@@ -887,8 +901,19 @@ export function RoleplayPlayer({
     const userStartsEmpty =
       flow?.startBy === "user" && bubbles.length === 0;
     if (!personaReady && !userStartsEmpty) return;
-    lastAutoSuggestedAtRef.current = bubbles.length;
-    void fetchAutoSuggestion();
+    // If the trainee is already composing a reply, don't suggest.
+    if (input.trim().length > 0) return;
+    const bubblesAtSchedule = bubbles.length;
+    const t = setTimeout(() => {
+      // The effect's cleanup runs the moment any dep changes (new
+      // bubble arrives, user starts typing, streaming flips), so if
+      // the timer fires the situation is still the one we scheduled
+      // against — just record the fire so we don't ask again for the
+      // same conversational state.
+      lastAutoSuggestedAtRef.current = bubblesAtSchedule;
+      void fetchAutoSuggestion();
+    }, AUTO_HINT_DELAY_MS);
+    return () => clearTimeout(t);
     // fetchAutoSuggestion reads live state via setters/refs; safe to
     // omit from deps.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -900,6 +925,7 @@ export function RoleplayPlayer({
     hintLoading,
     hintRefreshing,
     flow?.startBy,
+    input,
   ]);
 
   // ───────── Auto-flow orchestrator ─────────
@@ -1225,7 +1251,12 @@ export function RoleplayPlayer({
         <div className="space-y-4">
           <VideoTile
             label={personaRole || personaShort}
-            isActive={!streaming && captionText.length > 0}
+            // Persona tile is the current speaker whenever it's mid-stream
+            // OR has a settled caption on screen. Previously this was
+            // `!streaming && …`, so the avatar visibly *deactivated*
+            // exactly when the AI was talking — the ring vanished the
+            // moment tokens started flowing back.
+            isActive={streaming || captionText.length > 0}
             cornerAction={
               avatarMode ? (
                 <button

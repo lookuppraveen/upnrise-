@@ -4,6 +4,7 @@
 // prototype's dark "AI Weekly Brief" hero + `.akpi` corner-icon KPIs from
 // design_files/admin.css.
 
+import { Suspense } from "react";
 import Link from "next/link";
 import { getSessionUser } from "@/lib/auth/session";
 import {
@@ -66,10 +67,11 @@ export default async function AdminDashboard() {
     topPerformerScore: topPerformer?.avgScore ?? null,
     strugglingCount: needsAttention.length,
   };
-  const aiBrief = await generateAdminWeeklyBrief({
-    companyId: user.companyId,
-    signal: briefSignal,
-  });
+  // NOTE: generateAdminWeeklyBrief hits Claude (~1–3s cold). It was
+  // previously awaited here, blocking the entire dashboard render. It's
+  // now deferred to a <Suspense> below so the KPIs + tables paint
+  // immediately and the AI paragraph streams in when it's ready.
+  const companyId = user.companyId;
 
   return (
     <div className="px-7 pt-6 pb-20 max-w-[1480px] space-y-[22px]">
@@ -99,7 +101,11 @@ export default async function AdminDashboard() {
         sessions={stats.sessions}
         completionPct={stats.completionPct}
         attentionCount={needsAttention.length}
-        aiBrief={aiBrief}
+        aiBrief={
+          <Suspense fallback={<BriefSkeleton />}>
+            <AiBriefParagraph companyId={companyId} signal={briefSignal} />
+          </Suspense>
+        }
       />
 
       {/* KPI row — .akpi pattern */}
@@ -238,6 +244,29 @@ export default async function AdminDashboard() {
 // reflects the per-request server render. A future iteration can swap the
 // composed text for a real Claude call cached daily.
 
+async function AiBriefParagraph({
+  companyId,
+  signal,
+}: {
+  companyId: string;
+  signal: AdminWeeklySignal;
+}) {
+  const text = await generateAdminWeeklyBrief({ companyId, signal });
+  return <>{text}</>;
+}
+
+function BriefSkeleton() {
+  return (
+    <span className="inline-flex items-center gap-2 text-white/50 text-[13px]">
+      <span
+        aria-hidden
+        className="inline-block w-3.5 h-3.5 rounded-full border-2 border-white/30 border-r-transparent animate-spin"
+      />
+      Generating brief…
+    </span>
+  );
+}
+
 function AiWeeklyBrief({
   learners,
   activeTrainings,
@@ -253,7 +282,7 @@ function AiWeeklyBrief({
   sessions: number;
   completionPct: number | null;
   attentionCount: number;
-  aiBrief: string;
+  aiBrief: React.ReactNode;
 }) {
   const title = buildBriefTitle({ attentionCount, sessions, learners });
   const body = buildBriefBody({

@@ -49,7 +49,9 @@ export function HistoryView({
   aiBrief,
 }: {
   history: HistorySession[];
-  aiBrief?: string;
+  // ReactNode (not string) so the server page can pass a <Suspense> —
+  // the AI brief streams in without blocking the KPI row from rendering.
+  aiBrief?: React.ReactNode;
 }) {
   const [mode, setMode] = useState<ModeFilter>("all");
 
@@ -216,7 +218,7 @@ function AiSummaryCard({
   aiBrief,
 }: {
   summary: Summary;
-  aiBrief?: string;
+  aiBrief?: React.ReactNode;
 }) {
   const showJump =
     (summary.kind === "improving" || summary.kind === "declining") &&
@@ -289,7 +291,9 @@ function AiSummaryCard({
         )}
       </div>
       <div className="text-[12.5px] text-ink-2 mt-1.5 leading-[1.5]">
-        {aiBrief ?? composeSummaryBody(summary)}
+        {aiBrief !== undefined && aiBrief !== null
+          ? aiBrief
+          : composeSummaryBody(summary)}
       </div>
     </div>
   );

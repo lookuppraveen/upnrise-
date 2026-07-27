@@ -2,10 +2,33 @@
 // never from the URL or client (BUILD_PLAN.md §5).
 //
 // Phase 2 surfaces: trainings, modules, assignments, roleplay sessions.
+//
+// Caching strategy (see cache-tags.ts):
+//
+//   Heavy list/aggregate reads are wrapped in `unstable_cache` with:
+//     • a keyPart array that includes any tenant/user id — different
+//       tenants get different entries
+//     • a `tags` array so mutating server actions can invalidate the
+//       right set via `revalidateTag(cacheTags.X(companyId))`
+//     • a `revalidate` TTL as a safety net (data won't stale forever
+//       if someone forgets to add a `revalidateTag` on a new mutation)
+//
+// TTLs are deliberately short. The goal is to collapse repeat visits
+// during a browsing session, not to serve minutes-old data.
 
+import { unstable_cache } from "next/cache";
 import { prisma } from "./client";
+import { cacheTags } from "./cache-tags";
 
-export async function listTrainingsForCompany(companyId: string) {
+export function listTrainingsForCompany(companyId: string) {
+  return unstable_cache(
+    () => _listTrainingsForCompany(companyId),
+    ["listTrainingsForCompany", companyId],
+    { revalidate: 60, tags: [cacheTags.trainings(companyId)] },
+  )();
+}
+
+async function _listTrainingsForCompany(companyId: string) {
   return prisma.training.findMany({
     where: { companyId, status: "published" },
     orderBy: { createdAt: "desc" },
@@ -41,7 +64,15 @@ export async function getTrainingWithModulesForTenant(
   });
 }
 
-export async function getAssignmentsForUser(userId: string) {
+export function getAssignmentsForUser(userId: string) {
+  return unstable_cache(
+    () => _getAssignmentsForUser(userId),
+    ["getAssignmentsForUser", userId],
+    { revalidate: 30, tags: [cacheTags.learnerAssignments(userId)] },
+  )();
+}
+
+async function _getAssignmentsForUser(userId: string) {
   return prisma.assignment.findMany({
     where: { userId },
     orderBy: [{ dueAt: "asc" }, { priority: "asc" }],
@@ -64,7 +95,86 @@ export async function getAssignmentsForUser(userId: string) {
  *   - the org's best score (across this module)
  *   - number of attempts
  */
-export async function getModuleStatsForUser(userId: string, moduleId: string) {
+export function getModuleStatsForUser(userId: string, moduleId: string) {
+  return unstable_cache(
+    () => _getModuleStatsForUser(userId, moduleId),
+    ["getModuleStatsForUser", userId, moduleId],
+    { revalidate: 30, tags: [cacheTags.learner(userId)] },
+  )();
+}
+
+/**
+ * Batched module stats — one call per training-detail page instead of
+ * N calls per module. Same shape as `getModuleStatsForUser`, keyed by
+ * moduleId.
+ *
+ * Runs three grouped queries: user's max score by module, org's max
+ * score by module, and user's attempt count by module. Everything else
+ * is Map merging.
+ */
+export function getModuleStatsForManyForUser(
+  userId: string,
+  moduleIds: string[],
+): Promise<
+  Map<string, { yourBest: number | null; orgBest: number | null; attempts: number }>
+> {
+  return unstable_cache(
+    () => _getModuleStatsForManyForUser(userId, moduleIds),
+    [
+      "getModuleStatsForManyForUser",
+      userId,
+      moduleIds.slice().sort().join(","),
+    ],
+    { revalidate: 30, tags: [cacheTags.learner(userId)] },
+  )();
+}
+
+async function _getModuleStatsForManyForUser(
+  userId: string,
+  moduleIds: string[],
+) {
+  const out = new Map<
+    string,
+    { yourBest: number | null; orgBest: number | null; attempts: number }
+  >();
+  if (moduleIds.length === 0) return out;
+
+  const [yourAgg, orgAgg, attemptsAgg] = await Promise.all([
+    prisma.roleplaySession.groupBy({
+      by: ["moduleId"],
+      where: { userId, moduleId: { in: moduleIds }, score: { not: null } },
+      _max: { score: true },
+    }),
+    prisma.roleplaySession.groupBy({
+      by: ["moduleId"],
+      where: { moduleId: { in: moduleIds }, score: { not: null } },
+      _max: { score: true },
+    }),
+    prisma.roleplaySession.groupBy({
+      by: ["moduleId"],
+      where: { userId, moduleId: { in: moduleIds } },
+      _count: { _all: true },
+    }),
+  ]);
+
+  const yours = new Map<string, number | null>();
+  for (const r of yourAgg) yours.set(r.moduleId, r._max.score);
+  const org = new Map<string, number | null>();
+  for (const r of orgAgg) org.set(r.moduleId, r._max.score);
+  const attempts = new Map<string, number>();
+  for (const r of attemptsAgg) attempts.set(r.moduleId, r._count._all);
+
+  for (const id of moduleIds) {
+    out.set(id, {
+      yourBest: yours.get(id) ?? null,
+      orgBest: org.get(id) ?? null,
+      attempts: attempts.get(id) ?? 0,
+    });
+  }
+  return out;
+}
+
+async function _getModuleStatsForUser(userId: string, moduleId: string) {
   const [yourBestAgg, orgBestAgg, attempts] = await Promise.all([
     prisma.roleplaySession.aggregate({
       where: { userId, moduleId, score: { not: null } },
@@ -90,7 +200,18 @@ export async function getModuleStatsForUser(userId: string, moduleId: string) {
  * for which they have at least one *completed* roleplay session, or just any
  * session for video/quiz modules. Cheap heuristic for the list page.
  */
-export async function getTrainingProgressForUser(
+export function getTrainingProgressForUser(
+  userId: string,
+  trainingId: string,
+): Promise<number> {
+  return unstable_cache(
+    () => _getTrainingProgressForUser(userId, trainingId),
+    ["getTrainingProgressForUser", userId, trainingId],
+    { revalidate: 30, tags: [cacheTags.learner(userId)] },
+  )();
+}
+
+async function _getTrainingProgressForUser(
   userId: string,
   trainingId: string,
 ) {
@@ -131,10 +252,102 @@ export async function getTrainingProgressForUser(
   return Math.round((completedCount / modules.length) * 100);
 }
 
+/**
+ * Batched progress lookup for many trainings at once. Same math as
+ * `getTrainingProgressForUser`, but a single pass across all training
+ * ids — three queries total instead of `3 * N`. Returns a Map so
+ * callers can index by trainingId without another pass.
+ *
+ * Used by the trainee's catalog + assignments pages where the O(N)
+ * per-row call was the dominant DB cost.
+ */
+export function getTrainingProgressForManyForUser(
+  userId: string,
+  trainingIds: string[],
+): Promise<Map<string, number>> {
+  return unstable_cache(
+    () => _getTrainingProgressForManyForUser(userId, trainingIds),
+    ["getTrainingProgressForManyForUser", userId, trainingIds.slice().sort().join(",")],
+    { revalidate: 30, tags: [cacheTags.learner(userId)] },
+  )();
+}
+
+async function _getTrainingProgressForManyForUser(
+  userId: string,
+  trainingIds: string[],
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (trainingIds.length === 0) return out;
+
+  const modules = await prisma.trainingModule.findMany({
+    where: { trainingId: { in: trainingIds }, published: true },
+    select: { id: true, type: true, trainingId: true },
+  });
+  if (modules.length === 0) {
+    for (const id of trainingIds) out.set(id, 0);
+    return out;
+  }
+
+  const roleplayModuleIds = modules
+    .filter((m) => m.type === "roleplay")
+    .map((m) => m.id);
+  const nonRoleplayModuleIds = modules
+    .filter((m) => m.type !== "roleplay")
+    .map((m) => m.id);
+
+  const [roleplayDone, nonRoleplayDone] = await Promise.all([
+    roleplayModuleIds.length === 0
+      ? Promise.resolve([] as { moduleId: string }[])
+      : prisma.roleplaySession.groupBy({
+          by: ["moduleId"],
+          where: {
+            userId,
+            moduleId: { in: roleplayModuleIds },
+            endedAt: { not: null },
+          },
+        }),
+    nonRoleplayModuleIds.length === 0
+      ? Promise.resolve([] as { moduleId: string }[])
+      : prisma.moduleCompletion.findMany({
+          where: { userId, moduleId: { in: nonRoleplayModuleIds } },
+          select: { moduleId: true },
+        }),
+  ]);
+
+  const completedModuleIds = new Set<string>();
+  for (const r of roleplayDone) completedModuleIds.add(r.moduleId);
+  for (const r of nonRoleplayDone) completedModuleIds.add(r.moduleId);
+
+  const modulesByTraining = new Map<
+    string,
+    { total: number; done: number }
+  >();
+  for (const m of modules) {
+    const b = modulesByTraining.get(m.trainingId) ?? { total: 0, done: 0 };
+    b.total++;
+    if (completedModuleIds.has(m.id)) b.done++;
+    modulesByTraining.set(m.trainingId, b);
+  }
+
+  for (const id of trainingIds) {
+    const b = modulesByTraining.get(id);
+    out.set(id, b && b.total > 0 ? Math.round((b.done / b.total) * 100) : 0);
+  }
+  return out;
+}
+
 // ─────────────────────────── Phase 2.5 helpers ───────────────────────────
 
 /** All ended sessions for a user, newest first, with training + module + delta. */
-export async function getHistoryForUser(userId: string) {
+export function getHistoryForUser(userId: string) {
+  return unstable_cache(
+    () => _getHistoryForUser(userId),
+    ["getHistoryForUser", userId],
+    { revalidate: 30, tags: [cacheTags.learnerHistory(userId)] },
+  )();
+}
+
+async function _getHistoryForUser(userId: string) {
   return prisma.roleplaySession.findMany({
     where: { userId, endedAt: { not: null } },
     orderBy: { startedAt: "desc" },
@@ -161,7 +374,15 @@ export async function getHistoryForUser(userId: string) {
 }
 
 /** Aggregate KPIs for the learner dashboard. */
-export async function getDashboardStatsForUser(userId: string) {
+export function getDashboardStatsForUser(userId: string) {
+  return unstable_cache(
+    () => _getDashboardStatsForUser(userId),
+    ["getDashboardStatsForUser", userId],
+    { revalidate: 30, tags: [cacheTags.learner(userId)] },
+  )();
+}
+
+async function _getDashboardStatsForUser(userId: string) {
   const [count, agg, totalDuration, pointsAgg] = await Promise.all([
     prisma.roleplaySession.count({
       where: { userId, endedAt: { not: null } },
@@ -191,7 +412,15 @@ export async function getDashboardStatsForUser(userId: string) {
 }
 
 /** Most-recent ended session — drives "Continue learning". */
-export async function getLastSessionForUser(userId: string) {
+export function getLastSessionForUser(userId: string) {
+  return unstable_cache(
+    () => _getLastSessionForUser(userId),
+    ["getLastSessionForUser", userId],
+    { revalidate: 30, tags: [cacheTags.learner(userId)] },
+  )();
+}
+
+async function _getLastSessionForUser(userId: string) {
   return prisma.roleplaySession.findFirst({
     where: { userId, endedAt: { not: null } },
     orderBy: { endedAt: "desc" },
@@ -214,7 +443,18 @@ export async function getLastSessionForUser(userId: string) {
  * frequency count over the `weak_skills` array — exact-match aggregation is
  * fine for dev. Phase 2.6 lets Claude synthesize a richer view.
  */
-export async function getTopWeakSkillsForUser(
+export function getTopWeakSkillsForUser(
+  userId: string,
+  limit = 3,
+): Promise<Array<{ skill: string; count: number }>> {
+  return unstable_cache(
+    () => _getTopWeakSkillsForUser(userId, limit),
+    ["getTopWeakSkillsForUser", userId, String(limit)],
+    { revalidate: 60, tags: [cacheTags.learner(userId)] },
+  )();
+}
+
+async function _getTopWeakSkillsForUser(
   userId: string,
   limit = 3,
 ): Promise<Array<{ skill: string; count: number }>> {
@@ -256,7 +496,15 @@ export function subscriptionMrrCents(args: {
 }
 
 /** List all companies for the super-admin grid, with sub + plan + user count. */
-export async function listAllCompaniesForSuper() {
+export function listAllCompaniesForSuper() {
+  return unstable_cache(
+    _listAllCompaniesForSuper,
+    ["listAllCompaniesForSuper"],
+    { revalidate: 60, tags: [cacheTags.companiesAll, cacheTags.plansAll] },
+  )();
+}
+
+async function _listAllCompaniesForSuper() {
   const companies = await prisma.company.findMany({
     orderBy: { name: "asc" },
     include: {
@@ -304,7 +552,15 @@ export async function listAllCompaniesForSuper() {
  * Platform-wide KPIs for /super/overview. Computed at request time (cheap
  * for the seeded scale; production would denormalize MRR per subscription).
  */
-export async function getPlatformStats() {
+export function getPlatformStats() {
+  return unstable_cache(
+    _getPlatformStats,
+    ["getPlatformStats"],
+    { revalidate: 60, tags: [cacheTags.platformStats] },
+  )();
+}
+
+async function _getPlatformStats() {
   const [companies, users, sessions, aiSpendAgg, subscriptions, plans] =
     await Promise.all([
       prisma.company.count(),
@@ -336,7 +592,15 @@ export async function getPlatformStats() {
 }
 
 /** Companies sorted by churn risk desc — drives the "At-risk accounts" list. */
-export async function getAtRiskCompaniesForSuper(limit = 6) {
+export function getAtRiskCompaniesForSuper(limit = 6) {
+  return unstable_cache(
+    () => _getAtRiskCompaniesForSuper(limit),
+    ["getAtRiskCompaniesForSuper", String(limit)],
+    { revalidate: 120, tags: [cacheTags.atRiskAll, cacheTags.companiesAll] },
+  )();
+}
+
+async function _getAtRiskCompaniesForSuper(limit = 6) {
   const rows = await prisma.company.findMany({
     where: { churnRisk: { not: null } },
     orderBy: [{ churnRisk: "desc" }, { name: "asc" }],
@@ -447,7 +711,18 @@ export async function listAllUsersForSuper(args: {
  *   creditsUsed    = abs(sum of negative entries) (ai_consumption + negative adjustments)
  *   creditsBalance = creditsGranted - creditsUsed
  */
-export async function listBillingForSuper() {
+export function listBillingForSuper() {
+  return unstable_cache(
+    _listBillingForSuper,
+    ["listBillingForSuper"],
+    {
+      revalidate: 60,
+      tags: [cacheTags.billingAll, cacheTags.companiesAll, cacheTags.plansAll],
+    },
+  )();
+}
+
+async function _listBillingForSuper() {
   const companies = await prisma.company.findMany({
     orderBy: { name: "asc" },
     include: {
@@ -536,7 +811,15 @@ export async function getCompanyCreditsForSuper(companyId: string) {
 }
 
 /** Cross-tenant aggregates by region/industry for /super/analytics. */
-export async function getAnalyticsBreakdownsForSuper() {
+export function getAnalyticsBreakdownsForSuper() {
+  return unstable_cache(
+    _getAnalyticsBreakdownsForSuper,
+    ["getAnalyticsBreakdownsForSuper"],
+    { revalidate: 300, tags: [cacheTags.analyticsAll, cacheTags.companiesAll] },
+  )();
+}
+
+async function _getAnalyticsBreakdownsForSuper() {
   const companies = await listAllCompaniesForSuper();
 
   const byRegion = new Map<
@@ -653,7 +936,15 @@ export async function listGlobalAuditLog(args: {
 }
 
 /** Cross-tenant audit-log stream for the Platform Overview. */
-export async function getRecentPlatformActivity(limit = 8) {
+export function getRecentPlatformActivity(limit = 8) {
+  return unstable_cache(
+    () => _getRecentPlatformActivity(limit),
+    ["getRecentPlatformActivity", String(limit)],
+    { revalidate: 30, tags: [cacheTags.activityAll] },
+  )();
+}
+
+async function _getRecentPlatformActivity(limit = 8) {
   return prisma.auditLog.findMany({
     orderBy: { createdAt: "desc" },
     take: limit,
@@ -665,7 +956,15 @@ export async function getRecentPlatformActivity(limit = 8) {
 }
 
 /** Plans with sub counts + total MRR contribution. */
-export async function listPlansForSuper() {
+export function listPlansForSuper() {
+  return unstable_cache(
+    _listPlansForSuper,
+    ["listPlansForSuper"],
+    { revalidate: 300, tags: [cacheTags.plansAll] },
+  )();
+}
+
+async function _listPlansForSuper() {
   const plans = await prisma.plan.findMany({
     orderBy: { sortOrder: "asc" },
     include: {
@@ -841,7 +1140,22 @@ export async function getZoneBreakdownForCompany(companyId: string) {
   });
 }
 
-export async function getAdminDashboardStats(companyId: string) {
+export function getAdminDashboardStats(companyId: string) {
+  return unstable_cache(
+    () => _getAdminDashboardStats(companyId),
+    ["getAdminDashboardStats", companyId],
+    {
+      revalidate: 30,
+      tags: [
+        cacheTags.dashboard(companyId),
+        cacheTags.trainings(companyId),
+        cacheTags.assignments(companyId),
+      ],
+    },
+  )();
+}
+
+async function _getAdminDashboardStats(companyId: string) {
   const [learners, activeTrainings, avgAgg, allAssignments] = await Promise.all([
     prisma.user.count({
       where: { companyId, role: "trainee" },
@@ -864,12 +1178,15 @@ export async function getAdminDashboardStats(companyId: string) {
   ]);
 
   // Compute completion across assignments using the same progress heuristic
-  // we use for trainees. Cheap: at-most-N trainings × at-most-N assignments.
-  let completed = 0;
-  for (const a of allAssignments) {
-    const p = await getTrainingProgressForUser(a.userId, a.trainingId);
-    if (p >= 100) completed++;
-  }
+  // we use for trainees. Previously this looped `await` sequentially —
+  // for T assignments that meant T × 3 sequential queries. Fan out with
+  // Promise.all so all assignments compute in parallel.
+  const progresses = await Promise.all(
+    allAssignments.map((a) =>
+      getTrainingProgressForUser(a.userId, a.trainingId),
+    ),
+  );
+  const completed = progresses.filter((p) => p >= 100).length;
 
   return {
     learners,
@@ -887,7 +1204,21 @@ export async function getAdminDashboardStats(companyId: string) {
 }
 
 /** All trainings for admin — includes drafts/archived, not just published. */
-export async function listTrainingsForAdmin(companyId: string) {
+export function listTrainingsForAdmin(companyId: string) {
+  return unstable_cache(
+    () => _listTrainingsForAdmin(companyId),
+    ["listTrainingsForAdmin", companyId],
+    {
+      revalidate: 30,
+      tags: [
+        cacheTags.trainings(companyId),
+        cacheTags.assignments(companyId),
+      ],
+    },
+  )();
+}
+
+async function _listTrainingsForAdmin(companyId: string) {
   const trainings = await prisma.training.findMany({
     where: { companyId },
     orderBy: { updatedAt: "desc" },
@@ -904,32 +1235,56 @@ export async function listTrainingsForAdmin(companyId: string) {
     },
   });
 
-  // Aggregate completion across all assignments per training (for the card).
-  return Promise.all(
-    trainings.map(async (t) => {
-      const assignments = await prisma.assignment.findMany({
-        where: { trainingId: t.id },
-        select: { userId: true },
-      });
-      let done = 0;
-      for (const a of assignments) {
-        const p = await getTrainingProgressForUser(a.userId, t.id);
-        if (p >= 100) done++;
-      }
-      return {
-        ...t,
-        learnerCount: assignments.length,
-        completionPct:
-          assignments.length === 0
-            ? null
-            : Math.round((done / assignments.length) * 100),
-      };
-    }),
+  // Aggregate completion across assignments per training. Previously we
+  // ran (1 findMany + N × 3 queries) *per training* — a full O(T·A) walk.
+  // Now: fetch every assignment once, then compute all progress values in
+  // one Promise.all fan-out. Same result, one order of magnitude fewer
+  // round-trips on any real-sized tenant.
+  const trainingIds = trainings.map((t) => t.id);
+  if (trainingIds.length === 0) return [];
+
+  const allAssignments = await prisma.assignment.findMany({
+    where: { trainingId: { in: trainingIds } },
+    select: { trainingId: true, userId: true },
+  });
+
+  const progresses = await Promise.all(
+    allAssignments.map((a) =>
+      getTrainingProgressForUser(a.userId, a.trainingId),
+    ),
   );
+
+  const byTraining = new Map<string, { learners: number; done: number }>();
+  for (let i = 0; i < allAssignments.length; i++) {
+    const a = allAssignments[i];
+    const bucket = byTraining.get(a.trainingId) ?? { learners: 0, done: 0 };
+    bucket.learners++;
+    if (progresses[i] >= 100) bucket.done++;
+    byTraining.set(a.trainingId, bucket);
+  }
+
+  return trainings.map((t) => {
+    const b = byTraining.get(t.id);
+    const learnerCount = b?.learners ?? 0;
+    return {
+      ...t,
+      learnerCount,
+      completionPct:
+        learnerCount === 0 ? null : Math.round(((b?.done ?? 0) / learnerCount) * 100),
+    };
+  });
 }
 
 /** Employee/learner roster for admin. Per-user activity stats. */
-export async function listEmployeesForCompany(companyId: string) {
+export function listEmployeesForCompany(companyId: string) {
+  return unstable_cache(
+    () => _listEmployeesForCompany(companyId),
+    ["listEmployeesForCompany", companyId],
+    { revalidate: 60, tags: [cacheTags.employees(companyId)] },
+  )();
+}
+
+async function _listEmployeesForCompany(companyId: string) {
   const users = await prisma.user.findMany({
     where: { companyId, role: { in: ["admin", "trainee"] } },
     orderBy: { createdAt: "asc" },
@@ -986,7 +1341,15 @@ export async function listEmployeesForCompany(companyId: string) {
  * Tenant feed posts, newest first. Includes author name when present
  * (null author = AI-generated).
  */
-export async function listFeedPostsForCompany(companyId: string, take = 40) {
+export function listFeedPostsForCompany(companyId: string, take = 40) {
+  return unstable_cache(
+    () => _listFeedPostsForCompany(companyId, take),
+    ["listFeedPostsForCompany", companyId, String(take)],
+    { revalidate: 30, tags: [cacheTags.feed(companyId)] },
+  )();
+}
+
+async function _listFeedPostsForCompany(companyId: string, take = 40) {
   return prisma.feedPost.findMany({
     where: { companyId },
     orderBy: { createdAt: "desc" },
@@ -1006,7 +1369,15 @@ export async function listFeedPostsForCompany(companyId: string, take = 40) {
  * Tie-breaker: more sessions. Includes recent activity (sessions in last 7d)
  * as a "trend" signal.
  */
-export async function getLeaderboardForCompany(companyId: string) {
+export function getLeaderboardForCompany(companyId: string) {
+  return unstable_cache(
+    () => _getLeaderboardForCompany(companyId),
+    ["getLeaderboardForCompany", companyId],
+    { revalidate: 60, tags: [cacheTags.leaderboard(companyId)] },
+  )();
+}
+
+async function _getLeaderboardForCompany(companyId: string) {
   const trainees = await prisma.user.findMany({
     where: { companyId, role: "trainee" },
     select: { id: true, email: true, name: true },
@@ -1073,7 +1444,18 @@ export async function getLeaderboardForCompany(companyId: string) {
  * production would either denormalize progress or batch with a single
  * groupBy + module count subquery.
  */
-export async function listAssignmentsForCompany(companyId: string) {
+export function listAssignmentsForCompany(companyId: string) {
+  return unstable_cache(
+    () => _listAssignmentsForCompany(companyId),
+    ["listAssignmentsForCompany", companyId],
+    {
+      revalidate: 30,
+      tags: [cacheTags.assignments(companyId), cacheTags.trainings(companyId)],
+    },
+  )();
+}
+
+async function _listAssignmentsForCompany(companyId: string) {
   const rows = await prisma.assignment.findMany({
     where: { training: { companyId } },
     orderBy: [{ priority: "asc" }, { dueAt: "asc" }, { createdAt: "desc" }],
@@ -1107,23 +1489,28 @@ export type ComputedAssignmentStatus =
 
 export async function getAssignmentsWithProgressForUser(userId: string) {
   const assignments = await getAssignmentsForUser(userId);
-  return Promise.all(
-    assignments.map(async (a) => {
-      const progress = await getTrainingProgressForUser(userId, a.trainingId);
-      const status: ComputedAssignmentStatus =
-        progress >= 100
-          ? "completed"
-          : progress > 0
-            ? "in_progress"
-            : "not_started";
-      const overdue =
-        a.dueAt != null && a.dueAt < new Date() && status !== "completed";
-      return {
-        ...a,
-        computedProgress: progress,
-        computedStatus: status,
-        overdue,
-      };
-    }),
+  // Batched — one call for every training the user is assigned to,
+  // regardless of assignment count. Previously this was N × 3 queries.
+  const progressByTraining = await getTrainingProgressForManyForUser(
+    userId,
+    assignments.map((a) => a.trainingId),
   );
+  const now = new Date();
+  return assignments.map((a) => {
+    const progress = progressByTraining.get(a.trainingId) ?? 0;
+    const status: ComputedAssignmentStatus =
+      progress >= 100
+        ? "completed"
+        : progress > 0
+          ? "in_progress"
+          : "not_started";
+    const overdue =
+      a.dueAt != null && a.dueAt < now && status !== "completed";
+    return {
+      ...a,
+      computedProgress: progress,
+      computedStatus: status,
+      overdue,
+    };
+  });
 }

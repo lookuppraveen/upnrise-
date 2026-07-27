@@ -5,16 +5,18 @@
 //
 //   1. Verifies the session belongs to the user.
 //   2. Marks endedAt + durationSec.
-//   3. Runs scoreSession() — inline, blocking. May take 3–10s; the player
-//      shows an "Ending…" state via React useTransition while we wait.
-//   4. Persists score, rubric_scores, strong/weak skills.
-//   5. Inserts an `feedback` row with the AI coaching summary (kind=ai).
-//   6. Returns the results-page URL.
+//   3. Returns the results-page URL immediately.
+//   4. Runs scoreSession() via `after()` — after the response has been
+//      sent, so the player doesn't sit on a spinner for the 3–10s the
+//      grading LLM takes. The results page shows a "Grading…" overlay
+//      that polls until score/rubricScores land.
+//   5. Persists score, rubric_scores, strong/weak skills.
+//   6. Inserts a `feedback` row with the AI coaching summary (kind=ai).
 //
 // If scoring fails (Claude error, malformed tool output), session is still
 // marked ended and the results page renders the transcript without scores.
 
-import { NextResponse } from "next/server";
+import { NextResponse, after } from "next/server";
 import { z } from "zod";
 import { getSessionUser } from "@/lib/auth/session";
 import { prisma } from "@/lib/db/client";
@@ -105,68 +107,87 @@ export async function POST(req: Request) {
     });
   }
 
-  // 4. Score.
+  // 4. Score — deferred to after the response is sent. The results
+  // page shows a "Grading…" overlay and polls until score/rubricScores
+  // land, so the trainee sees their transcript instantly instead of
+  // waiting on a spinner while Claude thinks for 3–10s.
   const cfg = session.module.roleplayConfig;
   const rubric = cfg ? parseRubric(cfg.rubric) : null;
   const transcript = session.transcript as unknown as TranscriptTurn[];
 
   if (cfg && rubric) {
-    const result = await scoreSession({
-      transcript,
-      rubric,
-      persona: cfg.persona,
-      scenario: cfg.scenario,
-      feedbackTone: (session.module.training.feedbackTone as "soft" | "balanced" | "direct") ?? "balanced",
-    });
+    const sessionId = session.id;
+    const moduleId = session.moduleId;
+    const trainingId = session.module.training.id;
+    const passingScore =
+      session.module.training.passingScore ?? rubric.pass_score ?? 70;
+    const feedbackTone =
+      (session.module.training.feedbackTone as
+        | "soft"
+        | "balanced"
+        | "direct") ?? "balanced";
+    const recipientId = user.id;
+    const companyId = user.companyId;
 
-    if (result) {
-      const passingScore = session.module.training.passingScore ?? rubric.pass_score ?? 70;
-      await prisma.$transaction([
-        prisma.roleplaySession.update({
-          where: { id: session.id },
-          data: {
-            score: result.overall,
-            rubricScores: result.rubric_scores,
-            strongSkills: result.strong_skills,
-            weakSkills: result.weak_skills,
-          },
-        }),
-        prisma.feedback.create({
-          data: {
-            recipientId: user.id,
-            sessionId: session.id,
-            trainingId: session.module.training.id,
-            kind: "ai",
-            sentiment:
-              result.overall >= passingScore
-                ? "positive"
-                : result.overall >= 50
-                  ? "neutral"
-                  : "negative",
-            body: result.summary,
-            source: process.env.ANTHROPIC_MODEL_FAST ?? "claude",
-          },
-        }),
-      ]);
+    after(async () => {
+      try {
+        const result = await scoreSession({
+          transcript,
+          rubric,
+          persona: cfg.persona,
+          scenario: cfg.scenario,
+          feedbackTone,
+        });
+        if (!result) return;
 
-      // Reward triggers — must run AFTER the score is persisted so the
-      // completed-session counts include this one. Failures are swallowed
-      // so a rewards bug never blocks the learner getting their results.
-      if (user.companyId) {
-        try {
-          await awardForSession({
-            userId: user.id,
-            companyId: user.companyId,
-            sessionId: session.id,
-            moduleId: session.moduleId,
-            trainingId: session.module.training.id,
-            score: result.overall,
-          });
-        } catch (err) {
-          console.error("[rewards] awardForSession failed", err);
+        await prisma.$transaction([
+          prisma.roleplaySession.update({
+            where: { id: sessionId },
+            data: {
+              score: result.overall,
+              rubricScores: result.rubric_scores,
+              strongSkills: result.strong_skills,
+              weakSkills: result.weak_skills,
+            },
+          }),
+          prisma.feedback.create({
+            data: {
+              recipientId,
+              sessionId,
+              trainingId,
+              kind: "ai",
+              sentiment:
+                result.overall >= passingScore
+                  ? "positive"
+                  : result.overall >= 50
+                    ? "neutral"
+                    : "negative",
+              body: result.summary,
+              source: process.env.ANTHROPIC_MODEL_FAST ?? "claude",
+            },
+          }),
+        ]);
+
+        // Rewards — swallowed on failure so a bug here never gates
+        // the learner's grade landing on the results page.
+        if (companyId) {
+          try {
+            await awardForSession({
+              userId: recipientId,
+              companyId,
+              sessionId,
+              moduleId,
+              trainingId,
+              score: result.overall,
+            });
+          } catch (err) {
+            console.error("[rewards] awardForSession failed", err);
+          }
         }
+      } catch (err) {
+        console.error("[end] deferred scoreSession failed", err);
       }
-    }
+    });
   }
 
   // Admins previewing a module don't get a /learn/.../results page —

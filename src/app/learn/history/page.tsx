@@ -5,6 +5,7 @@
 // timeline. The weekly AI brief is generated server-side from real
 // week-over-week stats and passed in as prose.
 
+import { Suspense } from "react";
 import { getSessionUser } from "@/lib/auth/session";
 import { getHistoryForUser } from "@/lib/db/queries";
 import {
@@ -39,15 +40,45 @@ export default async function HistoryPage() {
   }));
 
   const signal = buildSignal(rows);
-  const aiBrief = await generateTraineeWeeklyBrief({
-    userId: user.id,
-    signal,
-  });
 
+  // Weekly brief hits Claude — cold ~1–3s. It's now streamed via
+  // <Suspense> so the KPI row + timeline render immediately. The
+  // AiSummaryCard falls back to its deterministic summary body while
+  // the brief resolves; the brief swaps in when ready.
   return (
     <div className="px-7 pt-6 pb-20 max-w-[1100px]">
-      <HistoryView history={rows} aiBrief={aiBrief} />
+      <HistoryView
+        history={rows}
+        aiBrief={
+          <Suspense fallback={<HistoryBriefFallback />}>
+            <HistoryBriefText userId={user.id} signal={signal} />
+          </Suspense>
+        }
+      />
     </div>
+  );
+}
+
+async function HistoryBriefText({
+  userId,
+  signal,
+}: {
+  userId: string;
+  signal: TraineeWeeklySignal;
+}) {
+  const text = await generateTraineeWeeklyBrief({ userId, signal });
+  return <>{text}</>;
+}
+
+function HistoryBriefFallback() {
+  return (
+    <span className="inline-flex items-center gap-2 text-ink-3">
+      <span
+        aria-hidden
+        className="inline-block w-3 h-3 rounded-full border-2 border-ink-3/40 border-r-transparent animate-spin"
+      />
+      Reading your week…
+    </span>
   );
 }
 

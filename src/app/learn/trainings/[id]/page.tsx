@@ -13,7 +13,7 @@ import { notFound } from "next/navigation";
 import { getSessionUser } from "@/lib/auth/session";
 import {
   getTrainingWithModulesForTenant,
-  getModuleStatsForUser,
+  getModuleStatsForManyForUser,
   getTrainingProgressForUser,
 } from "@/lib/db/queries";
 import { Card } from "@/components/ui/Card";
@@ -72,14 +72,23 @@ export default async function TrainingDetail({
   const training = await getTrainingWithModulesForTenant(id, user.companyId);
   if (!training) notFound();
 
-  const progress = await getTrainingProgressForUser(user.id, training.id);
+  // Progress + batched module stats fire in parallel — they only need
+  // the training id and the module id list, which we already have.
+  // Previously stats were N × 3 queries; now three total groupBys.
+  const [progress, statsByModule] = await Promise.all([
+    getTrainingProgressForUser(user.id, training.id),
+    getModuleStatsForManyForUser(
+      user.id,
+      training.modules.map((m) => m.id),
+    ),
+  ]);
 
-  const moduleStats = await Promise.all(
-    training.modules.map(async (m) => ({
-      module: m,
-      stats: await getModuleStatsForUser(user.id, m.id),
-    })),
-  );
+  const moduleStats = training.modules.map((m) => ({
+    module: m,
+    stats:
+      statsByModule.get(m.id) ??
+      { yourBest: null, orgBest: null, attempts: 0 },
+  }));
 
   const totalAttempts = moduleStats.reduce(
     (s, ms) => s + ms.stats.attempts,
