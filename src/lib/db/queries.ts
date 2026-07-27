@@ -112,13 +112,20 @@ export function getModuleStatsForUser(userId: string, moduleId: string) {
  * score by module, and user's attempt count by module. Everything else
  * is Map merging.
  */
-export function getModuleStatsForManyForUser(
+type ModuleStats = {
+  yourBest: number | null;
+  orgBest: number | null;
+  attempts: number;
+};
+
+export async function getModuleStatsForManyForUser(
   userId: string,
   moduleIds: string[],
-): Promise<
-  Map<string, { yourBest: number | null; orgBest: number | null; attempts: number }>
-> {
-  return unstable_cache(
+): Promise<Map<string, ModuleStats>> {
+  // See getTrainingProgressForManyForUser for the same pattern —
+  // Vercel's cache handler flattens JS Maps to `{}`, so we cache a
+  // plain object and rebuild the Map for callers.
+  const record = await unstable_cache(
     () => _getModuleStatsForManyForUser(userId, moduleIds),
     [
       "getModuleStatsForManyForUser",
@@ -127,16 +134,14 @@ export function getModuleStatsForManyForUser(
     ],
     { revalidate: 30, tags: [cacheTags.learner(userId)] },
   )();
+  return new Map(Object.entries(record));
 }
 
 async function _getModuleStatsForManyForUser(
   userId: string,
   moduleIds: string[],
-) {
-  const out = new Map<
-    string,
-    { yourBest: number | null; orgBest: number | null; attempts: number }
-  >();
+): Promise<Record<string, ModuleStats>> {
+  const out: Record<string, ModuleStats> = {};
   if (moduleIds.length === 0) return out;
 
   const [yourAgg, orgAgg, attemptsAgg] = await Promise.all([
@@ -165,11 +170,11 @@ async function _getModuleStatsForManyForUser(
   for (const r of attemptsAgg) attempts.set(r.moduleId, r._count._all);
 
   for (const id of moduleIds) {
-    out.set(id, {
+    out[id] = {
       yourBest: yours.get(id) ?? null,
       orgBest: org.get(id) ?? null,
       attempts: attempts.get(id) ?? 0,
-    });
+    };
   }
   return out;
 }
@@ -260,23 +265,31 @@ async function _getTrainingProgressForUser(
  *
  * Used by the trainee's catalog + assignments pages where the O(N)
  * per-row call was the dominant DB cost.
+ *
+ * IMPORTANT: the cache handler on Vercel serializes results, which
+ * collapses a JS `Map` to `{}`. The inner function therefore returns a
+ * plain `Record<string, number>` (safe to serialize) and this wrapper
+ * rebuilds the Map for callers. Don't inline the cache call — the
+ * `.get(id)` at the call site will throw `e.get is not a function` if
+ * it ever sees the raw cached payload.
  */
-export function getTrainingProgressForManyForUser(
+export async function getTrainingProgressForManyForUser(
   userId: string,
   trainingIds: string[],
 ): Promise<Map<string, number>> {
-  return unstable_cache(
+  const record = await unstable_cache(
     () => _getTrainingProgressForManyForUser(userId, trainingIds),
     ["getTrainingProgressForManyForUser", userId, trainingIds.slice().sort().join(",")],
     { revalidate: 30, tags: [cacheTags.learner(userId)] },
   )();
+  return new Map(Object.entries(record));
 }
 
 async function _getTrainingProgressForManyForUser(
   userId: string,
   trainingIds: string[],
-): Promise<Map<string, number>> {
-  const out = new Map<string, number>();
+): Promise<Record<string, number>> {
+  const out: Record<string, number> = {};
   if (trainingIds.length === 0) return out;
 
   const modules = await prisma.trainingModule.findMany({
@@ -284,7 +297,7 @@ async function _getTrainingProgressForManyForUser(
     select: { id: true, type: true, trainingId: true },
   });
   if (modules.length === 0) {
-    for (const id of trainingIds) out.set(id, 0);
+    for (const id of trainingIds) out[id] = 0;
     return out;
   }
 
@@ -331,7 +344,7 @@ async function _getTrainingProgressForManyForUser(
 
   for (const id of trainingIds) {
     const b = modulesByTraining.get(id);
-    out.set(id, b && b.total > 0 ? Math.round((b.done / b.total) * 100) : 0);
+    out[id] = b && b.total > 0 ? Math.round((b.done / b.total) * 100) : 0;
   }
   return out;
 }
@@ -1464,6 +1477,7 @@ async function _listAssignmentsForCompany(companyId: string) {
       training: { select: { id: true, title: true, categories: true } },
     },
   });
+  const nowMs = Date.now();
   return Promise.all(
     rows.map(async (a) => {
       const progress = await getTrainingProgressForUser(a.userId, a.trainingId);
@@ -1474,7 +1488,9 @@ async function _listAssignmentsForCompany(companyId: string) {
             ? "in_progress"
             : "not_started";
       const overdue =
-        a.dueAt != null && a.dueAt < new Date() && computedStatus !== "completed";
+        a.dueAt != null &&
+        new Date(a.dueAt).getTime() < nowMs &&
+        computedStatus !== "completed";
       return { ...a, computedProgress: progress, computedStatus, overdue };
     }),
   );
@@ -1495,7 +1511,10 @@ export async function getAssignmentsWithProgressForUser(userId: string) {
     userId,
     assignments.map((a) => a.trainingId),
   );
-  const now = new Date();
+  // dueAt comes from getAssignmentsForUser, which is cached — on a
+  // cache hit, Date fields round-trip as ISO strings. Compare on
+  // numeric ms so string vs Date doesn't matter.
+  const nowMs = Date.now();
   return assignments.map((a) => {
     const progress = progressByTraining.get(a.trainingId) ?? 0;
     const status: ComputedAssignmentStatus =
@@ -1505,7 +1524,9 @@ export async function getAssignmentsWithProgressForUser(userId: string) {
           ? "in_progress"
           : "not_started";
     const overdue =
-      a.dueAt != null && a.dueAt < now && status !== "completed";
+      a.dueAt != null &&
+      new Date(a.dueAt).getTime() < nowMs &&
+      status !== "completed";
     return {
       ...a,
       computedProgress: progress,

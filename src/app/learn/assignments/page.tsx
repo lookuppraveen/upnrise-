@@ -374,27 +374,30 @@ function matchesTab(a: AssignmentItem, tab: TabKey): boolean {
   }
 }
 
-function formatDue(due: Date | null): string {
+// dueAt round-trips through unstable_cache and comes back as an ISO
+// string on cache hits. Accept `Date | string | null` everywhere and
+// normalize via new Date(...) inside the helper — idempotent on Date.
+function formatDue(due: Date | string | null): string {
   if (!due) return "No due date";
   const days = daysFromNow(due);
   if (days < 0) return `${Math.abs(days)}d overdue`;
   if (days === 0) return "Due today";
   if (days === 1) return "Due tomorrow";
   if (days <= 7) return `Due in ${days}d`;
-  return `Due ${due.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
+  return `Due ${new Date(due).toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
 }
 
-function formatDueShort(due: Date | null): string {
+function formatDueShort(due: Date | string | null): string {
   if (!due) return "";
   const days = daysFromNow(due);
   if (days < 0) return `is ${Math.abs(days)}d overdue`;
   if (days === 0) return "is due today";
   if (days === 1) return "is due tomorrow";
   if (days <= 7) return `is due in ${days}d`;
-  return `is due ${due.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
+  return `is due ${new Date(due).toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
 }
 
-function daysFromNow(d: Date): number {
+function daysFromNow(d: Date | string): number {
   return Math.round(
     (new Date(d).getTime() - Date.now()) / (1000 * 60 * 60 * 24),
   );

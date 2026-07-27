@@ -115,7 +115,7 @@ export default async function LearnDashboard() {
                       <div className="text-[11.5px] text-ink-3 font-mono">
                         {a.priority.toUpperCase()} ·{" "}
                         {a.dueAt
-                          ? a.dueAt.toLocaleDateString("en-US", {
+                          ? new Date(a.dueAt).toLocaleDateString("en-US", {
                               month: "short",
                               day: "numeric",
                             })
@@ -382,7 +382,10 @@ function pickFirstName(name: string | null | undefined, email: string): string {
 
 function countDueWithinDays(
   assignments: Array<{
-    dueAt: Date | null;
+    // dueAt round-trips through unstable_cache, which serializes Date to
+    // ISO string. Accept both so a fresh render (Date) and a cache hit
+    // (string) both work — new Date(...) is idempotent on Dates.
+    dueAt: Date | string | null;
     computedStatus: string;
   }>,
   days: number,
@@ -392,6 +395,6 @@ function countDueWithinDays(
     (a) =>
       a.computedStatus !== "completed" &&
       a.dueAt != null &&
-      a.dueAt.getTime() <= cutoff,
+      new Date(a.dueAt).getTime() <= cutoff,
   ).length;
 }
