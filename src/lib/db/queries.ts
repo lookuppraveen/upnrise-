@@ -3,22 +3,37 @@
 //
 // Phase 2 surfaces: trainings, modules, assignments, roleplay sessions.
 //
-// Caching strategy (see cache-tags.ts):
+// ── Caching status ────────────────────────────────────────────────
+// Previously every heavy read was wrapped in Next's `unstable_cache`.
+// Vercel's cache handler serializes results through JSON, which turns
+// `Date` → ISO string and `Map` → `{}`. That silently broke downstream
+// code across the app (`.getTime is not a function`, `.get is not a
+// function`, missing filter results, etc.) — the caching layer became
+// a source of production incidents.
 //
-//   Heavy list/aggregate reads are wrapped in `unstable_cache` with:
-//     • a keyPart array that includes any tenant/user id — different
-//       tenants get different entries
-//     • a `tags` array so mutating server actions can invalidate the
-//       right set via `revalidateTag(cacheTags.X(companyId))`
-//     • a `revalidate` TTL as a safety net (data won't stale forever
-//       if someone forgets to add a `revalidateTag` on a new mutation)
+// The `unstable_cache` symbol is shadowed below with a pass-through
+// no-op so every existing call site continues to compile and behave
+// as if it were talking to a real cache, but no cache is consulted.
+// The batching + Suspense + loading skeletons that ship alongside
+// this file still deliver the perceived-speed win.
 //
-// TTLs are deliberately short. The goal is to collapse repeat visits
-// during a browsing session, not to serve minutes-old data.
+// If we ever re-introduce caching, do it with a Date/Map-safe
+// serializer (superjson) and start with a single query as a canary.
+// See `invalidate.ts` — the tag-based invalidation helpers are still
+// invoked from mutating actions, but they're currently harmless because
+// nothing is tagged.
 
-import { unstable_cache } from "next/cache";
 import { prisma } from "./client";
 import { cacheTags } from "./cache-tags";
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function unstable_cache<F extends (...args: never[]) => Promise<unknown>>(
+  fn: F,
+  _key?: string[],
+  _opts?: { revalidate?: number; tags?: string[] },
+): F {
+  return fn;
+}
 
 export function listTrainingsForCompany(companyId: string) {
   return unstable_cache(
