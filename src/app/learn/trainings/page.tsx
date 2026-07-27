@@ -43,12 +43,18 @@ export default async function TrainingsList() {
     _count: t._count,
   }));
 
+  // listTrainingsForCompany goes through unstable_cache, which turns
+  // Date fields into ISO strings on cache hits. Unary `+` on a Date
+  // gives ms, but on a string gives NaN — every filter returns false
+  // and every training gets dropped from the UI. Normalize with
+  // `new Date(...)` first (idempotent on Date).
   const cutoff = Date.now() - NEW_DAYS * 24 * 60 * 60 * 1000;
+  const asMs = (v: Date | string) => new Date(v).getTime();
   const newlyAdded = withProgress.filter(
-    (_, i) => +trainings[i].createdAt >= cutoff,
+    (_, i) => asMs(trainings[i].createdAt) >= cutoff,
   );
   const others = withProgress.filter(
-    (_, i) => +trainings[i].createdAt < cutoff,
+    (_, i) => asMs(trainings[i].createdAt) < cutoff,
   );
 
   return (
