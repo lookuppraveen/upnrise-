@@ -29,6 +29,10 @@ export type ElevenLabsSpeakOpts = {
   voiceId?: string;
   gender?: "female" | "male";
   model?: string;
+  /** RoleplaySession id the utterance belongs to. Sent to the route so
+   *  voice_usage_log rows can be attributed to the session and counted
+   *  against the per-session cap. Omit for previews / non-session TTS. */
+  sessionId?: string | null;
 };
 
 export type UseElevenLabsTTSResult = {
@@ -121,6 +125,7 @@ export function useElevenLabsTTS(): UseElevenLabsTTSResult {
             voiceId: opts?.voiceId,
             gender: opts?.gender,
             model: opts?.model,
+            sessionId: opts?.sessionId ?? undefined,
           }),
           signal: controller.signal,
         });

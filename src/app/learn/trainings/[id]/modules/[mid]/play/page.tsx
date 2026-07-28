@@ -157,6 +157,18 @@ export default async function PlayPage({
   const filteredUserChoiceMode =
     filteredModes.length > 1 ? userChoiceMode : false;
 
+  // Admin-picked ElevenLabs voice for the persona (Phase 3). Falls
+  // through to null when the module was saved before the picker
+  // existed OR when the admin left "Auto" selected — the player then
+  // auto-picks from gender via voice-catalog.pickDefaultVoice.
+  const personaBodyForVoice = mod.body as
+    | { persona?: { elevenLabsVoiceId?: unknown } }
+    | null;
+  const personaElevenLabsVoiceId =
+    typeof personaBodyForVoice?.persona?.elevenLabsVoiceId === "string"
+      ? (personaBodyForVoice.persona.elevenLabsVoiceId as string)
+      : null;
+
   return (
     <div className="px-7 pt-5 pb-8 max-w-[1280px] mx-auto">
       <RoleplayPlayer
@@ -178,6 +190,7 @@ export default async function PlayPage({
         recordAv={settings.recordAv === "yes"}
         availableLanguages={availableLanguages}
         personaPortraitUrl={personaPortraitUrl}
+        personaElevenLabsVoiceId={personaElevenLabsVoiceId}
       />
     </div>
   );

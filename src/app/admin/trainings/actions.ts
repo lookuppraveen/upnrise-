@@ -925,6 +925,11 @@ const PersonaSchema = z.object({
   liveAvatarName: z.string().trim().max(200).nullable().optional(),
   liveVoiceId: z.string().trim().max(120).nullable().optional(),
   liveVoiceName: z.string().trim().max(200).nullable().optional(),
+  liveDisplayUrl: z.string().trim().max(4000).nullable().optional(),
+  // Phase 3: admin-picked ElevenLabs voice for the trainee player.
+  // Nullable so the "Auto" option (fall back to gender-based default)
+  // round-trips through save cleanly.
+  elevenLabsVoiceId: z.string().trim().max(120).nullable().optional(),
 });
 
 const AdditionalSettingsSchema = z

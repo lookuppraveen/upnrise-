@@ -71,3 +71,12 @@ export function pickDefaultVoice(gender: CatalogGender | null): CatalogVoice {
 export function findVoice(voiceId: string): CatalogVoice | null {
   return CATALOG_VOICES.find((v) => v.id === voiceId) ?? null;
 }
+
+/**
+ * All catalog voices matching a gender. Used by the persona editor's
+ * voice-picker grid to show relevant options first while still letting
+ * the admin cross-gender if the persona calls for it.
+ */
+export function voicesByGender(gender: CatalogGender): CatalogVoice[] {
+  return CATALOG_VOICES.filter((v) => v.gender === gender);
+}

@@ -64,6 +64,7 @@ export function RoleplayPlayer({
   recordAv = false,
   availableLanguages = [],
   personaPortraitUrl = null,
+  personaElevenLabsVoiceId = null,
 }: {
   moduleId: string;
   moduleName: string;
@@ -102,6 +103,10 @@ export function RoleplayPlayer({
    *  one at the pre-session gate (only shown when 2+). Stored on the
    *  RoleplaySession so the results page reads the actual choice. */
   availableLanguages?: string[];
+  /** Admin-picked ElevenLabs voice id for the persona (Phase 3).
+   *  When null, the player falls back to the gender-based default
+   *  from `voice-catalog.ts`. */
+  personaElevenLabsVoiceId?: string | null;
 }) {
   const router = useRouter();
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -213,22 +218,26 @@ export function RoleplayPlayer({
   // The learner-voice-for-auto-flow logic below still uses the
   // browser voice list; that's an intentional feature (two distinct
   // voices in the demo conversation) so we keep the hook wiring.
-  // Phase 1: auto-pick an ElevenLabs voice from persona gender. The
-  // useVoiceMode `speak()` will hit /api/roleplay/tts for this voice
-  // and fall back to browser TTS if the server returns 503 (kill
-  // switch, missing key) or 502 (upstream error).
-  // Phase 3 will let admins pick a specific voice_id in the module
-  // editor and pass it in here — until then, this default gives every
-  // trainee a natural-sounding persona voice out of the box.
+  // Voice resolution — Phase 3 semantics:
+  //   1. If the admin picked a specific voice in the persona editor
+  //      (`personaElevenLabsVoiceId`), use it.
+  //   2. Otherwise fall back to the gender-based default from the
+  //      curated catalog — the same behaviour we shipped in Phase 1.
+  // The trainee player forwards this to /api/roleplay/tts; useVoiceMode
+  // handles the graceful fallback to browser TTS on error.
   const elevenLabsVoiceId = useMemo(
-    () => pickDefaultVoice(personaGender).id,
-    [personaGender],
+    () => personaElevenLabsVoiceId ?? pickDefaultVoice(personaGender).id,
+    [personaElevenLabsVoiceId, personaGender],
   );
 
   const voice = useVoiceMode({
     enabled: voiceMode,
     voiceGender: personaGender,
     elevenLabsVoiceId,
+    // Attribute every TTS call to the roleplay session so cost lands
+    // on the right row + counts toward the per-session cap. Null until
+    // /api/roleplay/start returns; before then no TTS fires anyway.
+    sessionId,
     // 1000ms of silence → commit. Tuned down from 2000ms because the
     // longer window made every turn feel dead — trainees stopped
     // speaking and stared at nothing for a full two seconds before

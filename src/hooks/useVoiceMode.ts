@@ -99,6 +99,9 @@ export function useVoiceMode(opts: {
    *  AND flip a session-scoped kill switch so we don't hammer the
    *  provider for the rest of the session. */
   elevenLabsVoiceId?: string | null;
+  /** RoleplaySession id — forwarded on every TTS call so voice usage
+   *  is attributed to the session and enforces the per-session cap. */
+  sessionId?: string | null;
   /** Prefer ElevenLabs Scribe for speech-to-text. On Firefox this is
    *  the ONLY way to get mic input (browser SpeechRecognition doesn't
    *  exist). Defaults to true — the hook internally falls back to
@@ -140,6 +143,7 @@ export function useVoiceMode(opts: {
     voiceUri = null,
     elevenLabsVoiceId = null,
     elevenLabsSttEnabled = true,
+    sessionId = null,
     onTranscript,
     onInterruption,
     silenceThresholdMs = DEFAULT_SILENCE_MS,
@@ -155,6 +159,7 @@ export function useVoiceMode(opts: {
     enabled: enabled && elevenLabsSttEnabled,
     languageCode: normalizeLangForScribe(lang),
     silenceThresholdMs,
+    sessionId,
     onTranscript,
     onInterruption,
   });
@@ -460,7 +465,10 @@ export function useVoiceMode(opts: {
       if (ttsSupported) window.speechSynthesis?.cancel();
       setState("speaking");
       try {
-        await elevenLabs.speak(text, { voiceId: elevenLabsVoiceId! });
+        await elevenLabs.speak(text, {
+          voiceId: elevenLabsVoiceId!,
+          sessionId,
+        });
         setState((s) => {
           if (s !== "speaking") return s;
           return wantsListeningRef.current ? "listening" : "idle";
@@ -477,7 +485,14 @@ export function useVoiceMode(opts: {
         await speakWithBrowser(text, opts);
       }
     },
-    [enabled, ttsSupported, elevenLabsVoiceId, elevenLabs, speakWithBrowser],
+    [
+      enabled,
+      ttsSupported,
+      elevenLabsVoiceId,
+      elevenLabs,
+      speakWithBrowser,
+      sessionId,
+    ],
   );
 
   const startListening = useCallback(

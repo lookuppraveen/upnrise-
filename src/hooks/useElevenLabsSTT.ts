@@ -63,6 +63,10 @@ type Options = {
   enabled: boolean;
   languageCode?: string;
   silenceThresholdMs?: number;
+  /** RoleplaySession id — sent to /api/roleplay/stt for cost
+   *  attribution. Null before start returns; TTS route accepts
+   *  omitted sessionId so a leading gap doesn't error. */
+  sessionId?: string | null;
   onTranscript: (text: string) => void;
   /** Fired when speech is detected during "background" mode (used by
    *  the player to cancel persona TTS). */
@@ -86,6 +90,7 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
     enabled,
     languageCode,
     silenceThresholdMs = DEFAULT_SILENCE_MS,
+    sessionId,
     onTranscript,
     onInterruption,
   } = opts;
@@ -99,6 +104,7 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
   const onInterruptionRef = useRef(onInterruption);
   const silenceThresholdRef = useRef(silenceThresholdMs);
   const languageCodeRef = useRef(languageCode);
+  const sessionIdRef = useRef(sessionId ?? null);
   const modeRef = useRef<ListeningMode>("active");
   useEffect(() => {
     onTranscriptRef.current = onTranscript;
@@ -112,6 +118,9 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
   useEffect(() => {
     languageCodeRef.current = languageCode;
   }, [languageCode]);
+  useEffect(() => {
+    sessionIdRef.current = sessionId ?? null;
+  }, [sessionId]);
 
   // Long-lived resources — held across utterances so we don't
   // re-prompt for mic permission every turn.
@@ -216,6 +225,9 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
       form.append("audio", blob);
       if (languageCodeRef.current) {
         form.append("languageCode", languageCodeRef.current);
+      }
+      if (sessionIdRef.current) {
+        form.append("sessionId", sessionIdRef.current);
       }
       const res = await fetch("/api/roleplay/stt", {
         method: "POST",

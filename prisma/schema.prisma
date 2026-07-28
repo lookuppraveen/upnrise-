@@ -248,6 +248,7 @@ model Company {
   videoProviders         VideoProvider[]
   didPortraits           DidPortrait[]
   questionBankItems      QuestionBankItem[]
+  voiceUsageLogs         VoiceUsageLog[]
 
   @@map("companies")
 }
@@ -505,6 +506,7 @@ model User {
   rewardEarnings                  RewardEarning[]
   conversations                   Conversation[]
   moduleCompletions               ModuleCompletion[]
+  voiceUsageLogs                  VoiceUsageLog[]
 
   @@index([companyId])
   @@index([teamId])
@@ -865,6 +867,7 @@ model RoleplaySession {
   user   User           @relation(fields: [userId], references: [id], onDelete: Cascade)
   module TrainingModule @relation(fields: [moduleId], references: [id], onDelete: Cascade)
   feedback Feedback[]
+  voiceUsageLogs VoiceUsageLog[]
 
   @@index([userId, moduleId, startedAt])
   @@index([moduleId])
@@ -988,4 +991,41 @@ model FeedPost {
 
   @@index([companyId, createdAt])
   @@map("feed_posts")
+}
+
+// One row per ElevenLabs (or other-provider) voice API call. Used for
+// cost attribution to tenants + per-session + per-tenant soft caps.
+// Written from /api/roleplay/tts and /api/roleplay/stt as a fire-and-
+// forget insert AFTER the response has been sent (never in the hot path).
+//
+// Kept lean: we store only what we need for a query — provider, kind
+// (tts | stt | tts_preview), the tenant + user + optional session,
+// input size (chars for tts, bytes for stt), and the estimated cost
+// in whole cents. Precise cost reconciliation against ElevenLabs
+// invoices is deferred; the estimate is a strict upper bound.
+model VoiceUsageLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  companyId  String   @map("company_id") @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  sessionId  String?  @map("session_id") @db.Uuid
+  kind       String   // "tts" | "stt" | "tts_preview"
+  provider   String   @default("elevenlabs")
+  model      String?  // e.g. "eleven_flash_v2_5", "scribe_v1"
+  voiceId    String?  @map("voice_id")
+  charsIn    Int?     @map("chars_in")
+  bytesIn    Int?     @map("bytes_in")
+  costCents  Int      @default(0) @map("cost_cents")
+  // Free-form JSON for debugging (upstream request id, error code, etc.).
+  meta       Json?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  company Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user    User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session RoleplaySession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  // Hot query: per-tenant monthly spend.
+  @@index([companyId, createdAt])
+  // Hot query: per-session cumulative usage for the soft cap.
+  @@index([sessionId])
+  @@map("voice_usage_log")
 }

@@ -21,6 +21,7 @@ import {
   DidPortraitPickerModal,
   type SavedPortrait,
 } from "@/components/admin/DidPortraitPickerModal";
+import { voicesByGender, type CatalogVoice } from "@/lib/voice/voice-catalog";
 
 export type PersonaData = {
   title: string;
@@ -33,6 +34,12 @@ export type PersonaData = {
   backgroundId: string | null;
   languages: string[];
   voiceId: string | null;
+  /** ElevenLabs voice id used by the roleplay player for the persona's
+   *  spoken lines. Independent from `voiceId` (which is an internal
+   *  label mapped to the D-ID / Microsoft Neural streaming avatar
+   *  voice). Null means "auto-pick from `avatarGender`" — see
+   *  `pickDefaultVoice` in `lib/voice/voice-catalog.ts`. */
+  elevenLabsVoiceId: string | null;
   // Optional override of the tenant's default LiveAvatar (set on the
   // VideoProvider row). When present, the trainee streaming session will
   // mint a token against this avatar instead — letting one tenant ship
@@ -232,6 +239,10 @@ export const DEFAULT_PERSONA: PersonaData = {
   liveVoiceId: "en-IN-NeerjaNeural",
   liveVoiceName: "Neerja · Female (en-IN)",
   liveDisplayUrl: null,
+  // null → the trainee player picks a female voice from the ElevenLabs
+  // catalog based on avatarGender. Admins override this via the
+  // "Roleplay voice (ElevenLabs)" section in the persona editor.
+  elevenLabsVoiceId: null,
 };
 
 export function PersonaModal({
@@ -276,6 +287,17 @@ export function PersonaModal({
   const [languages, setLanguages] = useState<string[]>(initial.languages);
   const [voiceId, setVoiceId] = useState<string | null>(initial.voiceId);
   const [voicesOpen, setVoicesOpen] = useState(false);
+  // ElevenLabs voice — drives the trainee-side roleplay audio. Kept
+  // separate from voiceId (which maps to the D-ID streaming avatar)
+  // because the two providers use different id spaces.
+  const [elevenLabsVoiceId, setElevenLabsVoiceId] = useState<string | null>(
+    initial.elevenLabsVoiceId ?? null,
+  );
+  const [elevenVoicesOpen, setElevenVoicesOpen] = useState(false);
+  const [previewingVoiceId, setPreviewingVoiceId] = useState<string | null>(
+    null,
+  );
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const [generating, setGenerating] = useState(false);
   const [genError, setGenError] = useState<string | null>(null);
   const [liveAvatarId, setLiveAvatarId] = useState<string | null>(
@@ -348,6 +370,46 @@ export function PersonaModal({
     );
   }
 
+  // ElevenLabs voice preview — POSTs a short sample sentence to the
+  // existing /api/roleplay/tts route (admins are allowed) and plays
+  // the returned audio via a shared Audio element. Clicking a
+  // different voice while one is playing cancels + replays. Errors
+  // (missing key, 402 from provider, network) fall silently — the
+  // preview button just doesn't play.
+  async function previewVoice(voice: CatalogVoice) {
+    setPreviewingVoiceId(voice.id);
+    try {
+      // Stop any prior preview so the two don't overlap.
+      previewAudioRef.current?.pause();
+      const sample =
+        `Hi, I'm ${voice.name}. This is a sample of how I'd sound as your persona.`;
+      const res = await fetch("/api/roleplay/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: sample, voiceId: voice.id }),
+      });
+      if (!res.ok) throw new Error(`tts_${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = previewAudioRef.current ?? new Audio();
+      previewAudioRef.current = audio;
+      audio.src = url;
+      const cleanup = () => {
+        URL.revokeObjectURL(url);
+        setPreviewingVoiceId((cur) => (cur === voice.id ? null : cur));
+      };
+      audio.onended = cleanup;
+      audio.onerror = cleanup;
+      await audio.play();
+    } catch (err) {
+      console.warn(
+        "[persona-editor] voice preview failed",
+        err instanceof Error ? err.message : err,
+      );
+      setPreviewingVoiceId(null);
+    }
+  }
+
   function save() {
     onSave({
       title: title.trim(),
@@ -365,6 +427,7 @@ export function PersonaModal({
       liveVoiceId,
       liveVoiceName,
       liveDisplayUrl,
+      elevenLabsVoiceId,
     });
   }
 
@@ -907,6 +970,105 @@ export function PersonaModal({
                     </button>
                   );
                 })}
+              </div>
+            ) : null}
+          </div>
+
+          {/* ── Roleplay voice (ElevenLabs) ─────────────────────────
+              Trainee-facing spoken audio. Independent from the "Voices"
+              accordion above (which maps to the D-ID streaming avatar).
+              null → the player auto-picks by avatarGender. */}
+          <div className="bg-surface border border-border rounded-[10px] p-4 space-y-3">
+            <button
+              type="button"
+              onClick={() => setElevenVoicesOpen((o) => !o)}
+              className="w-full flex items-center justify-between text-left"
+              aria-expanded={elevenVoicesOpen}
+            >
+              <div>
+                <div className="text-[13px] font-semibold text-ink">
+                  Roleplay voice
+                </div>
+                <div className="text-[11.5px] text-ink-3 mt-0.5">
+                  {elevenLabsVoiceId
+                    ? `Trainees hear ${voicesByGender("female").concat(voicesByGender("male")).find((v) => v.id === elevenLabsVoiceId)?.name ?? "custom voice"}`
+                    : `Auto — picks a ${gender === "male" ? "male" : "female"} voice for the persona`}
+                </div>
+              </div>
+              <Icon
+                name="chevron-down"
+                size={14}
+                className={cn(
+                  "text-ink-3 transition-transform",
+                  elevenVoicesOpen && "rotate-180",
+                )}
+              />
+            </button>
+            {elevenVoicesOpen ? (
+              <div className="space-y-3">
+                <button
+                  type="button"
+                  onClick={() => setElevenLabsVoiceId(null)}
+                  className={cn(
+                    "w-full text-left px-3 py-2 rounded-md border transition-colors",
+                    elevenLabsVoiceId === null
+                      ? "border-accent bg-accent-pale/30"
+                      : "border-border bg-surface hover:border-accent-pale",
+                  )}
+                >
+                  <div className="text-[13px] font-semibold text-ink">
+                    Auto (match persona gender)
+                  </div>
+                  <div className="text-[11.5px] text-ink-3">
+                    Trainee player picks a{" "}
+                    {gender === "male" ? "male" : "female"} voice.
+                  </div>
+                </button>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {voicesByGender(gender === "neutral" ? "female" : gender).map(
+                    (v) => {
+                      const selected = elevenLabsVoiceId === v.id;
+                      const previewing = previewingVoiceId === v.id;
+                      return (
+                        <div
+                          key={v.id}
+                          className={cn(
+                            "flex items-start gap-2 px-3 py-2 rounded-md border transition-colors",
+                            selected
+                              ? "border-accent bg-accent-pale/30"
+                              : "border-border bg-surface",
+                          )}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => setElevenLabsVoiceId(v.id)}
+                            className="flex-1 min-w-0 text-left"
+                          >
+                            <div className="text-[13px] font-semibold text-ink">
+                              {v.name}
+                            </div>
+                            <div className="text-[11.5px] text-ink-3">
+                              {v.tone ?? ""}
+                            </div>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => previewVoice(v)}
+                            disabled={previewing}
+                            aria-label={`Preview ${v.name}`}
+                            title="Play a sample"
+                            className="shrink-0 w-8 h-8 grid place-items-center rounded-md border border-border-strong bg-surface hover:bg-surface-2 disabled:opacity-60"
+                          >
+                            <Icon
+                              name={previewing ? "history" : "play"}
+                              size={12}
+                            />
+                          </button>
+                        </div>
+                      );
+                    },
+                  )}
+                </div>
               </div>
             ) : null}
           </div>

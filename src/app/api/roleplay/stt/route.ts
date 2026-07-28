@@ -3,31 +3,28 @@
 // Body: multipart/form-data
 //   audio        — Blob (webm/opus, mp4/aac, mp3, or wav)
 //   languageCode — optional ISO 639-1 hint (e.g. "en", "hi")
+//   sessionId    — optional RoleplaySession uuid for cost attribution
 //
 // Resp: { text: string, languageCode?: string }
 //
 // Client posts a short mic recording after silence-based VAD fires;
-// we forward to ElevenLabs Scribe and return the transcript. Same
-// auth model as /api/roleplay/tts.
+// we forward to ElevenLabs Scribe and return the transcript.
 //
-// Failure modes (client falls back to browser SpeechRecognition):
-//   401 unauthorized       — no session
-//   403 forbidden          — wrong role
-//   400 bad_body           — missing audio blob / too large
-//   503 provider_disabled  — VOICE_PROVIDER_DEFAULT=browser or key missing
-//   502 upstream_error     — ElevenLabs returned non-2xx (rate limit, quota…)
-//
-// Firefox has no SpeechRecognition to fall back to, so if the client
-// hits 503/502 there, the mic path is effectively unavailable — the
-// UI already surfaces "type instead" for that case.
+// Phase 4 additions:
+//   • Record a VoiceUsageLog row (kind="stt") via after() so
+//     transcription cost is attributed alongside TTS.
+//   • No per-session cap on STT (learner mic input is bounded by
+//     session duration, not char count). Per-tenant monthly cap is
+//     TTS-only for the same reason.
 
+import { after } from "next/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { transcribe, SttError } from "@/lib/voice/elevenlabs-stt";
+import { estimateSttCostCentsFromBytes } from "@/lib/voice/cost";
+import { recordVoiceUsage } from "@/lib/voice/usage";
 
-// Cap the accepted upload size. Roleplay chunks are <6s of speech
-// which is well under 100KB at opus 32kbps; 5MB is a generous ceiling
-// that stops a bad client from sending an entire minute of audio.
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+const STT_MODEL = process.env.ELEVENLABS_STT_MODEL ?? "scribe_v1";
 
 export async function POST(req: Request) {
   const user = await getSessionUser();
@@ -59,16 +56,41 @@ export async function POST(req: Request) {
       ? languageCodeRaw.trim().toLowerCase()
       : undefined;
 
+  const sessionIdRaw = form.get("sessionId");
+  const sessionId =
+    typeof sessionIdRaw === "string" && /^[0-9a-fA-F-]{36}$/.test(sessionIdRaw)
+      ? sessionIdRaw
+      : null;
+
+  const bytesIn = audio.size;
+  const companyId = user.companyId;
+
   try {
     const result = await transcribe({
       apiKey,
       audio,
-      // Preserve extension so ElevenLabs's mime sniffing picks the
-      // right decoder. Browser MediaRecorder default is webm.
       filename: guessFilename(audio.type),
       languageCode,
       signal: req.signal,
     });
+
+    // Attribute after the response is sent — same non-blocking pattern
+    // as the TTS route.
+    if (companyId) {
+      const costCents = estimateSttCostCentsFromBytes(bytesIn, STT_MODEL);
+      after(async () => {
+        await recordVoiceUsage({
+          companyId,
+          userId: user.id,
+          sessionId,
+          kind: "stt",
+          model: STT_MODEL,
+          bytesIn,
+          costCents,
+        });
+      });
+    }
+
     return new Response(
       JSON.stringify({
         text: result.text,
@@ -83,6 +105,24 @@ export async function POST(req: Request) {
       },
     );
   } catch (err) {
+    // Log failed calls too so persistent Scribe errors show up in the
+    // super-admin tile as $0 rows with an error tag.
+    if (companyId) {
+      const statusStr =
+        err instanceof SttError ? `${err.status}` : "network";
+      after(async () => {
+        await recordVoiceUsage({
+          companyId,
+          userId: user.id,
+          sessionId,
+          kind: "stt",
+          model: STT_MODEL,
+          bytesIn,
+          costCents: 0,
+          meta: { error: `upstream_${statusStr}` },
+        });
+      });
+    }
     if (err instanceof SttError) {
       console.error(
         `[roleplay/stt] upstream ${err.status}: ${err.upstreamBody}`,

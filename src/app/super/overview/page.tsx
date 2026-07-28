@@ -16,6 +16,11 @@ import {
   getRecentPlatformActivity,
   listBillingForSuper,
 } from "@/lib/db/queries";
+import {
+  getPlatformVoiceSpendThisMonth,
+  getTopVoiceSpendThisMonth,
+} from "@/lib/voice/usage-queries";
+import { formatCentsAsUsd } from "@/lib/voice/cost";
 import { Card } from "@/components/ui/Card";
 import { Icon } from "@/components/ui/Icon";
 import type { IconName } from "@/components/ui/Icon";
@@ -29,12 +34,22 @@ export default async function SuperOverview() {
   const user = await getSessionUser();
   if (!user || user.role !== "super_admin") return null;
 
-  const [stats, atRisk, activity, billing] = await Promise.all([
-    getPlatformStats(),
-    getAtRiskCompaniesForSuper(),
-    getRecentPlatformActivity(10),
-    listBillingForSuper(),
-  ]);
+  const [stats, atRisk, activity, billing, voiceTop, voiceTotals] =
+    await Promise.all([
+      getPlatformStats(),
+      getAtRiskCompaniesForSuper(),
+      getRecentPlatformActivity(10),
+      listBillingForSuper(),
+      // Both voice queries fail silently to 0 rows if voice_usage_log
+      // hasn't been created yet — the SQL script in prisma/ hasn't
+      // been applied. That lets the page render before the DB catches
+      // up rather than crashing every /super/overview load.
+      getTopVoiceSpendThisMonth(5).catch(() => []),
+      getPlatformVoiceSpendThisMonth().catch(() => ({
+        costCents: 0,
+        callCount: 0,
+      })),
+    ]);
 
   const today = new Date().toLocaleDateString("en-US", {
     weekday: "long",
@@ -100,6 +115,61 @@ export default async function SuperOverview() {
           icon="credit-card"
         />
       </div>
+
+      {/* Voice spend (Phase 4) — cost attribution across tenants for
+          the current calendar month. Renders even when the table is
+          empty so the operator sees the tile appear as spend accrues. */}
+      <section className="space-y-3">
+        <div className="flex items-baseline gap-2">
+          <h2 className="font-display text-[22px] leading-none -tracking-[0.01em]">
+            Voice spend
+          </h2>
+          <span className="text-[12px] text-ink-3 font-mono">
+            · this month · {formatCentsAsUsd(voiceTotals.costCents)} total ·{" "}
+            {voiceTotals.callCount.toLocaleString()} calls
+          </span>
+        </div>
+        {voiceTop.length === 0 ? (
+          <Card pad="md" className="text-[13px] text-ink-2">
+            No voice usage recorded this month yet.
+          </Card>
+        ) : (
+          <Card pad="md" className="rounded-[12px]">
+            <div className="space-y-1.5">
+              {voiceTop.map((row) => (
+                <Link
+                  key={row.companyId}
+                  href={`/super/companies/${row.companyId}`}
+                  className="flex items-center gap-3 p-2 rounded-md hover:bg-surface-2"
+                >
+                  <div
+                    className="w-9 h-9 grid place-items-center rounded-full text-white font-display font-normal text-[12px] shrink-0"
+                    style={{ backgroundColor: row.brandColor }}
+                  >
+                    {row.logoInitials}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="font-semibold text-[13px] truncate">
+                      {row.companyName}
+                    </div>
+                    <div className="text-[11px] text-ink-3 font-mono truncate">
+                      {row.ttsChars.toLocaleString()} chars synthesized
+                    </div>
+                  </div>
+                  <div className="text-right shrink-0">
+                    <div className="font-mono font-semibold text-[13px] text-ink">
+                      {formatCentsAsUsd(row.costCentsTotal)}
+                    </div>
+                    <div className="text-[10px] font-semibold uppercase tracking-[0.08em] text-ink-3">
+                      estimated
+                    </div>
+                  </div>
+                </Link>
+              ))}
+            </div>
+          </Card>
+        )}
+      </section>
 
       {/* AI Alerts */}
       <section className="space-y-3">
