@@ -20,7 +20,7 @@ import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/Button";
 import { Icon } from "@/components/ui/Icon";
 import { cn } from "@/lib/cn";
-import { useVoiceMode, type VoiceOption } from "@/hooks/useVoiceMode";
+import { useVoiceMode } from "@/hooks/useVoiceMode";
 import { useStreamingAvatar } from "@/hooks/useStreamingAvatar";
 import {
   MODE_DESCRIPTIONS,
@@ -205,22 +205,14 @@ export function RoleplayPlayer({
     () => derivePersonaGender(personaName, personaBlurb),
     [personaName, personaBlurb],
   );
-  // Manual voice override — trainee picks via the dropdown next to
-  // the mic. Persists per-tab in sessionStorage so a refresh keeps
-  // their choice but switching personas / modules resets cleanly.
-  const voiceOverrideKey = `roleplay.voiceUri.${moduleId}`;
-  const [manualVoiceUri, setManualVoiceUri] = useState<string | null>(null);
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const saved = window.sessionStorage.getItem(voiceOverrideKey);
-    if (saved) setManualVoiceUri(saved);
-  }, [voiceOverrideKey]);
-  function handlePickVoice(uri: string | null) {
-    setManualVoiceUri(uri);
-    if (typeof window === "undefined") return;
-    if (uri) window.sessionStorage.setItem(voiceOverrideKey, uri);
-    else window.sessionStorage.removeItem(voiceOverrideKey);
-  }
+  // NOTE: The manual voice picker used to live here (a dropdown next
+  // to the mic that let the trainee override the auto-picked TTS
+  // voice). It was removed with Phase 1 of the ElevenLabs cutover —
+  // the persona voice is now an admin decision (part of the persona
+  // identity) driven by module config, not a trainee preference.
+  // The learner-voice-for-auto-flow logic below still uses the
+  // browser voice list; that's an intentional feature (two distinct
+  // voices in the demo conversation) so we keep the hook wiring.
   // Phase 1: auto-pick an ElevenLabs voice from persona gender. The
   // useVoiceMode `speak()` will hit /api/roleplay/tts for this voice
   // and fall back to browser TTS if the server returns 503 (kill
@@ -236,7 +228,6 @@ export function RoleplayPlayer({
   const voice = useVoiceMode({
     enabled: voiceMode,
     voiceGender: personaGender,
-    voiceUri: manualVoiceUri,
     elevenLabsVoiceId,
     // 1000ms of silence → commit. Tuned down from 2000ms because the
     // longer window made every turn feel dead — trainees stopped
@@ -537,9 +528,12 @@ export function RoleplayPlayer({
         void runAutoFlowAfterPersona();
         return;
       }
-      // Open the mic in active mode — silence timer (2000ms) commits
-      // the user's reply when they stop talking. Skip when STT isn't
-      // supported (Firefox) — the user can still type.
+      // Open the mic in active mode — silence timer commits the user's
+      // reply when they stop talking. Phase 2 gives us STT support on
+      // every modern browser (ElevenLabs Scribe covers Firefox where
+      // window.SpeechRecognition doesn't exist); if the browser is
+      // truly missing both MediaRecorder AND SpeechRecognition, the
+      // user can still type in the composer.
       if (
         voiceMode &&
         !stoppingRef.current &&
@@ -1427,9 +1421,6 @@ export function RoleplayPlayer({
         streaming={streaming}
         sessionReady={!!sessionId}
         ending={ending}
-        availableVoices={voice.availableVoices}
-        selectedVoiceUri={voice.selectedVoiceUri}
-        onPickVoice={handlePickVoice}
         autoFlow={autoFlow}
         autoFlowAvailable={Boolean(hintsAllowed) && voice.ttsSupported}
         onToggleAutoFlow={handleToggleAutoFlow}
@@ -2533,9 +2524,6 @@ function CallControlsBar({
   streaming,
   sessionReady,
   ending,
-  availableVoices,
-  selectedVoiceUri,
-  onPickVoice,
   autoFlow,
   autoFlowAvailable,
   onToggleAutoFlow,
@@ -2551,9 +2539,6 @@ function CallControlsBar({
   streaming: boolean;
   sessionReady: boolean;
   ending: boolean;
-  availableVoices: VoiceOption[];
-  selectedVoiceUri: string | null;
-  onPickVoice: (uri: string | null) => void;
   autoFlow: boolean;
   autoFlowAvailable: boolean;
   onToggleAutoFlow: () => void;
@@ -2596,13 +2581,6 @@ function CallControlsBar({
         {tooltip}
       </span>
       <div className="flex items-center gap-3">
-        {voiceTtsSupported && availableVoices.length > 0 ? (
-          <VoicePicker
-            voices={availableVoices}
-            selectedUri={selectedVoiceUri}
-            onPick={onPickVoice}
-          />
-        ) : null}
         <button
           type="button"
           onClick={onToggleAutoFlow}
@@ -2666,140 +2644,6 @@ function CallControlsBar({
       </div>
     </div>
   );
-}
-
-// ─────────────── Voice picker ───────────────
-// Dropdown that lets the trainee override the auto-picked TTS voice.
-// Click the pill → menu opens with every voice the browser exposes
-// for the persona's language; pick one (or "Auto") and the choice
-// persists in sessionStorage for this module.
-
-function VoicePicker({
-  voices,
-  selectedUri,
-  onPick,
-}: {
-  voices: VoiceOption[];
-  selectedUri: string | null;
-  onPick: (uri: string | null) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    function onDoc(e: MouseEvent) {
-      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
-    }
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
-  }, [open]);
-
-  const current = voices.find((v) => v.uri === selectedUri);
-  const label = current ? shortVoiceName(current.name) : "Auto";
-
-  return (
-    <div ref={rootRef} className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        suppressHydrationWarning
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        aria-label="Pick voice"
-        className="inline-flex items-center gap-1.5 h-[36px] px-3 rounded-full text-[11.5px] font-semibold text-white shadow-md max-w-[180px]"
-        style={{ background: "#1a1a1a" }}
-        title={current ? `Voice: ${current.name}` : "Voice: Auto"}
-      >
-        <Icon name="settings" size={11} />
-        <span className="truncate">{label}</span>
-        <Icon name="chevron-down" size={10} />
-      </button>
-      {open ? (
-        <div
-          role="listbox"
-          className="absolute bottom-[44px] left-1/2 -translate-x-1/2 w-[280px] max-h-[280px] overflow-y-auto rounded-[10px] border border-border bg-surface shadow-md"
-        >
-          <VoiceOptionRow
-            label="Auto (match persona)"
-            sublabel="Pick the best voice for this persona"
-            active={selectedUri === null}
-            onClick={() => {
-              onPick(null);
-              setOpen(false);
-            }}
-          />
-          <div className="border-t border-border my-1" />
-          {voices.map((v) => (
-            <VoiceOptionRow
-              key={v.uri}
-              label={shortVoiceName(v.name)}
-              sublabel={`${v.lang}${v.gender !== "unknown" ? " · " + v.gender : ""}${v.localService ? " · local" : ""}`}
-              active={v.uri === selectedUri}
-              onClick={() => {
-                onPick(v.uri);
-                setOpen(false);
-              }}
-            />
-          ))}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function VoiceOptionRow({
-  label,
-  sublabel,
-  active,
-  onClick,
-}: {
-  label: string;
-  sublabel: string;
-  active: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      suppressHydrationWarning
-      role="option"
-      aria-selected={active}
-      className={cn(
-        "w-full text-left px-3 py-2 hover:bg-surface-2 transition-colors",
-        active ? "bg-surface-2" : "",
-      )}
-    >
-      <div className="flex items-center gap-2">
-        <span
-          className={cn(
-            "w-2 h-2 rounded-full shrink-0",
-            active ? "" : "opacity-0",
-          )}
-          style={{ background: "#5b2eea" }}
-          aria-hidden
-        />
-        <span className="text-[12.5px] font-semibold text-ink truncate">
-          {label}
-        </span>
-      </div>
-      <div className="text-[10.5px] text-ink-3 pl-4 mt-0.5">{sublabel}</div>
-    </button>
-  );
-}
-
-function shortVoiceName(name: string): string {
-  // Most browsers expose names like "Microsoft Zira - English (United States)"
-  // or "Google US English". Trim to the meaningful chunk so the picker pill
-  // doesn't overflow.
-  return name
-    .replace(/^Microsoft\s+/i, "")
-    .replace(/^Google\s+/i, "")
-    .replace(/\s+Desktop$/i, "")
-    .replace(/\s+Online\s*\(Natural\)$/i, " · Natural")
-    .replace(/\s+-\s+.*$/, "")
-    .trim();
 }
 
 // Split a paragraph into discrete sentences ending in .!?…  D-ID

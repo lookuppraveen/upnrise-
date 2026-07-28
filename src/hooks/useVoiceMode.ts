@@ -32,6 +32,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useElevenLabsTTS } from "./useElevenLabsTTS";
+import { useElevenLabsSTT } from "./useElevenLabsSTT";
 
 // Threshold of silence after the user has spoken before we commit
 // the transcript. Long enough to survive a "uhh… let me think" pause,
@@ -98,6 +99,12 @@ export function useVoiceMode(opts: {
    *  AND flip a session-scoped kill switch so we don't hammer the
    *  provider for the rest of the session. */
   elevenLabsVoiceId?: string | null;
+  /** Prefer ElevenLabs Scribe for speech-to-text. On Firefox this is
+   *  the ONLY way to get mic input (browser SpeechRecognition doesn't
+   *  exist). Defaults to true — the hook internally falls back to
+   *  browser SR when MediaRecorder/getUserMedia aren't available.
+   *  Pass `false` to force browser SR (e.g. for local debugging). */
+  elevenLabsSttEnabled?: boolean;
   onTranscript: (text: string) => void;
   /** Fired when interim speech is detected while listening in
    *  "background" mode (mic-open-during-TTS). The player typically
@@ -132,11 +139,26 @@ export function useVoiceMode(opts: {
     voiceGender = null,
     voiceUri = null,
     elevenLabsVoiceId = null,
+    elevenLabsSttEnabled = true,
     onTranscript,
     onInterruption,
     silenceThresholdMs = DEFAULT_SILENCE_MS,
   } = opts;
   const [state, setState] = useState<VoiceState>("idle");
+
+  // ElevenLabs STT — server-proxied Scribe. Preferred over browser
+  // SpeechRecognition because it (a) works on Firefox, (b) handles more
+  // languages, (c) has higher accuracy on noisy audio. Falls through to
+  // browser SR when the browser doesn't support MediaRecorder /
+  // getUserMedia, or when the caller opts out.
+  const elevenLabsStt = useElevenLabsSTT({
+    enabled: enabled && elevenLabsSttEnabled,
+    languageCode: normalizeLangForScribe(lang),
+    silenceThresholdMs,
+    onTranscript,
+    onInterruption,
+  });
+  const useElevenLabsSttPath = elevenLabsSttEnabled && elevenLabsStt.supported;
 
   // ElevenLabs TTS driver — always instantiated so the hook shape
   // stays stable. `speak()` below decides whether to call it based on
@@ -460,74 +482,85 @@ export function useVoiceMode(opts: {
 
   const startListening = useCallback(
     (opts?: { mode?: ListeningMode }) => {
-      if (!enabled || !sttSupported) return;
+      if (!enabled) return;
+
+      // ElevenLabs STT path — MediaRecorder + Scribe. Preferred because
+      // it's the only mic path that works on Firefox and gives us
+      // multilingual transcripts everywhere else.
+      if (useElevenLabsSttPath) {
+        // In active mode, cancel any dangling browser TTS so the mic
+        // doesn't record the persona's own voice. Background mode
+        // keeps TTS running for interruption detection.
+        if ((opts?.mode ?? "active") === "active") {
+          window.speechSynthesis?.cancel();
+        }
+        void elevenLabsStt.startListening({ mode: opts?.mode });
+        setState((s) => (s === "speaking" ? s : "listening"));
+        return;
+      }
+
+      // Fallback: browser SpeechRecognition (Chrome/Edge/Safari).
+      if (!sttSupported) return;
       const rec = recognitionRef.current;
       if (!rec) return;
       listeningModeRef.current = opts?.mode ?? "active";
-      // Reset state for a fresh utterance. Without this, a stale
-      // interim from the previous turn could leak into the commit.
       accumulatedFinalRef.current = "";
       interimRef.current = "";
       clearSilenceTimer();
       wantsListeningRef.current = true;
       try {
-        // In background mode the persona is still speaking — DON'T
-        // cancel synth here, that would silence the TTS we want to
-        // interrupt-detect against. In active mode, cancel any
-        // dangling TTS so the avatar doesn't hear itself.
         if (listeningModeRef.current === "active") {
           window.speechSynthesis?.cancel();
         }
         rec.start();
-        // Only set listening state if TTS isn't currently active.
-        // Otherwise the user sees "speaking" + listening simultaneously
-        // (background mode), which is visually correct as "speaking".
         setState((s) => (s === "speaking" ? s : "listening"));
       } catch (e) {
-        // Calling start() while already started throws. That's fine —
-        // we just updated the mode/refs above, which is what callers
-        // care about when "starting" a mode switch on a running rec.
         console.warn("[voice] start() failed:", e);
       }
     },
-    [enabled, sttSupported, clearSilenceTimer],
+    [enabled, useElevenLabsSttPath, elevenLabsStt, sttSupported, clearSilenceTimer],
   );
 
-  const setListeningMode = useCallback((mode: ListeningMode) => {
-    listeningModeRef.current = mode;
-    // Going active mid-session: kick the silence timer based on
-    // whatever content has already accumulated. If the user has been
-    // silent through the background phase, the timer fires after
-    // the threshold and commits whatever (likely empty) interim
-    // they made — same as the "no speech" pathway in onresult.
-    if (mode === "active") {
-      const combined = (
-        accumulatedFinalRef.current +
-        " " +
-        interimRef.current
-      ).trim();
-      if (combined.length > 0) {
-        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-        silenceTimerRef.current = setTimeout(() => {
-          commitPending();
-        }, silenceThresholdRef.current);
+  const setListeningMode = useCallback(
+    (mode: ListeningMode) => {
+      if (useElevenLabsSttPath) {
+        elevenLabsStt.setListeningMode(mode);
+        return;
       }
-    } else if (silenceTimerRef.current) {
-      // Going background — no auto-commit until interruption flips us
-      // back to active.
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
-  }, [commitPending]);
+      listeningModeRef.current = mode;
+      if (mode === "active") {
+        const combined = (
+          accumulatedFinalRef.current +
+          " " +
+          interimRef.current
+        ).trim();
+        if (combined.length > 0) {
+          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+          silenceTimerRef.current = setTimeout(() => {
+            commitPending();
+          }, silenceThresholdRef.current);
+        }
+      } else if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
+      }
+    },
+    [useElevenLabsSttPath, elevenLabsStt, commitPending],
+  );
 
   const stopListening = useCallback(() => {
+    if (useElevenLabsSttPath) {
+      elevenLabsStt.stopListening();
+      setState((s) => (s === "listening" ? "idle" : s));
+      return;
+    }
     wantsListeningRef.current = false;
     clearSilenceTimer();
     accumulatedFinalRef.current = "";
     interimRef.current = "";
     recognitionRef.current?.abort();
     setState((s) => (s === "listening" ? "idle" : s));
-  }, [clearSilenceTimer]);
+  }, [useElevenLabsSttPath, elevenLabsStt, clearSilenceTimer]);
 
   const cancelSpeech = useCallback(() => {
     if (typeof window !== "undefined" && window.speechSynthesis) {
@@ -539,10 +572,17 @@ export function useVoiceMode(opts: {
     setState((s) => (s === "speaking" ? "idle" : s));
   }, [elevenLabs]);
 
+  // sttSupported to the outside world means "the mic can accept input
+  // via *some* backend". ElevenLabs STT satisfies that on every
+  // browser with MediaRecorder + getUserMedia (Firefox included);
+  // browser SpeechRecognition satisfies it on Chrome/Edge/Safari.
+  const combinedSttSupported =
+    (useElevenLabsSttPath && elevenLabsStt.supported) || sttSupported;
+
   return {
     state,
     ttsSupported,
-    sttSupported,
+    sttSupported: combinedSttSupported,
     speak,
     startListening,
     setListeningMode,
@@ -551,6 +591,14 @@ export function useVoiceMode(opts: {
     selectedVoiceUri,
     availableVoices,
   };
+}
+
+// Scribe wants ISO 639-1 (like "en", "hi"). BCP-47 tags (like "en-US",
+// "hi-IN") work if we trim to the primary subtag.
+function normalizeLangForScribe(lang: string): string | undefined {
+  const trimmed = lang.trim();
+  if (!trimmed) return undefined;
+  return trimmed.split(/[-_]/)[0].toLowerCase();
 }
 
 // Trim the full voice list down to the requested lang family and
