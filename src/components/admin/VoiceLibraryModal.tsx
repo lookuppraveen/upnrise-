@@ -90,8 +90,14 @@ export function VoiceLibraryModal({
       if (!res.ok) {
         const body = (await res.json().catch(() => ({}))) as {
           error?: string;
+          status?: number;
         };
-        throw new Error(body.error ?? `search_${res.status}`);
+        // Surface the upstream HTTP status so "401 — key missing voices:read"
+        // is one glance away from the admin instead of buried in terminal
+        // logs. Falls back to the local response status when the route
+        // didn't include an upstream status.
+        const upstream = body.status ? ` (${body.status})` : "";
+        throw new Error(`${body.error ?? "search_error"}${upstream}`);
       }
       const data = (await res.json()) as { voices: LibraryVoice[] };
       setVoices(data.voices);

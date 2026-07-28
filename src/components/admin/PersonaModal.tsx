@@ -925,19 +925,32 @@ export function PersonaModal({
               }
             />
 
-            {/* Voices accordion */}
+            {/* Streaming avatar voice — clicking a card sets liveVoiceId
+                (a Microsoft Neural voice on D-ID / HeyGen). This is the
+                voice trainees hear when they pick Video mode and the
+                streaming avatar renders on screen. Trainee AUDIO mode
+                uses the ElevenLabs voice below instead, so this section
+                only matters for tenants shipping streaming avatars. */}
             <button
               type="button"
               onClick={() => setVoicesOpen((o) => !o)}
-              className="w-full flex items-center justify-between px-3 py-2.5 bg-surface border border-border-strong rounded-md text-[13px] font-semibold text-ink hover:bg-surface-2"
+              className="w-full flex items-center justify-between px-3 py-2.5 bg-surface border border-border-strong rounded-md text-left hover:bg-surface-2"
               aria-expanded={voicesOpen}
             >
-              <span>Voices</span>
+              <div>
+                <div className="text-[13px] font-semibold text-ink">
+                  Streaming avatar voice
+                </div>
+                <div className="text-[11.5px] text-ink-3 mt-0.5">
+                  Used when the trainee picks Video mode. Audio mode uses
+                  the Roleplay voice below.
+                </div>
+              </div>
               <Icon
                 name="chevron-down"
                 size={14}
                 className={cn(
-                  "text-ink-3 transition-transform",
+                  "text-ink-3 transition-transform shrink-0",
                   voicesOpen && "rotate-180",
                 )}
               />
@@ -984,9 +997,10 @@ export function PersonaModal({
           </div>
 
           {/* ── Roleplay voice (ElevenLabs) ─────────────────────────
-              Trainee-facing spoken audio. Independent from the "Voices"
-              accordion above (which maps to the D-ID streaming avatar).
-              null → the player auto-picks by avatarGender. */}
+              Trainee-facing spoken audio in Audio mode. Independent from
+              the "Streaming avatar voice" accordion above (which drives
+              the D-ID/HeyGen video render). null → the player auto-picks
+              from the ElevenLabs catalog by avatarGender. */}
           <div className="bg-surface border border-border rounded-[10px] p-4 space-y-3">
             <button
               type="button"
