@@ -22,6 +22,7 @@ import {
   type SavedPortrait,
 } from "@/components/admin/DidPortraitPickerModal";
 import { voicesByGender, type CatalogVoice } from "@/lib/voice/voice-catalog";
+import { VoiceLibraryModal } from "@/components/admin/VoiceLibraryModal";
 
 export type PersonaData = {
   title: string;
@@ -293,7 +294,15 @@ export function PersonaModal({
   const [elevenLabsVoiceId, setElevenLabsVoiceId] = useState<string | null>(
     initial.elevenLabsVoiceId ?? null,
   );
+  // Display-only name shown next to the voice id when the admin picks
+  // from the library. Not persisted (the id is what round-trips
+  // through save); reset on next open. Used to answer "which voice did
+  // I pick?" without a follow-up API call.
+  const [libraryVoiceName, setLibraryVoiceName] = useState<string | null>(
+    null,
+  );
   const [elevenVoicesOpen, setElevenVoicesOpen] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
   const [previewingVoiceId, setPreviewingVoiceId] = useState<string | null>(
     null,
   );
@@ -991,7 +1000,13 @@ export function PersonaModal({
                 </div>
                 <div className="text-[11.5px] text-ink-3 mt-0.5">
                   {elevenLabsVoiceId
-                    ? `Trainees hear ${voicesByGender("female").concat(voicesByGender("male")).find((v) => v.id === elevenLabsVoiceId)?.name ?? "custom voice"}`
+                    ? `Trainees hear ${
+                        voicesByGender("female")
+                          .concat(voicesByGender("male"))
+                          .find((v) => v.id === elevenLabsVoiceId)?.name ??
+                        libraryVoiceName ??
+                        "custom voice"
+                      }`
                     : `Auto — picks a ${gender === "male" ? "male" : "female"} voice for the persona`}
                 </div>
               </div>
@@ -1041,7 +1056,10 @@ export function PersonaModal({
                         >
                           <button
                             type="button"
-                            onClick={() => setElevenLabsVoiceId(v.id)}
+                            onClick={() => {
+                              setElevenLabsVoiceId(v.id);
+                              setLibraryVoiceName(null);
+                            }}
                             className="flex-1 min-w-0 text-left"
                           >
                             <div className="text-[13px] font-semibold text-ink">
@@ -1069,9 +1087,36 @@ export function PersonaModal({
                     },
                   )}
                 </div>
+
+                {/* Library search — the escape hatch out of the curated
+                    grid above. Opens a modal that hits ElevenLabs's full
+                    shared-voices catalog with Indian voices at the top. */}
+                <button
+                  type="button"
+                  onClick={() => setLibraryOpen(true)}
+                  className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-md border border-dashed border-border-strong bg-surface hover:bg-surface-2 text-[12.5px] font-semibold text-ink-2"
+                >
+                  <Icon name="ai-sparkle" size={11} />
+                  Browse voice library (Indian, Hindi, and more)
+                </button>
               </div>
             ) : null}
           </div>
+
+          {libraryOpen ? (
+            <VoiceLibraryModal
+              initialQuery={{
+                gender: gender === "neutral" ? "female" : gender,
+                accent: "indian",
+              }}
+              onPick={(voiceId, name) => {
+                setElevenLabsVoiceId(voiceId);
+                setLibraryVoiceName(name);
+                setLibraryOpen(false);
+              }}
+              onClose={() => setLibraryOpen(false)}
+            />
+          ) : null}
         </div>
 
         {/* Footer */}

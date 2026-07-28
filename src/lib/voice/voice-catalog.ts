@@ -80,3 +80,47 @@ export function findVoice(voiceId: string): CatalogVoice | null {
 export function voicesByGender(gender: CatalogGender): CatalogVoice[] {
   return CATALOG_VOICES.filter((v) => v.gender === gender);
 }
+
+/**
+ * Quick-filter presets for the "Browse voice library" search modal.
+ * Each preset maps 1:1 to a search query hitting ElevenLabs's shared
+ * library — admins click one to skip building the filter combo by hand.
+ *
+ * Order matters: Indian voices sit at the top because that's the primary
+ * trainee audience and the reason we shipped library search in the
+ * first place. Everything else is available via free-text search.
+ */
+export type VoiceLibraryPreset = {
+  key: string;
+  label: string;
+  /** Passed to `/api/admin/voices/search` as query params. */
+  query: {
+    language?: string;
+    accent?: string;
+    gender?: "male" | "female" | "neutral";
+  };
+};
+
+export const VOICE_LIBRARY_PRESETS: VoiceLibraryPreset[] = [
+  {
+    key: "indian-female",
+    label: "Indian · Female",
+    query: { accent: "indian", gender: "female" },
+  },
+  {
+    key: "indian-male",
+    label: "Indian · Male",
+    query: { accent: "indian", gender: "male" },
+  },
+  { key: "hindi", label: "Hindi", query: { language: "hi" } },
+  {
+    key: "english-female",
+    label: "English · Female",
+    query: { language: "en", gender: "female" },
+  },
+  {
+    key: "english-male",
+    label: "English · Male",
+    query: { language: "en", gender: "male" },
+  },
+];
