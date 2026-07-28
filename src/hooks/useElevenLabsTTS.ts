@@ -1,14 +1,17 @@
 // Client-side hook that speaks a persona line via ElevenLabs.
 //
-// Phase 1 strategy — download-then-play (blob URL + HTMLAudioElement):
-//   • Simplest cross-browser path that works everywhere the roleplay
-//     player is likely to run (Chrome, Edge, Firefox, Safari desktop,
-//     iOS Safari, Chrome Android).
-//   • First-byte latency is higher than a true streaming pipe (~600ms
-//     for a short sentence vs ~250ms), but the failure surface is
-//     tiny — no MediaSource quirks, no codec bikeshedding.
-//   • Phase 5 can upgrade to MediaSource / Web Audio for lower latency
-//     without touching the caller's interface.
+// Phase 5 upgrade — MediaSource streaming with blob fallback:
+//   • Preferred path: pipe ElevenLabs's chunked mp3 straight into a
+//     MediaSource + SourceBuffer so the audio element starts playing
+//     as soon as the first buffered chunk lands. First-word latency
+//     drops from ~600ms (blob) to ~250ms (streamed).
+//   • Fallback path: browsers without usable MediaSource — mainly
+//     older iOS Safari — download the full response as a blob and
+//     play that. Same UX as Phase 1, no worse.
+//   • Detection is upfront (MediaSource.isTypeSupported for audio/mpeg)
+//     so we don't consume the response body on a failed streaming
+//     attempt. If MSE fails mid-stream, the caller falls back to
+//     browser TTS for that utterance via the useVoiceMode kill switch.
 //
 // Failure model:
 //   • The hook resolves normally on success and rejects on any error.
@@ -20,6 +23,18 @@
 //     missing key on prod) — permanent fallback for the session.
 //   • 502 or a network error means "transient upstream problem" —
 //     also fall back for the session; ops sees a log entry.
+
+const STREAMING_MIME = "audio/mpeg";
+
+function canStreamAudioMp3(): boolean {
+  if (typeof window === "undefined") return false;
+  if (typeof MediaSource === "undefined") return false;
+  try {
+    return MediaSource.isTypeSupported(STREAMING_MIME);
+  } catch {
+    return false;
+  }
+}
 
 "use client";
 
@@ -115,7 +130,6 @@ export function useElevenLabsTTS(): UseElevenLabsTTSResult {
       const controller = new AbortController();
       abortRef.current = controller;
 
-      let objectUrl: string | null = null;
       try {
         const res = await fetch("/api/roleplay/tts", {
           method: "POST",
@@ -133,47 +147,23 @@ export function useElevenLabsTTS(): UseElevenLabsTTSResult {
           const status = res.status;
           throw new Error(`tts_${status}`);
         }
-        const blob = await res.blob();
-        objectUrl = URL.createObjectURL(blob);
-        objectUrlRef.current = objectUrl;
-        audio.src = objectUrl;
 
-        await new Promise<void>((resolve, reject) => {
-          const cleanup = () => {
-            audio.removeEventListener("ended", onEnd);
-            audio.removeEventListener("error", onErr);
-            audio.removeEventListener("pause", onPause);
-          };
-          const onEnd = () => {
-            cleanup();
-            setPlaying(false);
-            resolve();
-          };
-          const onErr = () => {
-            cleanup();
-            setPlaying(false);
-            reject(new Error("audio_playback_error"));
-          };
-          const onPause = () => {
-            // A pause we didn't drive (e.g. user hit a system control)
-            // shouldn't hang the promise. Treat it as a natural end
-            // if we're at/near the end, otherwise a soft cancel.
-            if (audio.ended || audio.currentTime === 0) {
-              cleanup();
-              setPlaying(false);
-              resolve();
-            }
-          };
-          audio.addEventListener("ended", onEnd);
-          audio.addEventListener("error", onErr);
-          audio.addEventListener("pause", onPause);
+        // MediaSource path when the browser can decode chunked mp3 —
+        // first word plays ~2-3× sooner than the blob approach.
+        if (canStreamAudioMp3() && res.body) {
+          await playViaMediaSource(
+            audio,
+            res.body,
+            controller.signal,
+            setPlaying,
+          );
+          return;
+        }
 
-          setPlaying(true);
-          audio.play().catch((err) => {
-            cleanup();
-            setPlaying(false);
-            reject(err instanceof Error ? err : new Error("audio_play_failed"));
-          });
+        // Fallback: buffer the whole response, play as a blob. iOS
+        // Safari <17.1 lands here; so does anything without MSE.
+        await playViaBlob(audio, res, controller.signal, setPlaying, (url) => {
+          objectUrlRef.current = url;
         });
       } catch (err) {
         // AbortError is expected on cancel — swallow it, everything else
@@ -181,10 +171,6 @@ export function useElevenLabsTTS(): UseElevenLabsTTSResult {
         if (err instanceof Error && err.name === "AbortError") return;
         throw err;
       } finally {
-        if (objectUrl && objectUrl === objectUrlRef.current) {
-          URL.revokeObjectURL(objectUrl);
-          objectUrlRef.current = null;
-        }
         if (abortRef.current === controller) {
           abortRef.current = null;
         }
@@ -194,4 +180,179 @@ export function useElevenLabsTTS(): UseElevenLabsTTSResult {
   );
 
   return { speak, cancel, playing };
+}
+
+// ───────────────────────────────────────────────────────────────
+// Playback paths
+// ───────────────────────────────────────────────────────────────
+
+/**
+ * Streaming path: MediaSource + SourceBuffer. Audio starts playing as
+ * soon as the first chunk is decoded — usually 200–350ms after the
+ * fetch resolves. On any error mid-stream the promise rejects; the
+ * caller (useVoiceMode) falls back to browser TTS for the utterance.
+ */
+async function playViaMediaSource(
+  audio: HTMLAudioElement,
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+  setPlaying: (v: boolean) => void,
+): Promise<void> {
+  const mediaSource = new MediaSource();
+  const objectUrl = URL.createObjectURL(mediaSource);
+  audio.src = objectUrl;
+
+  try {
+    await waitForSourceOpen(mediaSource);
+    const sourceBuffer = mediaSource.addSourceBuffer(STREAMING_MIME);
+
+    // Kick playback the moment the first bytes land — Safari won't
+    // auto-start otherwise, and Chrome benefits from the head start.
+    setPlaying(true);
+    const playPromise = audio.play().catch((err) => {
+      throw err instanceof Error ? err : new Error("audio_play_failed");
+    });
+
+    const reader = body.getReader();
+    while (true) {
+      if (signal.aborted) throw new DOMException("aborted", "AbortError");
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.byteLength > 0) {
+        await appendChunk(sourceBuffer, value);
+      }
+    }
+
+    // Signal end-of-stream so `ended` fires after the buffered tail
+    // plays out. Wait for the play() promise so a very fast, short
+    // response doesn't race the state transition.
+    await playPromise;
+    if (mediaSource.readyState === "open") {
+      try {
+        mediaSource.endOfStream();
+      } catch {
+        /* readyState raced closed — nothing to do */
+      }
+    }
+
+    await waitForEnded(audio, signal);
+  } finally {
+    setPlaying(false);
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+function waitForSourceOpen(ms: MediaSource): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onOpen = () => {
+      cleanup();
+      resolve();
+    };
+    const onErr = () => {
+      cleanup();
+      reject(new Error("mediasource_error"));
+    };
+    const cleanup = () => {
+      ms.removeEventListener("sourceopen", onOpen);
+      ms.removeEventListener("error", onErr);
+    };
+    ms.addEventListener("sourceopen", onOpen);
+    ms.addEventListener("error", onErr);
+  });
+}
+
+function appendChunk(
+  sb: SourceBuffer,
+  chunk: Uint8Array,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onEnd = () => {
+      cleanup();
+      resolve();
+    };
+    const onErr = () => {
+      cleanup();
+      reject(new Error("sourcebuffer_append_error"));
+    };
+    const cleanup = () => {
+      sb.removeEventListener("updateend", onEnd);
+      sb.removeEventListener("error", onErr);
+    };
+    sb.addEventListener("updateend", onEnd);
+    sb.addEventListener("error", onErr);
+    try {
+      // Some browsers want a plain ArrayBuffer, not a typed-array view
+      // that might reference a shared buffer offset. .slice() copies.
+      sb.appendBuffer(chunk.slice().buffer);
+    } catch (err) {
+      cleanup();
+      reject(err instanceof Error ? err : new Error("append_threw"));
+    }
+  });
+}
+
+function waitForEnded(
+  audio: HTMLAudioElement,
+  signal: AbortSignal,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onEnd = () => {
+      cleanup();
+      resolve();
+    };
+    const onErr = () => {
+      cleanup();
+      reject(new Error("audio_playback_error"));
+    };
+    const onPause = () => {
+      // Native pause we didn't drive → treat near-end as clean, else soft-cancel.
+      if (audio.ended || audio.currentTime === 0) {
+        cleanup();
+        resolve();
+      }
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(new DOMException("aborted", "AbortError"));
+    };
+    const cleanup = () => {
+      audio.removeEventListener("ended", onEnd);
+      audio.removeEventListener("error", onErr);
+      audio.removeEventListener("pause", onPause);
+      signal.removeEventListener("abort", onAbort);
+    };
+    audio.addEventListener("ended", onEnd);
+    audio.addEventListener("error", onErr);
+    audio.addEventListener("pause", onPause);
+    signal.addEventListener("abort", onAbort);
+  });
+}
+
+/**
+ * Fallback path: download the full response as a blob and play. Used
+ * on browsers without a usable MediaSource for audio/mpeg (mainly
+ * older iOS Safari). Identical UX to the Phase 1 implementation.
+ */
+async function playViaBlob(
+  audio: HTMLAudioElement,
+  res: Response,
+  signal: AbortSignal,
+  setPlaying: (v: boolean) => void,
+  registerObjectUrl: (url: string) => void,
+): Promise<void> {
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  registerObjectUrl(objectUrl);
+  audio.src = objectUrl;
+
+  try {
+    setPlaying(true);
+    audio.play().catch((err) => {
+      throw err instanceof Error ? err : new Error("audio_play_failed");
+    });
+    await waitForEnded(audio, signal);
+  } finally {
+    setPlaying(false);
+    URL.revokeObjectURL(objectUrl);
+  }
 }

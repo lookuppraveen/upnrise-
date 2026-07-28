@@ -28,11 +28,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 type ListeningMode = "active" | "background";
 
-// Volume threshold on a 0-255 byte scale (from AnalyserNode). 20 is a
-// reasonable middle for the median mic in a quiet room. Trainees on
-// noisy backgrounds (open office, café) may false-trigger — Phase 5
-// can add adaptive noise-floor calibration.
-const VOLUME_THRESHOLD = 20;
+// Adaptive VAD tuning (Phase 5).
+//
+// Threshold is calibrated per-mic-open to the trainee's actual noise
+// floor: sample volume for the first CALIBRATION_MS, take the mean,
+// multiply by NOISE_MULTIPLIER, floor at MIN_THRESHOLD. Handles the
+// full range from a quiet home office (baseline ~5) to a café or open
+// floor (baseline ~30) without needing per-user config.
+const MIN_THRESHOLD = 15;
+const FALLBACK_THRESHOLD = 20; // used before calibration completes
+const NOISE_MULTIPLIER = 3.0;
+const CALIBRATION_MS = 500;
 // Minimum time above threshold before we consider it "real speech"
 // (not a cough / mic bump). Avoids sending 100ms of noise to Scribe.
 const MIN_SPEECH_MS = 250;
@@ -134,6 +140,12 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
   const speechStartedAtRef = useRef<number | null>(null);
   const lastSoundAtRef = useRef<number | null>(null);
   const hasSpokeRef = useRef(false);
+  // Adaptive VAD state — reset on every startListening. We collect
+  // volume samples during the calibration window, then lock in a
+  // threshold based on the observed noise floor.
+  const calibrationStartRef = useRef<number | null>(null);
+  const calibrationSamplesRef = useRef<number[]>([]);
+  const adaptiveThresholdRef = useRef(FALLBACK_THRESHOLD);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -274,11 +286,47 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
     speechStartedAtRef.current = null;
     lastSoundAtRef.current = null;
     hasSpokeRef.current = false;
+    // Reset adaptive calibration for this listening session. The
+    // threshold falls back to FALLBACK_THRESHOLD until CALIBRATION_MS
+    // of samples land, then locks in based on the observed noise floor.
+    calibrationStartRef.current = Date.now();
+    calibrationSamplesRef.current = [];
+    adaptiveThresholdRef.current = FALLBACK_THRESHOLD;
 
     vadTimerRef.current = setInterval(() => {
       const vol = readVolume();
       const now = Date.now();
-      const isSound = vol > VOLUME_THRESHOLD;
+
+      // Calibration: for the first CALIBRATION_MS of listening we
+      // collect samples silently — the trainee shouldn't be speaking
+      // yet (the mic just opened) so this measures room noise. Once
+      // the window closes we compute the threshold and stop
+      // sampling. In background mode we can't calibrate reliably
+      // (persona TTS is bleeding into the mic on non-headphone setups)
+      // so we skip calibration and use the fallback threshold.
+      if (
+        modeRef.current === "active" &&
+        calibrationStartRef.current != null
+      ) {
+        if (now - calibrationStartRef.current < CALIBRATION_MS) {
+          calibrationSamplesRef.current.push(vol);
+        } else {
+          const samples = calibrationSamplesRef.current;
+          if (samples.length > 0) {
+            const mean =
+              samples.reduce((a, b) => a + b, 0) / samples.length;
+            adaptiveThresholdRef.current = Math.max(
+              MIN_THRESHOLD,
+              Math.round(mean * NOISE_MULTIPLIER),
+            );
+          }
+          calibrationStartRef.current = null;
+          calibrationSamplesRef.current = [];
+        }
+      }
+
+      const threshold = adaptiveThresholdRef.current;
+      const isSound = vol > threshold;
 
       if (modeRef.current === "background") {
         // Interruption detection during persona TTS: any sustained
@@ -291,6 +339,11 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
             onInterruptionRef.current?.();
             hasSpokeRef.current = true;
             lastSoundAtRef.current = now;
+            // Kick calibration for the newly-active mode so the silence
+            // check uses a locked-in threshold instead of the wobbly
+            // interim reading during barge-in.
+            calibrationStartRef.current = now;
+            calibrationSamplesRef.current = [];
           }
         } else {
           speechStartedAtRef.current = null;

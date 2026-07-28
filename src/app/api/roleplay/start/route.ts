@@ -139,6 +139,13 @@ export async function POST(req: Request) {
     // Ask Claude for the persona's opening line. Empty messages array
     // means "you go first" — we instruct it via a primer user message.
     // Cache the system block; the very next /turn call will hit it.
+    //
+    // The opening sets the tone for the entire roleplay. Generic "Hi,
+    // how can I help you?" openings waste the trainee's first turn on
+    // a boilerplate exchange. We steer toward openings that:
+    //   • Anchor to the scenario (why we're talking today)
+    //   • Give the trainee something concrete to engage with
+    //   • Sound like a real person, not a receptionist script
     const completion = await anthropic.messages.create({
       model: ROLEPLAY_MODEL,
       max_tokens: 180,
@@ -153,7 +160,7 @@ export async function POST(req: Request) {
         {
           role: "user",
           content:
-            "[The learner has just connected and is waiting for you to speak. Start the conversation in character with a single short greeting or opening line, 1–2 sentences.]",
+            "[The learner has just connected and is waiting for you to speak. Open the conversation in character with a single line, 1–2 sentences (25 words max total). Ground the opening in THIS specific scenario — reference what brought you here, what you're looking for, or a specific concern you have — so the learner has something concrete to respond to. Avoid empty pleasantries like 'How can I help you?' or 'Nice to meet you'; get to the point quickly. Speak like a real person, not a script.]",
         },
       ],
     });

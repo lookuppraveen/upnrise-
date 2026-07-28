@@ -253,14 +253,20 @@ export function RoleplayPlayer({
       setInput(text);
       void sendText(text);
     },
-    // Note: interruption-while-AI-speaks is disabled in this build.
-    // Browser-side echo cancellation isn't reliable enough to keep
-    // the mic open during persona TTS — speaker bleed produces false
-    // interim text that cuts the AI off mid-sentence. The mic only
-    // opens AFTER persona TTS completes. When useStreamingAvatar
-    // grows a stop() method we can re-enable interruption behind a
-    // manual "tap to interrupt" button.
+    // Barge-in (Phase 5): the STT hook fires this when it detects
+    // sustained speech while the mic is open in "background" mode
+    // during persona TTS. We route through a ref (`bargeInRef`)
+    // populated below so this callback doesn't reference `voice` /
+    // `avatarRef` before they're bound. Behavior locked in there.
+    onInterruption: () => {
+      bargeInRef.current();
+    },
   });
+  // Populated after `voice` + `avatarRef` exist so the callback above
+  // can reach the latest cancel handlers. Initialized to a no-op so a
+  // very-early interruption event (unlikely — VAD needs 250ms of
+  // sustained speech first) can't crash.
+  const bargeInRef = useRef<() => void>(() => {});
 
   // Auto-flow ("demo conversation") — when on, the player runs the
   // entire roleplay hands-off: persona speaks → a short beat → hint
@@ -297,6 +303,24 @@ export function RoleplayPlayer({
   // Refs so the bubble-effect can read live values without re-running.
   const avatarRef = useRef(avatar);
   avatarRef.current = avatar;
+  // Assemble the barge-in handler on every render so cancelSpeech +
+  // avatar.stop pick up the latest instances. Fires the moment the STT
+  // VAD sees sustained speech during persona TTS (see onInterruption
+  // above).
+  bargeInRef.current = () => {
+    voice.cancelSpeech();
+    const av = avatarRef.current;
+    // Streaming avatar (D-ID / HeyGen) has its own TTS; stop it too so
+    // the avatar doesn't keep talking after we've handed the floor
+    // over to the trainee. Some drivers don't expose stop(); ignore.
+    if (av && "stop" in av && typeof (av as { stop?: unknown }).stop === "function") {
+      try {
+        (av as { stop: () => void }).stop();
+      } catch {
+        /* ignore */
+      }
+    }
+  };
   // Track which bubbles we've already spoken so a re-render doesn't
   // make the avatar repeat itself.
   const spokenIdxRef = useRef<Set<number>>(new Set());
@@ -487,11 +511,12 @@ export function RoleplayPlayer({
   // then either (a) hand the mic to the trainee or (b) trigger the
   // auto-flow step that speaks the suggested reply and submits it.
   //
-  // Cadence is shaped to feel like two people talking: persona finishes
-  // its line → ~700ms beat → mic opens. Shorter feels rushed, longer
-  // feels awkward. The mic stays CLOSED during persona TTS — opening
-  // it for interruption-detection produced false interim text from
-  // speaker bleed that cut the AI off mid-sentence.
+  // Phase 5 cadence: open the mic in "background" mode BEFORE persona
+  // TTS starts so the STT hook can detect barge-in (sustained speech
+  // from the trainee = "I want to interrupt"). Adaptive VAD in the
+  // STT hook keeps false triggers rare even on speakers. When the
+  // persona finishes cleanly, we just flip the mic to "active" mode —
+  // no new getUserMedia prompt, no perceptible seam.
   useEffect(() => {
     if (!voiceMode || streaming || stoppingRef.current) return;
     const lastIdx = bubbles.length - 1;
@@ -502,6 +527,17 @@ export function RoleplayPlayer({
     if (spokenIdxRef.current.has(lastIdx)) return;
     spokenIdxRef.current.add(lastIdx);
     (async () => {
+      // Open the mic in background mode before the persona speaks.
+      // Skipped for auto-flow (the trainee isn't in the loop) and for
+      // browsers without STT (nothing to detect anyway).
+      const bargeInAllowed =
+        !autoFlowRef.current &&
+        voice.sttSupported &&
+        !stoppingRef.current;
+      if (bargeInAllowed) {
+        voice.startListening({ mode: "background" });
+      }
+
       // If the streaming avatar is connected, push text to HeyGen so
       // the avatar speaks it (and we don't double-up with browser TTS).
       // Otherwise fall back to the browser SpeechSynthesis.
@@ -537,19 +573,22 @@ export function RoleplayPlayer({
         void runAutoFlowAfterPersona();
         return;
       }
-      // Open the mic in active mode — silence timer commits the user's
-      // reply when they stop talking. Phase 2 gives us STT support on
-      // every modern browser (ElevenLabs Scribe covers Firefox where
-      // window.SpeechRecognition doesn't exist); if the browser is
-      // truly missing both MediaRecorder AND SpeechRecognition, the
-      // user can still type in the composer.
+      // Flip the mic to active mode. If the trainee already interrupted
+      // during TTS, the STT hook self-flipped to active from within
+      // its VAD tick — this call is idempotent in that case. If no
+      // barge-in fired, we just switch the same open mic from listen-
+      // for-interruption to listen-for-commit-on-silence.
       if (
         voiceMode &&
         !stoppingRef.current &&
         voice.sttSupported &&
         !streaming
       ) {
-        voice.startListening({ mode: "active" });
+        if (bargeInAllowed) {
+          voice.setListeningMode("active");
+        } else {
+          voice.startListening({ mode: "active" });
+        }
       }
     })();
     // runAutoFlowAfterPersona is read via ref-stable closures (autoFlowRef,

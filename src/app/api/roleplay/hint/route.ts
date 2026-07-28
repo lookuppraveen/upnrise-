@@ -32,7 +32,11 @@ const Body = z.object({
 });
 
 const Out = z.object({
-  hint: z.string().min(5).max(800),
+  // Cap at 350 chars — trainees hit the Hint button mid-conversation and
+  // need a line they can deliver in one breath. Longer responses turn
+  // the "teleprompter" into an essay. Below-min catches accidental empty
+  // model responses; above-max hard-rejects verbose drift.
+  hint: z.string().min(5).max(350),
 });
 
 export async function POST(req: Request) {
@@ -74,22 +78,23 @@ export async function POST(req: Request) {
 
   const formatRule =
     parsed.data.type === "bullet"
-      ? "Format: 2-4 short verbatim lines the learner can say. Each line starts with '• ' (bullet character). Each bullet is a complete, ready-to-speak sentence in first person — NOT coaching advice. No markdown asterisks. No preamble. No closing summary."
-      : "Format: one ready-to-speak reply, 2-4 sentences, written in first person as if the learner is speaking it aloud. Plain text only. No headings. No bullets. No quotation marks around the whole reply. No coaching commentary — just the words to say.";
+      ? "Format: 2-3 SHORT verbatim lines, one per bullet. Each line starts with '• '. Each line is 8-14 words — a single crisp sentence the learner delivers in one breath. First person only. No markdown asterisks, no preamble, no closing summary."
+      : "Format: ONE line, 1-2 short sentences, 25 words max. Written in first person as the exact words the learner says. Plain text only, no headings, no bullets, no quotation marks around the whole reply, no coaching commentary. Short and punchy beats long and thorough — the learner has to say this aloud in the next second.";
 
   const system = [
-    "You are a teleprompter for a sales learner who is mid-roleplay. They just hit the Hint button and need the EXACT words to say back to the customer.",
+    "You are a teleprompter for a sales learner mid-roleplay. They hit the Hint button and need the EXACT words to say back to the customer RIGHT NOW.",
     "",
-    "Return ONLY the line the learner should speak next. Write it in first person, as if they are reading it aloud to the customer right now.",
+    "Return ONLY the line the learner should speak next. First person. Short.",
     "",
     "Rules:",
-    "- Output is the SCRIPT, not coaching. No 'You should…', no 'Try to…', no 'Acknowledge their concern' — write the actual sentence the learner says.",
-    "- Tie the response to the customer's most recent line. Address their specific question, objection, or moment directly.",
-    "- Match the persona's register: professional, concise, conversational. No marketing fluff.",
-    "- Stay in character as a sales rep talking to this specific customer in this specific scenario.",
-    "- Never include stage directions, brackets, or notes (e.g. no '[pause]', '[smile]', '(then ask…)').",
+    "- SHORT beats thorough. The learner has to say this in the next second — one crisp line is worth ten well-organized paragraphs.",
+    "- Output is the SCRIPT, not coaching. No 'You should…', no 'Try to…', no 'Acknowledge their concern' — write the actual sentence.",
+    "- Tie the response to the customer's most recent line. Address the specific question, objection, or moment directly.",
+    "- Conversational, natural register. No marketing fluff, no jargon dumps, no over-qualifying.",
+    "- Stay in character as a sales rep in this specific scenario.",
+    "- Never include stage directions, brackets, or notes (no '[pause]', '[smile]', '(then ask…)').",
     "- Never name the speaker or prefix with 'Salesperson:' / 'Me:' — just the words.",
-    "- If the transcript shows no turns yet (learner opens), produce a strong opening line that fits the scenario.",
+    "- If the transcript shows no turns yet (learner opens), produce a strong opening line that fits the scenario — same short-and-punchy rule applies.",
     "",
     formatRule,
   ].join("\n");
@@ -109,7 +114,10 @@ export async function POST(req: Request) {
     const ai = await getAIConfig();
     const resp = await anthropic.messages.create({
       model: ai.fastModel,
-      max_tokens: 400,
+      // Hard cap on generation length — 200 tokens ≈ 150 words at most.
+      // Combined with the "25 words max" prompt rule and the 350-char
+      // schema cap, this triangulates on short, deliverable hints.
+      max_tokens: 200,
       system,
       messages: [{ role: "user", content: userMsg }],
     });
