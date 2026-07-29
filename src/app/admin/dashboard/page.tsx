@@ -38,44 +38,14 @@ export default async function AdminDashboard() {
     );
   }
 
-  const [stats, trainings, employees, leaderboard] = await Promise.all([
-    getAdminDashboardStats(user.companyId),
-    listTrainingsForAdmin(user.companyId),
-    listEmployeesForCompany(user.companyId),
-    getLeaderboardForCompany(user.companyId),
-  ]);
-
-  const recentTrainings = trainings.slice(0, 3);
-  // "Needs attention" = trainees who have a notably low avg score.
-  const needsAttention = employees
-    .filter(
-      (e) => e.role === "trainee" && e.avgScore != null && e.avgScore < 60,
-    )
-    .slice(0, 4);
-
-  const topPerformer = leaderboard[0];
-  const briefSignal: AdminWeeklySignal = {
-    learners: stats.learners,
-    activeTrainings: stats.activeTrainings,
-    sessions: stats.sessions,
-    avgScore: stats.avgScore,
-    completionPct: stats.completionPct,
-    topPerformerName:
-      topPerformer && topPerformer.avgScore != null
-        ? topPerformer.name ?? topPerformer.email.split("@")[0]
-        : null,
-    topPerformerScore: topPerformer?.avgScore ?? null,
-    strugglingCount: needsAttention.length,
-  };
-  // NOTE: generateAdminWeeklyBrief hits Claude (~1–3s cold). It was
-  // previously awaited here, blocking the entire dashboard render. It's
-  // now deferred to a <Suspense> below so the KPIs + tables paint
-  // immediately and the AI paragraph streams in when it's ready.
   const companyId = user.companyId;
 
+  // Every data-driven block is its own <Suspense> so the header paints
+  // in ~50ms and each section streams in as its Postgres queries resolve.
+  // Previously we blocked on a 4-way Promise.all that had to complete
+  // BEFORE the browser saw any HTML.
   return (
     <div className="px-7 pt-6 pb-20 max-w-[1480px] space-y-[22px]">
-      {/* Page head — apage-head from admin.css */}
       <header className="flex items-end justify-between gap-6 flex-wrap">
         <div>
           <h1 className="font-display text-[30px] leading-none -tracking-[0.015em]">
@@ -94,147 +64,255 @@ export default async function AdminDashboard() {
         </Link>
       </header>
 
-      <AiWeeklyBrief
-        learners={stats.learners}
-        activeTrainings={stats.activeTrainings}
-        avgScore={stats.avgScore}
-        sessions={stats.sessions}
-        completionPct={stats.completionPct}
-        attentionCount={needsAttention.length}
-        aiBrief={
-          <Suspense fallback={<BriefSkeleton />}>
-            <AiBriefParagraph companyId={companyId} signal={briefSignal} />
-          </Suspense>
-        }
-      />
+      <Suspense fallback={<WeeklyBriefSkeleton />}>
+        <WeeklyBriefSection companyId={companyId} />
+      </Suspense>
 
-      {/* KPI row — .akpi pattern */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-[14px]">
-        <Kpi
-          label="Learners"
-          value={String(stats.learners)}
-          icon="users"
-          tone="accent"
-        />
-        <Kpi
-          label="Active trainings"
-          value={String(stats.activeTrainings)}
-          icon="training"
-          tone="good"
-        />
-        <Kpi
-          label="Avg score"
-          value={stats.avgScore != null ? String(stats.avgScore) : "—"}
-          icon="chart"
-          tone="violet"
-          delta={
-            stats.avgScore != null
-              ? {
-                  dir: stats.avgScore >= 70 ? "up" : "down",
-                  text: stats.avgScore >= 70 ? "on target" : "below 70",
-                }
-              : null
-          }
-        />
-        <Kpi
-          label="Completion"
-          value={
-            stats.completionPct != null ? `${stats.completionPct}%` : "—"
-          }
-          icon="clipboard"
-          tone="warn"
-          delta={
-            stats.assignmentsTotal > 0
-              ? {
-                  dir: "up",
-                  text: `${stats.assignmentsCompleted}/${stats.assignmentsTotal}`,
-                }
-              : null
-          }
-        />
-      </div>
+      <Suspense fallback={<KpiRowSkeleton />}>
+        <KpiRow companyId={companyId} />
+      </Suspense>
 
-      {/* Two-column: recent trainings + needs attention */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-[14px]">
-        <Card pad="md" className="lg:col-span-2 space-y-3 rounded-[12px]">
-          <div className="flex items-center justify-between">
-            <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-ink-3">
-              Recent trainings
-            </div>
-            <Link
-              href="/admin/trainings"
-              className="text-[12px] text-ink-2 hover:text-ink"
-            >
-              See all →
-            </Link>
-          </div>
-          {recentTrainings.length === 0 ? (
-            <p className="text-[12.5px] text-ink-3">
-              No trainings yet. Spin up your first one from{" "}
-              <Link
-                href="/admin/trainings"
-                className="text-accent underline"
-              >
-                Trainings
-              </Link>
-              .
-            </p>
-          ) : (
-            <div className="space-y-2">
-              {recentTrainings.map((t) => (
-                <Link
-                  key={t.id}
-                  href={`/admin/trainings/${t.id}/edit`}
-                  className="flex items-center gap-3 p-2 rounded-md hover:bg-surface-2"
-                >
-                  <div className="flex-1 min-w-0">
-                    <div className="font-semibold text-[13px] truncate flex items-center gap-2">
-                      {t.title}
-                      <StatusPill status={t.status} />
-                    </div>
-                    <div className="text-[11.5px] text-ink-3 font-mono">
-                      {t._count.modules} modules · {t.learnerCount} learners
-                      {t.completionPct != null
-                        ? ` · ${t.completionPct}% complete`
-                        : ""}
-                    </div>
-                  </div>
-                  <Icon name="chevron-right" size={14} className="text-ink-3" />
-                </Link>
-              ))}
-            </div>
-          )}
-        </Card>
-
-        <Card pad="md" className="space-y-3 rounded-[12px]">
-          <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-ink-3">
-            Needs attention
-          </div>
-          {needsAttention.length === 0 ? (
-            <p className="text-[12.5px] text-ink-3">
-              No struggling learners right now.
-            </p>
-          ) : (
-            <ul className="space-y-2">
-              {needsAttention.map((e) => (
-                <li
-                  key={e.id}
-                  className="flex items-center gap-2 text-[12.5px]"
-                >
-                  <span className="w-1.5 h-1.5 rounded-full bg-bad shrink-0" />
-                  <span className="flex-1 truncate text-ink">
-                    {e.name ?? e.email}
-                  </span>
-                  <span className="font-mono text-[11px] text-bad">
-                    {e.avgScore}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </Card>
+        <div className="lg:col-span-2">
+          <Suspense fallback={<TrainingsSkeleton />}>
+            <RecentTrainingsSection companyId={companyId} />
+          </Suspense>
+        </div>
+        <div>
+          <Suspense fallback={<AttentionSkeleton />}>
+            <NeedsAttentionSection companyId={companyId} />
+          </Suspense>
+        </div>
       </div>
     </div>
+  );
+}
+
+async function WeeklyBriefSection({ companyId }: { companyId: string }) {
+  // Fetches its own inputs; the request-scoped memo dedupes so
+  // KpiRow / NeedsAttention don't re-issue these queries.
+  const [stats, employees, leaderboard] = await Promise.all([
+    getAdminDashboardStats(companyId),
+    listEmployeesForCompany(companyId),
+    getLeaderboardForCompany(companyId),
+  ]);
+  const attentionCount = employees.filter(
+    (e) => e.role === "trainee" && e.avgScore != null && e.avgScore < 60,
+  ).length;
+  const topPerformer = leaderboard[0];
+  const briefSignal: AdminWeeklySignal = {
+    learners: stats.learners,
+    activeTrainings: stats.activeTrainings,
+    sessions: stats.sessions,
+    avgScore: stats.avgScore,
+    completionPct: stats.completionPct,
+    topPerformerName:
+      topPerformer && topPerformer.avgScore != null
+        ? topPerformer.name ?? topPerformer.email.split("@")[0]
+        : null,
+    topPerformerScore: topPerformer?.avgScore ?? null,
+    strugglingCount: attentionCount,
+  };
+  return (
+    <AiWeeklyBrief
+      learners={stats.learners}
+      activeTrainings={stats.activeTrainings}
+      avgScore={stats.avgScore}
+      sessions={stats.sessions}
+      completionPct={stats.completionPct}
+      attentionCount={attentionCount}
+      aiBrief={
+        <Suspense fallback={<BriefSkeleton />}>
+          <AiBriefParagraph companyId={companyId} signal={briefSignal} />
+        </Suspense>
+      }
+    />
+  );
+}
+
+async function KpiRow({ companyId }: { companyId: string }) {
+  const stats = await getAdminDashboardStats(companyId);
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-[14px]">
+      <Kpi
+        label="Learners"
+        value={String(stats.learners)}
+        icon="users"
+        tone="accent"
+      />
+      <Kpi
+        label="Active trainings"
+        value={String(stats.activeTrainings)}
+        icon="training"
+        tone="good"
+      />
+      <Kpi
+        label="Avg score"
+        value={stats.avgScore != null ? String(stats.avgScore) : "—"}
+        icon="chart"
+        tone="violet"
+        delta={
+          stats.avgScore != null
+            ? {
+                dir: stats.avgScore >= 70 ? "up" : "down",
+                text: stats.avgScore >= 70 ? "on target" : "below 70",
+              }
+            : null
+        }
+      />
+      <Kpi
+        label="Completion"
+        value={stats.completionPct != null ? `${stats.completionPct}%` : "—"}
+        icon="clipboard"
+        tone="warn"
+        delta={
+          stats.assignmentsTotal > 0
+            ? {
+                dir: "up",
+                text: `${stats.assignmentsCompleted}/${stats.assignmentsTotal}`,
+              }
+            : null
+        }
+      />
+    </div>
+  );
+}
+
+async function RecentTrainingsSection({ companyId }: { companyId: string }) {
+  const trainings = await listTrainingsForAdmin(companyId);
+  const recentTrainings = trainings.slice(0, 3);
+  return (
+    <Card pad="md" className="space-y-3 rounded-[12px]">
+      <div className="flex items-center justify-between">
+        <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-ink-3">
+          Recent trainings
+        </div>
+        <Link
+          href="/admin/trainings"
+          className="text-[12px] text-ink-2 hover:text-ink"
+        >
+          See all →
+        </Link>
+      </div>
+      {recentTrainings.length === 0 ? (
+        <p className="text-[12.5px] text-ink-3">
+          No trainings yet. Spin up your first one from{" "}
+          <Link href="/admin/trainings" className="text-accent underline">
+            Trainings
+          </Link>
+          .
+        </p>
+      ) : (
+        <div className="space-y-2">
+          {recentTrainings.map((t) => (
+            <Link
+              key={t.id}
+              href={`/admin/trainings/${t.id}/edit`}
+              className="flex items-center gap-3 p-2 rounded-md hover:bg-surface-2"
+            >
+              <div className="flex-1 min-w-0">
+                <div className="font-semibold text-[13px] truncate flex items-center gap-2">
+                  {t.title}
+                  <StatusPill status={t.status} />
+                </div>
+                <div className="text-[11.5px] text-ink-3 font-mono">
+                  {t._count.modules} modules · {t.learnerCount} learners
+                  {t.completionPct != null
+                    ? ` · ${t.completionPct}% complete`
+                    : ""}
+                </div>
+              </div>
+              <Icon name="chevron-right" size={14} className="text-ink-3" />
+            </Link>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+async function NeedsAttentionSection({ companyId }: { companyId: string }) {
+  const employees = await listEmployeesForCompany(companyId);
+  const needsAttention = employees
+    .filter(
+      (e) => e.role === "trainee" && e.avgScore != null && e.avgScore < 60,
+    )
+    .slice(0, 4);
+  return (
+    <Card pad="md" className="space-y-3 rounded-[12px]">
+      <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-ink-3">
+        Needs attention
+      </div>
+      {needsAttention.length === 0 ? (
+        <p className="text-[12.5px] text-ink-3">
+          No struggling learners right now.
+        </p>
+      ) : (
+        <ul className="space-y-2">
+          {needsAttention.map((e) => (
+            <li
+              key={e.id}
+              className="flex items-center gap-2 text-[12.5px]"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-bad shrink-0" />
+              <span className="flex-1 truncate text-ink">
+                {e.name ?? e.email}
+              </span>
+              <span className="font-mono text-[11px] text-bad">
+                {e.avgScore}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Card>
+  );
+}
+
+function WeeklyBriefSkeleton() {
+  return (
+    <div
+      className="relative overflow-hidden rounded-[14px] border border-[#2a2230] text-white p-7 h-[260px] animate-pulse"
+      style={{
+        background:
+          "radial-gradient(circle at top right, rgba(232,93,58,0.22) 0%, transparent 55%), linear-gradient(135deg, #2a1f2e 0%, #1a1320 60%, #221624 100%)",
+      }}
+    />
+  );
+}
+
+function KpiRowSkeleton() {
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-[14px]">
+      {Array.from({ length: 4 }).map((_, i) => (
+        <div
+          key={i}
+          className="h-[104px] bg-surface border border-border rounded-[12px] animate-pulse"
+        />
+      ))}
+    </div>
+  );
+}
+
+function TrainingsSkeleton() {
+  return (
+    <Card pad="md" className="space-y-3 rounded-[12px]">
+      <div className="h-3 w-32 bg-surface-2 rounded animate-pulse" />
+      {Array.from({ length: 3 }).map((_, i) => (
+        <div key={i} className="h-10 bg-surface-2 rounded animate-pulse" />
+      ))}
+    </Card>
+  );
+}
+
+function AttentionSkeleton() {
+  return (
+    <Card pad="md" className="space-y-3 rounded-[12px]">
+      <div className="h-3 w-32 bg-surface-2 rounded animate-pulse" />
+      {Array.from({ length: 4 }).map((_, i) => (
+        <div key={i} className="h-4 bg-surface-2 rounded animate-pulse" />
+      ))}
+    </Card>
   );
 }
 

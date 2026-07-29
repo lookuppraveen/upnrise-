@@ -1,3 +1,5 @@
+"use client";
+
 // Client-side hook that speaks a persona line via ElevenLabs.
 //
 // Phase 5 upgrade — MediaSource streaming with blob fallback:
@@ -35,8 +37,6 @@ function canStreamAudioMp3(): boolean {
     return false;
   }
 }
-
-"use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
 

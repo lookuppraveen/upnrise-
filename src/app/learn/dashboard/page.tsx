@@ -10,6 +10,7 @@
 // Rankings cards from the prototype (team/zone/HQ) are deliberately skipped
 // — we don't model team/zone yet.
 
+import { Suspense } from "react";
 import Link from "next/link";
 import { getSessionUser } from "@/lib/auth/session";
 import {
@@ -24,26 +25,18 @@ import { Icon } from "@/components/ui/Icon";
 import { AIBadge } from "@/components/ui/AIBadge";
 import { ProgressRing } from "@/components/ui/ProgressRing";
 
+// Suspense-split so the greeting + shell paints immediately and each
+// data-driven block streams in as its Postgres query resolves. Prior
+// version awaited all 4 queries in one Promise.all before rendering a
+// single byte — slowest query bottlenecked the whole page.
 export default async function LearnDashboard() {
   const user = (await getSessionUser())!;
-  const [stats, last, weakSkills, assignments] = await Promise.all([
-    getDashboardStatsForUser(user.id),
-    getLastSessionForUser(user.id),
-    getTopWeakSkillsForUser(user.id),
-    getAssignmentsWithProgressForUser(user.id),
-  ]);
-
-  const dueSoon = assignments
-    .filter((a) => a.computedStatus !== "completed")
-    .slice(0, 3);
-
   const firstName = pickFirstName(user.name, user.email);
   const today = new Date().toLocaleDateString("en-US", {
     weekday: "long",
     month: "long",
     day: "numeric",
   });
-  const dueThisWeekCount = countDueWithinDays(assignments, 7);
 
   return (
     <div className="px-7 pt-6 pb-20 max-w-[1180px] space-y-6">
@@ -53,120 +46,213 @@ export default async function LearnDashboard() {
         </h1>
         <p className="text-ink-2 text-[13.5px] mt-2">
           {today}
-          {dueThisWeekCount > 0
-            ? ` · ${dueThisWeekCount} module${dueThisWeekCount === 1 ? "" : "s"} due this week`
-            : " · all clear this week"}
+          <Suspense fallback={null}>
+            <DueThisWeekSubtitle userId={user.id} />
+          </Suspense>
         </p>
       </header>
 
-      <AiFocusCard last={last} />
+      <Suspense fallback={<FocusSkeleton />}>
+        <AiFocusSection userId={user.id} />
+      </Suspense>
 
-      {/* KPI row */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-        <Kpi label="Sessions" value={String(stats.sessions)} />
-        <Kpi
-          label="Avg score"
-          value={stats.avgScore != null ? String(stats.avgScore) : "—"}
-        />
-        <Kpi
-          label="Best"
-          value={stats.bestScore != null ? String(stats.bestScore) : "—"}
-        />
-        <Kpi label="Min practiced" value={String(stats.minutesPracticed)} />
-        <Kpi label="Points" value={stats.points.toLocaleString()} />
-      </div>
+      <Suspense fallback={<KpiSkeleton />}>
+        <KpiSection userId={user.id} />
+      </Suspense>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Due assignments (2 cols) */}
         <div className="lg:col-span-2">
-          <Card pad="md" className="space-y-3">
-            <div className="flex items-center justify-between">
-              <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-ink-3">
-                Due soon
-              </div>
-              <Link
-                href="/learn/assignments"
-                className="text-[12px] text-ink-2 hover:text-ink"
-              >
-                See all →
-              </Link>
-            </div>
-            {dueSoon.length === 0 ? (
-              <p className="text-[12.5px] text-ink-3">
-                Nothing due right now. Browse{" "}
-                <Link href="/learn/trainings" className="text-accent underline">
-                  Trainings
-                </Link>{" "}
-                for more practice.
-              </p>
-            ) : (
-              <div className="space-y-2">
-                {dueSoon.map((a) => (
-                  <Link
-                    key={a.id}
-                    href={`/learn/trainings/${a.training.id}`}
-                    className="flex items-center gap-3 p-2 rounded-md hover:bg-surface-2"
-                  >
-                    <ProgressRing value={a.computedProgress} size={40} />
-                    <div className="flex-1 min-w-0">
-                      <div className="font-semibold text-[13px] truncate">
-                        {a.training.title}
-                      </div>
-                      <div className="text-[11.5px] text-ink-3 font-mono">
-                        {a.priority.toUpperCase()} ·{" "}
-                        {a.dueAt
-                          ? new Date(a.dueAt).toLocaleDateString("en-US", {
-                              month: "short",
-                              day: "numeric",
-                            })
-                          : "no due date"}
-                      </div>
-                    </div>
-                    <Icon
-                      name="chevron-right"
-                      size={14}
-                      className="text-ink-3"
-                    />
-                  </Link>
-                ))}
-              </div>
-            )}
-          </Card>
+          <Suspense fallback={<DueSoonSkeleton />}>
+            <DueSoonSection userId={user.id} />
+          </Suspense>
         </div>
-
-        {/* Skill gaps */}
         <div>
-          <Card pad="md" className="space-y-3">
-            <div className="flex items-center gap-2">
-              <span className="text-[11px] font-semibold uppercase tracking-[0.12em] text-ink-3">
-                What to work on
-              </span>
-              <AIBadge>Trend</AIBadge>
-            </div>
-            {weakSkills.length === 0 ? (
-              <p className="text-[12.5px] text-ink-3">
-                Run a few sessions and your top skill gaps will show up here.
-              </p>
-            ) : (
-              <ul className="space-y-2">
-                {weakSkills.map((w) => (
-                  <li
-                    key={w.skill}
-                    className="flex items-center gap-2 text-[12.5px]"
-                  >
-                    <span className="w-1.5 h-1.5 rounded-full bg-warn shrink-0" />
-                    <span className="flex-1 text-ink">{w.skill}</span>
-                    <span className="font-mono text-[10.5px] text-ink-3">
-                      ×{w.count}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </Card>
+          <Suspense fallback={<WeakSkillsSkeleton />}>
+            <WeakSkillsSection userId={user.id} />
+          </Suspense>
         </div>
       </div>
     </div>
+  );
+}
+
+async function AiFocusSection({ userId }: { userId: string }) {
+  const last = await getLastSessionForUser(userId);
+  return <AiFocusCard last={last} />;
+}
+
+async function KpiSection({ userId }: { userId: string }) {
+  const stats = await getDashboardStatsForUser(userId);
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+      <Kpi label="Sessions" value={String(stats.sessions)} />
+      <Kpi
+        label="Avg score"
+        value={stats.avgScore != null ? String(stats.avgScore) : "—"}
+      />
+      <Kpi
+        label="Best"
+        value={stats.bestScore != null ? String(stats.bestScore) : "—"}
+      />
+      <Kpi label="Min practiced" value={String(stats.minutesPracticed)} />
+      <Kpi label="Points" value={stats.points.toLocaleString()} />
+    </div>
+  );
+}
+
+async function DueThisWeekSubtitle({ userId }: { userId: string }) {
+  const assignments = await getAssignmentsWithProgressForUser(userId);
+  const count = countDueWithinDays(assignments, 7);
+  return (
+    <span>
+      {count > 0
+        ? ` · ${count} module${count === 1 ? "" : "s"} due this week`
+        : " · all clear this week"}
+    </span>
+  );
+}
+
+async function DueSoonSection({ userId }: { userId: string }) {
+  const assignments = await getAssignmentsWithProgressForUser(userId);
+  const dueSoon = assignments
+    .filter((a) => a.computedStatus !== "completed")
+    .slice(0, 3);
+  return (
+    <Card pad="md" className="space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-ink-3">
+          Due soon
+        </div>
+        <Link
+          href="/learn/assignments"
+          className="text-[12px] text-ink-2 hover:text-ink"
+        >
+          See all →
+        </Link>
+      </div>
+      {dueSoon.length === 0 ? (
+        <p className="text-[12.5px] text-ink-3">
+          Nothing due right now. Browse{" "}
+          <Link href="/learn/trainings" className="text-accent underline">
+            Trainings
+          </Link>{" "}
+          for more practice.
+        </p>
+      ) : (
+        <div className="space-y-2">
+          {dueSoon.map((a) => (
+            <Link
+              key={a.id}
+              href={`/learn/trainings/${a.training.id}`}
+              className="flex items-center gap-3 p-2 rounded-md hover:bg-surface-2"
+            >
+              <ProgressRing value={a.computedProgress} size={40} />
+              <div className="flex-1 min-w-0">
+                <div className="font-semibold text-[13px] truncate">
+                  {a.training.title}
+                </div>
+                <div className="text-[11.5px] text-ink-3 font-mono">
+                  {a.priority.toUpperCase()} ·{" "}
+                  {a.dueAt
+                    ? new Date(a.dueAt).toLocaleDateString("en-US", {
+                        month: "short",
+                        day: "numeric",
+                      })
+                    : "no due date"}
+                </div>
+              </div>
+              <Icon name="chevron-right" size={14} className="text-ink-3" />
+            </Link>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+async function WeakSkillsSection({ userId }: { userId: string }) {
+  const weakSkills = await getTopWeakSkillsForUser(userId);
+  return (
+    <Card pad="md" className="space-y-3">
+      <div className="flex items-center gap-2">
+        <span className="text-[11px] font-semibold uppercase tracking-[0.12em] text-ink-3">
+          What to work on
+        </span>
+        <AIBadge>Trend</AIBadge>
+      </div>
+      {weakSkills.length === 0 ? (
+        <p className="text-[12.5px] text-ink-3">
+          Run a few sessions and your top skill gaps will show up here.
+        </p>
+      ) : (
+        <ul className="space-y-2">
+          {weakSkills.map((w) => (
+            <li
+              key={w.skill}
+              className="flex items-center gap-2 text-[12.5px]"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-warn shrink-0" />
+              <span className="flex-1 text-ink">{w.skill}</span>
+              <span className="font-mono text-[10.5px] text-ink-3">
+                ×{w.count}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Card>
+  );
+}
+
+function FocusSkeleton() {
+  return (
+    <div
+      className="relative rounded-[14px] border p-7 h-[210px] animate-pulse"
+      style={{
+        background:
+          "linear-gradient(135deg, #fff7f3 0%, var(--accent-pale) 100%)",
+        borderColor: "#f5cdb8",
+      }}
+    />
+  );
+}
+
+function KpiSkeleton() {
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+      {Array.from({ length: 5 }).map((_, i) => (
+        <Card key={i} pad="md" className="space-y-1">
+          <div className="h-3 bg-surface-2 rounded animate-pulse" />
+          <div className="h-8 bg-surface-2 rounded animate-pulse" />
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+function DueSoonSkeleton() {
+  return (
+    <Card pad="md" className="space-y-3">
+      <div className="h-3 w-24 bg-surface-2 rounded animate-pulse" />
+      <div className="space-y-2">
+        {Array.from({ length: 3 }).map((_, i) => (
+          <div key={i} className="h-12 bg-surface-2 rounded animate-pulse" />
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+function WeakSkillsSkeleton() {
+  return (
+    <Card pad="md" className="space-y-3">
+      <div className="h-3 w-32 bg-surface-2 rounded animate-pulse" />
+      <div className="space-y-2">
+        {Array.from({ length: 3 }).map((_, i) => (
+          <div key={i} className="h-5 bg-surface-2 rounded animate-pulse" />
+        ))}
+      </div>
+    </Card>
   );
 }
 

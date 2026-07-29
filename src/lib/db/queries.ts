@@ -4,35 +4,45 @@
 // Phase 2 surfaces: trainings, modules, assignments, roleplay sessions.
 //
 // ── Caching status ────────────────────────────────────────────────
-// Previously every heavy read was wrapped in Next's `unstable_cache`.
-// Vercel's cache handler serializes results through JSON, which turns
-// `Date` → ISO string and `Map` → `{}`. That silently broke downstream
-// code across the app (`.getTime is not a function`, `.get is not a
-// function`, missing filter results, etc.) — the caching layer became
-// a source of production incidents.
+// Next's `unstable_cache` (durable, cross-request) was retired because
+// Vercel's cache handler JSON-serializes results, which turns `Date` →
+// ISO string and `Map` → `{}` — a source of prod incidents.
 //
-// The `unstable_cache` symbol is shadowed below with a pass-through
-// no-op so every existing call site continues to compile and behave
-// as if it were talking to a real cache, but no cache is consulted.
-// The batching + Suspense + loading skeletons that ship alongside
-// this file still deliver the perceived-speed win.
+// The `unstable_cache` symbol is shadowed with a React `cache()`-backed
+// PER-REQUEST memo: identical keys within one render dedupe, but no
+// promise crosses request boundaries, so Dates/Maps stay live objects.
+// This kills the N+1 patterns where a page + child components pull the
+// same helper 3–5 times, and is completely safe.
 //
-// If we ever re-introduce caching, do it with a Date/Map-safe
-// serializer (superjson) and start with a single query as a canary.
-// See `invalidate.ts` — the tag-based invalidation helpers are still
-// invoked from mutating actions, but they're currently harmless because
-// nothing is tagged.
+// When we re-introduce durable caching, do it with a Date/Map-safe
+// serializer (superjson) on a per-query basis. See `invalidate.ts` —
+// the tag helpers still fire from mutating actions; safe no-op today.
 
+import { cache } from "react";
 import { prisma } from "./client";
 import { cacheTags } from "./cache-tags";
+
+// React `cache()` memoizes by argument identity within a request. We use
+// a zero-arg factory to get "one Map per request" — fresh on every
+// request boundary, deduped within.
+const requestScopedMemo = cache(() => new Map<string, Promise<unknown>>());
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 function unstable_cache<F extends (...args: never[]) => Promise<unknown>>(
   fn: F,
-  _key?: string[],
+  key: string[] = [],
   _opts?: { revalidate?: number; tags?: string[] },
 ): F {
-  return fn;
+  const k = key.join("|");
+  return (async () => {
+    const store = requestScopedMemo();
+    let p = store.get(k);
+    if (!p) {
+      p = fn();
+      store.set(k, p);
+    }
+    return p;
+  }) as F;
 }
 
 export function listTrainingsForCompany(companyId: string) {
@@ -360,6 +370,91 @@ async function _getTrainingProgressForManyForUser(
   for (const id of trainingIds) {
     const b = modulesByTraining.get(id);
     out[id] = b && b.total > 0 ? Math.round((b.done / b.total) * 100) : 0;
+  }
+  return out;
+}
+
+/**
+ * Cross-user batched progress lookup. Given many (userId, trainingId) pairs,
+ * compute the progress % for each in a total of 3 DB round-trips regardless
+ * of pair count. Result Map is keyed by `${userId}:${trainingId}`.
+ *
+ * Used by admin dashboard, admin trainings list, and admin assignments list
+ * where the previous per-pair fanout produced 3×N round-trips against a
+ * Tokyo Postgres pool.
+ */
+export async function getTrainingProgressForPairs(
+  pairs: Array<{ userId: string; trainingId: string }>,
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (pairs.length === 0) return out;
+
+  const trainingIds = Array.from(new Set(pairs.map((p) => p.trainingId)));
+  const userIds = Array.from(new Set(pairs.map((p) => p.userId)));
+
+  const modules = await prisma.trainingModule.findMany({
+    where: { trainingId: { in: trainingIds }, published: true },
+    select: { id: true, type: true, trainingId: true },
+  });
+  if (modules.length === 0) {
+    for (const p of pairs) out.set(`${p.userId}:${p.trainingId}`, 0);
+    return out;
+  }
+
+  const roleplayModuleIds = modules
+    .filter((m) => m.type === "roleplay")
+    .map((m) => m.id);
+  const nonRoleplayModuleIds = modules
+    .filter((m) => m.type !== "roleplay")
+    .map((m) => m.id);
+
+  const [roleplayDone, nonRoleplayDone] = await Promise.all([
+    roleplayModuleIds.length === 0
+      ? Promise.resolve([] as { userId: string; moduleId: string }[])
+      : prisma.roleplaySession.groupBy({
+          by: ["userId", "moduleId"],
+          where: {
+            userId: { in: userIds },
+            moduleId: { in: roleplayModuleIds },
+            endedAt: { not: null },
+          },
+        }),
+    nonRoleplayModuleIds.length === 0
+      ? Promise.resolve([] as { userId: string; moduleId: string }[])
+      : prisma.moduleCompletion.findMany({
+          where: {
+            userId: { in: userIds },
+            moduleId: { in: nonRoleplayModuleIds },
+          },
+          select: { userId: true, moduleId: true },
+        }),
+  ]);
+
+  const completed = new Set<string>();
+  for (const r of roleplayDone) completed.add(`${r.userId}:${r.moduleId}`);
+  for (const r of nonRoleplayDone) completed.add(`${r.userId}:${r.moduleId}`);
+
+  const modulesByTraining = new Map<string, string[]>();
+  for (const m of modules) {
+    const list = modulesByTraining.get(m.trainingId) ?? [];
+    list.push(m.id);
+    modulesByTraining.set(m.trainingId, list);
+  }
+
+  for (const p of pairs) {
+    const modList = modulesByTraining.get(p.trainingId) ?? [];
+    if (modList.length === 0) {
+      out.set(`${p.userId}:${p.trainingId}`, 0);
+      continue;
+    }
+    let done = 0;
+    for (const mid of modList) {
+      if (completed.has(`${p.userId}:${mid}`)) done++;
+    }
+    out.set(
+      `${p.userId}:${p.trainingId}`,
+      Math.round((done / modList.length) * 100),
+    );
   }
   return out;
 }
@@ -1205,16 +1300,19 @@ async function _getAdminDashboardStats(companyId: string) {
     }),
   ]);
 
-  // Compute completion across assignments using the same progress heuristic
-  // we use for trainees. Previously this looped `await` sequentially —
-  // for T assignments that meant T × 3 sequential queries. Fan out with
-  // Promise.all so all assignments compute in parallel.
-  const progresses = await Promise.all(
-    allAssignments.map((a) =>
-      getTrainingProgressForUser(a.userId, a.trainingId),
-    ),
+  // Compute completion across assignments using the same progress
+  // heuristic we use for trainees. Batched: 3 round-trips total, not
+  // 3×N. Previous per-assignment `Promise.all` still hammered the
+  // Tokyo Postgres pool with hundreds of parallel queries — the
+  // pooled connection limit throttled them serially anyway.
+  const progressMap = await getTrainingProgressForPairs(
+    allAssignments.map((a) => ({ userId: a.userId, trainingId: a.trainingId })),
   );
-  const completed = progresses.filter((p) => p >= 100).length;
+  let completed = 0;
+  for (const a of allAssignments) {
+    const p = progressMap.get(`${a.userId}:${a.trainingId}`) ?? 0;
+    if (p >= 100) completed++;
+  }
 
   return {
     learners,
@@ -1276,18 +1374,16 @@ async function _listTrainingsForAdmin(companyId: string) {
     select: { trainingId: true, userId: true },
   });
 
-  const progresses = await Promise.all(
-    allAssignments.map((a) =>
-      getTrainingProgressForUser(a.userId, a.trainingId),
-    ),
+  const progressMap = await getTrainingProgressForPairs(
+    allAssignments.map((a) => ({ userId: a.userId, trainingId: a.trainingId })),
   );
 
   const byTraining = new Map<string, { learners: number; done: number }>();
-  for (let i = 0; i < allAssignments.length; i++) {
-    const a = allAssignments[i];
+  for (const a of allAssignments) {
     const bucket = byTraining.get(a.trainingId) ?? { learners: 0, done: 0 };
     bucket.learners++;
-    if (progresses[i] >= 100) bucket.done++;
+    const p = progressMap.get(`${a.userId}:${a.trainingId}`) ?? 0;
+    if (p >= 100) bucket.done++;
     byTraining.set(a.trainingId, bucket);
   }
 
@@ -1493,22 +1589,23 @@ async function _listAssignmentsForCompany(companyId: string) {
     },
   });
   const nowMs = Date.now();
-  return Promise.all(
-    rows.map(async (a) => {
-      const progress = await getTrainingProgressForUser(a.userId, a.trainingId);
-      const computedStatus: ComputedAssignmentStatus =
-        progress >= 100
-          ? "completed"
-          : progress > 0
-            ? "in_progress"
-            : "not_started";
-      const overdue =
-        a.dueAt != null &&
-        new Date(a.dueAt).getTime() < nowMs &&
-        computedStatus !== "completed";
-      return { ...a, computedProgress: progress, computedStatus, overdue };
-    }),
+  const progressMap = await getTrainingProgressForPairs(
+    rows.map((a) => ({ userId: a.userId, trainingId: a.trainingId })),
   );
+  return rows.map((a) => {
+    const progress = progressMap.get(`${a.userId}:${a.trainingId}`) ?? 0;
+    const computedStatus: ComputedAssignmentStatus =
+      progress >= 100
+        ? "completed"
+        : progress > 0
+          ? "in_progress"
+          : "not_started";
+    const overdue =
+      a.dueAt != null &&
+      new Date(a.dueAt).getTime() < nowMs &&
+      computedStatus !== "completed";
+    return { ...a, computedProgress: progress, computedStatus, overdue };
+  });
 }
 
 // ────────────────────────────────────────────────────────────────────────
