@@ -362,6 +362,22 @@ export function RoleplayPlayer({
               `Attempt limit reached — you've used ${data.used} of ${data.limit}.`,
             );
           }
+          if (data.error === "not_assigned") {
+            throw new Error(
+              "This training is private and hasn't been assigned to you. Ask your admin for access.",
+            );
+          }
+          if (data.error === "prereq_not_met") {
+            throw new Error(
+              "Finish the prerequisite trainings before starting this one.",
+            );
+          }
+          if (data.error === "not_open_yet") {
+            throw new Error("This training hasn't opened yet.");
+          }
+          if (data.error === "past_due") {
+            throw new Error("This training's due date has passed.");
+          }
           throw new Error(data.error ?? `start failed: ${res.status}`);
         }
         const data: { sessionId: string; opening: string | null } =

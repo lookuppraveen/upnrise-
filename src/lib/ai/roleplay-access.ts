@@ -19,7 +19,7 @@ export async function loadModuleForUser(user: SessionUser, moduleId: string) {
         type: "roleplay",
         training: { companyId: user.companyId },
       },
-      include: { roleplayConfig: true, training: { select: { id: true, title: true, startAt: true, dueAt: true } } },
+      include: { roleplayConfig: true, training: { select: { id: true, title: true, startAt: true, dueAt: true, visibility: true, prerequisiteIds: true, rewardPoints: true, adaptiveDifficulty: true } } },
     });
   }
   const row = await prisma.trainingModule.findFirst({
@@ -29,7 +29,7 @@ export async function loadModuleForUser(user: SessionUser, moduleId: string) {
       published: true,
       training: { companyId: user.companyId, status: "published" },
     },
-    include: { roleplayConfig: true, training: { select: { id: true, title: true, startAt: true, dueAt: true } } },
+    include: { roleplayConfig: true, training: { select: { id: true, title: true, startAt: true, dueAt: true, visibility: true, prerequisiteIds: true, rewardPoints: true, adaptiveDifficulty: true } } },
   });
   return row;
 }
@@ -42,7 +42,7 @@ export async function loadSessionForUser(user: SessionUser, sessionId: string) {
         include: {
           roleplayConfig: true,
           training: {
-            select: { id: true, companyId: true, title: true, passingScore: true, feedbackTone: true },
+            select: { id: true, companyId: true, title: true, passingScore: true, feedbackTone: true, adaptiveDifficulty: true },
           },
         },
       },
@@ -81,7 +81,7 @@ export async function loadSessionForAdmin(user: SessionUser, sessionId: string) 
         include: {
           roleplayConfig: true,
           training: {
-            select: { id: true, companyId: true, title: true, passingScore: true, feedbackTone: true },
+            select: { id: true, companyId: true, title: true, passingScore: true, feedbackTone: true, adaptiveDifficulty: true },
           },
         },
       },

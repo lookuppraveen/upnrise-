@@ -22,6 +22,7 @@ import {
   appendTurn,
   buildSystemPrompt,
   toClaudeMessages,
+  type DifficultyTier,
   type TranscriptTurn,
 } from "@/lib/ai/roleplay";
 import { parseAdditionalSettings } from "@/lib/roleplay/additional-settings";
@@ -61,6 +62,24 @@ export async function POST(req: Request) {
       ? ((session.module.body as Record<string, unknown>)
           .idealConversation as string)
       : null;
+  // Adaptive difficulty — recompute the tier so the system prompt
+  // matches what /start built (crucial for the Anthropic system-block
+  // cache to hit). Rolling avg over the SAME sample won't shift
+  // mid-conversation because the current session isn't yet scored.
+  let difficultyTier: DifficultyTier | undefined;
+  if (
+    session.module.training.adaptiveDifficulty &&
+    user.role === "trainee"
+  ) {
+    const { getDifficultyTierForUser } = await import(
+      "@/lib/roleplay/adaptive-difficulty"
+    );
+    difficultyTier = await getDifficultyTierForUser({
+      userId: user.id,
+      trainingId: session.module.training.id,
+    });
+  }
+
   const systemPrompt = buildSystemPrompt(
     {
       persona: cfg.persona,
@@ -72,6 +91,7 @@ export async function POST(req: Request) {
       idealConversation,
       followIdealConversation: settings.followIdealConversation,
       endRoleplayBy: settings.endRoleplayBy,
+      difficultyTier,
     },
   );
 

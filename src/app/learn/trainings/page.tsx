@@ -23,7 +23,9 @@ export default async function TrainingsList() {
   if (!user.companyId) {
     return <EmptyState reason="no_tenant" />;
   }
-  const trainings = await listTrainingsForCompany(user.companyId);
+  // Passing userId enables the visibility gate — private trainings only
+  // surface to trainees who have an Assignment for them.
+  const trainings = await listTrainingsForCompany(user.companyId, user.id);
 
   // Previously fired N × 3 queries (one getTrainingProgressForUser per
   // training). Now: three total queries, one groupBy + one findMany +

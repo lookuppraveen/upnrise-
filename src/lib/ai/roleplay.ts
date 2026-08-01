@@ -24,12 +24,52 @@ export type RoleplayConfigShape = {
 /** Hard cap on transcript turns to keep prompts cheap + sessions sane. */
 export const MAX_TRANSCRIPT_TURNS = 40;
 
+/**
+ * Adaptive-difficulty tier derived from the learner's rolling
+ * performance. Passed into buildSystemPrompt when the training has
+ * `adaptiveDifficulty` on so the persona modulates its toughness.
+ *
+ * - warmup     : no prior scored sessions — assume newcomer
+ * - gentle     : rolling avg < 50
+ * - standard   : 50–69 (also the default when adaptiveDifficulty is off)
+ * - challenging: 70–84
+ * - hard       : ≥ 85
+ */
+export type DifficultyTier =
+  | "warmup"
+  | "gentle"
+  | "standard"
+  | "challenging"
+  | "hard";
+
+export function tierFromAvgScore(avg: number | null): DifficultyTier {
+  if (avg == null) return "warmup";
+  if (avg < 50) return "gentle";
+  if (avg < 70) return "standard";
+  if (avg < 85) return "challenging";
+  return "hard";
+}
+
+const DIFFICULTY_INSTRUCTIONS: Record<DifficultyTier, string> = {
+  warmup:
+    "The learner is new — this is an early practice attempt. Be welcoming: raise ONE mild concern per turn, accept reasonable answers on the first try, and let the conversation move forward without piling on objections. Give them room to find their footing.",
+  gentle:
+    "The learner has been struggling in prior sessions. Ease off: raise concerns clearly but calmly, accept partial answers as good enough to keep going, and avoid stacking multiple objections in a single turn. Reward genuine effort by softening.",
+  standard:
+    "Play the scenario at the intended difficulty. Push back where the persona would realistically push back, accept solid answers, and match the learner's energy.",
+  challenging:
+    "The learner is performing well and needs a harder rep. Stack two related concerns in a single turn when appropriate, follow up on vague answers with a sharper probe, and only agree once they've actually addressed the specific worry — not just acknowledged it.",
+  hard:
+    "The learner is strong and needs top-tier practice. Play the toughest realistic version of this persona: multi-part objections, price sensitivity, competing alternatives, and sceptical follow-ups. Do not soften unless the learner has genuinely earned it with a specific, concrete answer. If they use filler or generic pitches, cut them off politely and re-ask.",
+};
+
 export function buildSystemPrompt(
   cfg: RoleplayConfigShape,
   opts?: {
     idealConversation?: string | null;
     followIdealConversation?: boolean;
     endRoleplayBy?: "ai" | "user" | "either";
+    difficultyTier?: DifficultyTier;
   },
 ): string {
   const sections = [
@@ -66,6 +106,17 @@ export function buildSystemPrompt(
 
   if (cfg.systemPrompt) {
     sections.push("", "## Additional direction", cfg.systemPrompt);
+  }
+
+  // Adaptive difficulty — the training toggle in Step 4 Settings.
+  // Passed only when the admin turned it on; when omitted the persona
+  // plays at its authored difficulty.
+  if (opts?.difficultyTier) {
+    sections.push(
+      "",
+      "## Difficulty calibration",
+      DIFFICULTY_INSTRUCTIONS[opts.difficultyTier],
+    );
   }
 
   // When the admin asked the persona to follow the ideal conversation,

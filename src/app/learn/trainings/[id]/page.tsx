@@ -21,6 +21,7 @@ import { Button } from "@/components/ui/Button";
 import { Icon } from "@/components/ui/Icon";
 import type { IconName } from "@/components/ui/Icon";
 import type { ModuleType } from "@prisma/client";
+import { prisma } from "@/lib/db/client";
 import { cn } from "@/lib/cn";
 import {
   parseAdditionalSettings,
@@ -71,6 +72,16 @@ export default async function TrainingDetail({
 
   const training = await getTrainingWithModulesForTenant(id, user.companyId);
   if (!training) notFound();
+
+  // Visibility gate — trainees can't deep-link into a private training
+  // they aren't assigned to. Admins bypass (their preview surface uses
+  // /admin/preview, not this route).
+  if (user.role === "trainee" && training.visibility === "private") {
+    const hasAssignment = await prisma.assignment.count({
+      where: { userId: user.id, trainingId: training.id },
+    });
+    if (hasAssignment === 0) notFound();
+  }
 
   // Progress + batched module stats fire in parallel — they only need
   // the training id and the module id list, which we already have.
@@ -164,6 +175,16 @@ export default async function TrainingDetail({
               <span>· {totalAttempts} attempts</span>
             ) : null}
           </div>
+
+          {progress >= 100 && training.issueCertificate ? (
+            <Link
+              href={`/learn/certificates/${training.id}`}
+              className="inline-flex items-center gap-1.5 px-[14px] py-[7px] rounded-sm text-[13px] font-semibold bg-good text-white border border-good hover:bg-good/90"
+            >
+              <Icon name="trophy" size={13} />
+              View Certificate
+            </Link>
+          ) : null}
 
           <AiCoachInsight insight={insight} sessionsBasedOn={totalAttempts} />
         </div>

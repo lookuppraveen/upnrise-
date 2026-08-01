@@ -153,7 +153,13 @@ export async function awardForSession(input: {
 }
 
 /** Check training completion and award once. Public so other paths
- *  (e.g. quiz/video completion when those land) can also trigger it. */
+ *  (e.g. quiz/video completion when those land) can also trigger it.
+ *
+ *  Two rewards can fire on completion:
+ *  - `complete_training` from the tenant-wide RewardRule (via award())
+ *  - a per-training bonus from `Training.rewardPoints` (via
+ *    awardTrainingBonus below) — the admin's Step 4 Settings field.
+ *  Both are idempotent; sourceIds differ so they don't collide. */
 export async function maybeAwardTrainingComplete(input: {
   userId: string;
   companyId: string;
@@ -176,13 +182,57 @@ export async function maybeAwardTrainingComplete(input: {
   });
   if (completedModuleCount.length < modules.length) return 0;
 
-  return award({
+  let total = 0;
+  total += await award({
     userId: input.userId,
     companyId: input.companyId,
     action: "complete_training",
     sourceKind: "training",
     sourceId: input.trainingId,
   });
+  total += await awardTrainingBonus(input);
+  return total;
+}
+
+/**
+ * Award the per-training bonus configured in Step 4 Settings
+ * (`Training.rewardPoints`). Uses a `${trainingId}:bonus` sourceId so
+ * it never collides with the RewardRule-driven award for the same
+ * training. Skipped when rewardPoints is 0 or null. Idempotent via
+ * the RewardEarning unique constraint.
+ */
+async function awardTrainingBonus(input: {
+  userId: string;
+  companyId: string;
+  trainingId: string;
+}): Promise<number> {
+  const training = await prisma.training.findUnique({
+    where: { id: input.trainingId },
+    select: { rewardPoints: true },
+  });
+  const points = training?.rewardPoints ?? 0;
+  if (points <= 0) return 0;
+  try {
+    await prisma.rewardEarning.create({
+      data: {
+        userId: input.userId,
+        companyId: input.companyId,
+        action: "complete_training",
+        points,
+        sourceKind: "training",
+        sourceId: `${input.trainingId}:bonus`,
+      },
+    });
+    return points;
+  } catch (e) {
+    if (
+      e instanceof Prisma.PrismaClientKnownRequestError &&
+      e.code === "P2002"
+    ) {
+      return 0;
+    }
+    throw e;
+  }
 }
 
 /**

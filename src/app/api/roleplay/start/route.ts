@@ -21,6 +21,7 @@ const ROLEPLAY_MODEL =
 import {
   appendTurn,
   buildSystemPrompt,
+  type DifficultyTier,
   type TranscriptTurn,
 } from "@/lib/ai/roleplay";
 import { parseAdditionalSettings } from "@/lib/roleplay/additional-settings";
@@ -76,7 +77,7 @@ export async function POST(req: Request) {
   // hasn't opened yet or has already closed.
   if (user.role === "trainee") {
     const now = new Date();
-    const { startAt, dueAt } = mod.training;
+    const { startAt, dueAt, visibility, prerequisiteIds } = mod.training;
     if (startAt && now < startAt) {
       return NextResponse.json(
         {
@@ -94,6 +95,39 @@ export async function POST(req: Request) {
         },
         { status: 403 },
       );
+    }
+    // Visibility=private → trainee must have an Assignment. org_wide
+    // and public bypass. Assignment is authoritative because
+    // self-enrollment (Settings step) also writes an Assignment row.
+    if (visibility === "private") {
+      const has = await prisma.assignment.count({
+        where: { userId: user.id, trainingId: mod.training.id },
+      });
+      if (has === 0) {
+        return NextResponse.json(
+          { error: "not_assigned" },
+          { status: 403 },
+        );
+      }
+    }
+    // Prerequisites — every listed training must be 100% complete for
+    // this user before they can start this one.
+    if (prerequisiteIds.length > 0) {
+      const { getTrainingProgressForPairs } = await import(
+        "@/lib/db/queries"
+      );
+      const progress = await getTrainingProgressForPairs(
+        prerequisiteIds.map((tid) => ({ userId: user.id, trainingId: tid })),
+      );
+      const unmet = prerequisiteIds.filter(
+        (tid) => (progress.get(`${user.id}:${tid}`) ?? 0) < 100,
+      );
+      if (unmet.length > 0) {
+        return NextResponse.json(
+          { error: "prereq_not_met", prerequisiteIds: unmet },
+          { status: 403 },
+        );
+      }
     }
   }
 
@@ -113,6 +147,21 @@ export async function POST(req: Request) {
     _max: { score: true },
   });
 
+  // Adaptive difficulty — derive a persona-toughness tier from the
+  // learner's rolling avg score IN THIS TRAINING (falls back to overall
+  // recent history, then to warmup). Only computed when the admin
+  // turned it on in Step 4 Settings.
+  let difficultyTier: DifficultyTier | undefined;
+  if (mod.training.adaptiveDifficulty && user.role === "trainee") {
+    const { getDifficultyTierForUser } = await import(
+      "@/lib/roleplay/adaptive-difficulty"
+    );
+    difficultyTier = await getDifficultyTierForUser({
+      userId: user.id,
+      trainingId: mod.training.id,
+    });
+  }
+
   const cfg = mod.roleplayConfig;
   const systemPrompt = buildSystemPrompt(
     {
@@ -125,6 +174,7 @@ export async function POST(req: Request) {
       idealConversation,
       followIdealConversation: settings.followIdealConversation,
       endRoleplayBy: settings.endRoleplayBy,
+      difficultyTier,
     },
   );
 

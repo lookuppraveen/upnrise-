@@ -45,16 +45,30 @@ function unstable_cache<F extends (...args: never[]) => Promise<unknown>>(
   }) as F;
 }
 
-export function listTrainingsForCompany(companyId: string) {
+export function listTrainingsForCompany(companyId: string, userId?: string) {
   return unstable_cache(
-    () => _listTrainingsForCompany(companyId),
-    ["listTrainingsForCompany", companyId],
+    () => _listTrainingsForCompany(companyId, userId),
+    ["listTrainingsForCompany", companyId, userId ?? ""],
     { revalidate: 60, tags: [cacheTags.trainings(companyId)] },
   )();
 }
 
-async function _listTrainingsForCompany(companyId: string) {
-  return prisma.training.findMany({
+async function _listTrainingsForCompany(companyId: string, userId?: string) {
+  // Visibility gate: `private` trainings are only visible to trainees
+  // who have an Assignment for them. `org_wide` and `public` are visible
+  // to everyone in the tenant. When userId is omitted (e.g. admin/
+  // preview surfaces), no filtering — return all published trainings.
+  const assignedTrainingIds = userId
+    ? new Set(
+        (
+          await prisma.assignment.findMany({
+            where: { userId, training: { companyId } },
+            select: { trainingId: true },
+          })
+        ).map((a) => a.trainingId),
+      )
+    : null;
+  const rows = await prisma.training.findMany({
     where: { companyId, status: "published" },
     orderBy: { createdAt: "desc" },
     select: {
@@ -62,12 +76,17 @@ async function _listTrainingsForCompany(companyId: string) {
       title: true,
       description: true,
       categories: true,
+      visibility: true,
       houseStyleMatch: true,
       thumbnailUrl: true,
       createdAt: true,
       _count: { select: { modules: true } },
     },
   });
+  if (!assignedTrainingIds) return rows;
+  return rows.filter(
+    (t) => t.visibility !== "private" || assignedTrainingIds.has(t.id),
+  );
 }
 
 export async function getTrainingWithModulesForTenant(
