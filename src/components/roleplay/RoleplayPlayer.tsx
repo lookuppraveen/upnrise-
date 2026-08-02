@@ -798,17 +798,33 @@ export function RoleplayPlayer({
   // Auto-disconnect when the duration cap is hit. Skips if the admin
   // didn't opt in or the cap is already past — we don't want repeated
   // end() calls if the user is mid-navigation.
+  //
+  // Turn-integrity gate: never cut off a persona reply that's still
+  // being generated (`streaming`) or still being spoken by TTS
+  // (`voice.state === "speaking"`). If the max duration lands mid-
+  // turn we simply defer — the effect re-runs the moment the AI
+  // finishes, then fires end() cleanly. This preserves natural turn-
+  // taking: the trainee always hears the full persona reply before
+  // the session closes.
   const endedFiredRef = useRef(false);
   useEffect(() => {
     if (!duration?.autoDisconnect) return;
     if (!sessionId || ending || endedFiredRef.current) return;
     if (!maxReached) return;
+    if (streaming || voice.state === "speaking") return;
     endedFiredRef.current = true;
     end();
     // end() is stable for the duration of the session; ESLint can't see
     // that, so we deliberately scope deps to the trigger inputs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [maxReached, sessionId, ending, duration?.autoDisconnect]);
+  }, [
+    maxReached,
+    sessionId,
+    ending,
+    duration?.autoDisconnect,
+    streaming,
+    voice.state,
+  ]);
 
   // Bump the activity ref every time a turn lands — either side counts.
   useEffect(() => {
@@ -818,11 +834,21 @@ export function RoleplayPlayer({
   // Inactivity watchdog. 30s idle in a non-streaming state ends the
   // session. Only active when the admin enabled it AND the session has
   // started AND we're not already mid-end.
+  //
+  // Turn-integrity gate: as long as the AI is streaming a reply or the
+  // persona is still being spoken, we treat that as ongoing activity —
+  // reset the idle clock and skip this tick. This prevents the
+  // watchdog from ending the session mid-generation on long persona
+  // replies where TTS + streaming exceed 30s of "no user activity".
   useEffect(() => {
     if (!duration?.disconnectOnInactivity) return;
     if (!sessionId || ending || endedFiredRef.current) return;
     const t = setInterval(() => {
-      if (streaming || lastActivityRef.current === null) {
+      if (
+        streaming ||
+        voice.state === "speaking" ||
+        lastActivityRef.current === null
+      ) {
         lastActivityRef.current = Date.now();
         return;
       }
@@ -834,7 +860,13 @@ export function RoleplayPlayer({
     }, 5_000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, ending, streaming, duration?.disconnectOnInactivity]);
+  }, [
+    sessionId,
+    ending,
+    streaming,
+    voice.state,
+    duration?.disconnectOnInactivity,
+  ]);
 
   // ───────── Hints ─────────
   // Track the count of trainee-requested hints used in this attempt
