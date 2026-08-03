@@ -35,10 +35,23 @@ type ListeningMode = "active" | "background";
 // multiply by NOISE_MULTIPLIER, floor at MIN_THRESHOLD. Handles the
 // full range from a quiet home office (baseline ~5) to a café or open
 // floor (baseline ~30) without needing per-user config.
-const MIN_THRESHOLD = 15;
-const FALLBACK_THRESHOLD = 20; // used before calibration completes
+// Lowered from 15 → 3 to handle quiet built-in laptop mics. Real
+// ambient noise almost never sustains at 3+; below-threshold speech
+// is the more common failure mode (users complain "nothing happens").
+// Combined with the analyser GainNode boost below, the effective bar
+// is around 12 pre-boost, which comfortably captures normal speech
+// even on very quiet hardware.
+const MIN_THRESHOLD = 3;
+const FALLBACK_THRESHOLD = 8; // used before calibration completes
 const NOISE_MULTIPLIER = 3.0;
 const CALIBRATION_MS = 500;
+// Analyser-only gain boost. The AnalyserNode gets `source → GainNode
+// → Analyser` so the VAD reads a louder signal for detection
+// purposes; MediaRecorder still gets the raw stream so audio quality
+// to the STT server is unchanged. 4× is enough to lift a stubbornly
+// quiet mic (peak vol 3-4 without boost) into confidently-detectable
+// range without saturating a normal mic.
+const ANALYSER_GAIN = 4.0;
 // Minimum time above threshold before we consider it "real speech".
 // Two values because the modes have different noise profiles:
 //   - active mode (mic-only, TTS silent): 250ms — a short "yes" or
@@ -230,20 +243,27 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
     lastSoundAtRef.current = null;
 
     const doneBlob = new Promise<Blob>((resolve) => {
-      const mime = mimeRef.current ?? "audio/webm";
+      // Container-only mime for the assembled blob. MediaRecorder is
+      // created with the full "audio/webm;codecs=opus" hint (Chrome
+      // needs it), but Scribe's upload parser rejects blobs whose
+      // Content-Type includes the codec suffix as "corrupted". Strip
+      // to just the container ("audio/webm" or "audio/mp4") for the
+      // final blob type so the multipart part header is clean.
+      const rawMime = mimeRef.current ?? "audio/webm";
+      const containerMime = rawMime.split(";")[0].trim() || "audio/webm";
       // Some browsers fire ondataavailable AFTER stop() completes;
       // wait for that final chunk before assembling.
       rec.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) finalChunks.push(e.data);
       };
       rec.onstop = () => {
-        resolve(new Blob(finalChunks, { type: mime }));
+        resolve(new Blob(finalChunks, { type: containerMime }));
       };
       try {
         rec.stop();
       } catch {
         // If stop throws, resolve with whatever we have.
-        resolve(new Blob(finalChunks, { type: mime }));
+        resolve(new Blob(finalChunks, { type: containerMime }));
       }
     });
 
@@ -255,7 +275,11 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
     } catch {
       return;
     }
-    console.log("[stt] blob assembled", { size: blob.size });
+    console.log("[stt] blob assembled", {
+      size: blob.size,
+      type: blob.type,
+      chunkCount: finalChunks.length,
+    });
     // Discard tiny blobs — usually a mis-fired VAD or a cough. Below
     // ~1KB of opus is well under 100ms of audio.
     if (blob.size < 1024) {
@@ -460,7 +484,17 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
       const source = ctx.createMediaStreamSource(stream);
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 1024;
-      source.connect(analyser);
+      // Insert a GainNode between source and analyser. This boosts
+      // the VAD-visible signal WITHOUT changing the audio going to
+      // MediaRecorder — the raw stream is still recorded at native
+      // gain, so Scribe transcription quality is preserved. Quiet
+      // built-in laptop mics (baseline vol 1-3, speech peak 8-15) get
+      // lifted into the 4-12 baseline / 32-60 speech-peak range that
+      // the VAD can confidently distinguish.
+      const gain = ctx.createGain();
+      gain.gain.value = ANALYSER_GAIN;
+      source.connect(gain);
+      gain.connect(analyser);
       analyserRef.current = analyser;
       // Successful open — clear any prior error so the player drops
       // the "mic not working" banner.
@@ -529,8 +563,14 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
       };
       recorderRef.current = rec;
       try {
-        // Chunked start so a mid-utterance stop still has data.
-        rec.start(250);
+        // No timeslice: MediaRecorder buffers internally and emits a
+        // single well-formed blob at stop() time. Chrome's chunked
+        // output (start(250)) can produce structurally partial webm/
+        // opus that upstream parsers (ElevenLabs Scribe) reject as
+        // "File is corrupted". The single-blob pattern is the safe
+        // path for buffered STT: one ondataavailable event, one
+        // complete, valid container.
+        rec.start();
         console.log("[stt] MediaRecorder started", { mode: modeRef.current });
       } catch (err) {
         console.warn(
@@ -557,17 +597,43 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
     speechStartedAtRef.current = null;
     lastSoundAtRef.current = null;
     hasSpokeRef.current = false;
-    // Same guard as the barge-in path: on background→active, force
-    // threshold back to the safe fallback. Any prior calibration
-    // may have sampled TTS wind-down and inflated the bar. Skipping
-    // calibration here is intentional — we can't calibrate cleanly
-    // while echo cancellation is still draining persona audio.
+    // On background→active (persona finished, now user's turn), do
+    // TWO things:
+    //   1. Force threshold back to FALLBACK. Any prior calibration
+    //      may have sampled TTS wind-down and inflated the bar.
+    //   2. Restart the MediaRecorder from scratch so the recording
+    //      contains ONLY the user's turn — not the persona-TTS bleed
+    //      that was flowing into the mic during background mode. A
+    //      recording that spans a mode change can have structurally
+    //      malformed webm/opus that upstream Scribe rejects; keeping
+    //      each recording single-phase is the safer path.
     if (prev === "background" && mode === "active") {
       adaptiveThresholdRef.current = FALLBACK_THRESHOLD;
       calibrationStartRef.current = null;
       calibrationSamplesRef.current = [];
+      // Restart the recorder in place — same stream, fresh chunks.
+      const stream = streamRef.current;
+      const mime = mimeRef.current;
+      if (stream && mime) {
+        stopRecorder(true);
+        chunksRef.current = [];
+        try {
+          const rec = new MediaRecorder(stream, { mimeType: mime });
+          rec.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
+          };
+          rec.start();
+          recorderRef.current = rec;
+          console.log("[stt] recorder restarted for active turn");
+        } catch (err) {
+          console.warn(
+            "[stt] recorder restart on mode flip failed",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
     }
-  }, []);
+  }, [stopRecorder]);
 
   // Full teardown when the hook unmounts or the feature disables.
   useEffect(() => {
