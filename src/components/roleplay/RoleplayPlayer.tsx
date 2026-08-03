@@ -878,9 +878,14 @@ export function RoleplayPlayer({
     });
   }
 
-  // Auto-disconnect when the duration cap is hit. Skips if the admin
-  // didn't opt in or the cap is already past — we don't want repeated
-  // end() calls if the user is mid-navigation.
+  // Auto-disconnect when the duration cap is hit. The max duration is
+  // treated as a HARD cap — regardless of the admin's
+  // `autoDisconnectOnLimit` toggle, when the timer runs out we end the
+  // session and route to results. Prior behavior gated on that admin
+  // toggle (defaulting off), which surprised trainees: the timer
+  // would just keep ticking past the "cap" with no closure. The
+  // natural expectation for a training session is "time's up → session
+  // ends → I see my score."
   //
   // Turn-integrity gate: never cut off a persona reply that's still
   // being generated (`streaming`) or still being spoken by TTS
@@ -891,7 +896,6 @@ export function RoleplayPlayer({
   // the session closes.
   const endedFiredRef = useRef(false);
   useEffect(() => {
-    if (!duration?.autoDisconnect) return;
     if (!sessionId || ending || endedFiredRef.current) return;
     if (!maxReached) return;
     if (streaming || voice.state === "speaking") return;
@@ -900,14 +904,7 @@ export function RoleplayPlayer({
     // end() is stable for the duration of the session; ESLint can't see
     // that, so we deliberately scope deps to the trigger inputs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    maxReached,
-    sessionId,
-    ending,
-    duration?.autoDisconnect,
-    streaming,
-    voice.state,
-  ]);
+  }, [maxReached, sessionId, ending, streaming, voice.state]);
 
   // Bump the activity ref every time a turn lands — either side counts.
   useEffect(() => {
@@ -1599,6 +1596,30 @@ export function RoleplayPlayer({
           <div>{describeSttError(voice.sttError)}</div>
         </div>
       ) : null}
+
+      {/* Time's-almost-up banner. Shown in the last 30s so the trainee
+          has visible warning that the session will auto-end at the max
+          duration. Suppressed once ending has actually started so it
+          doesn't overlap the closing state. */}
+      {duration && maxSec > 0 && !ending && !endedFiredRef.current
+        ? (() => {
+            const remaining = maxSec - elapsedSec;
+            if (remaining > 30 || remaining < 0) return null;
+            return (
+              <div className="mx-auto max-w-[520px] rounded-md border border-warn/50 bg-warn-pale text-warn px-4 py-2.5 text-[12.5px] leading-[1.5] text-center">
+                <span className="font-semibold">
+                  {remaining <= 0
+                    ? "Time's up — wrapping up now…"
+                    : `${remaining}s remaining`}
+                </span>
+                <span className="text-warn/80 ml-2">
+                  The session will end automatically and take you to your
+                  results.
+                </span>
+              </div>
+            );
+          })()
+        : null}
 
       {/* Floating call controls — mic + end-call, centered */}
       <CallControlsBar
