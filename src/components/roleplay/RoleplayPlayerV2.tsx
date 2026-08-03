@@ -1,17 +1,19 @@
-// RoleplayPlayer — three-panel client player matching prototype.css `.rp-shell`.
+// RoleplayPlayerV2 — Focus-mode redesign (Option A from the redesign
+// discussion). HeyGen-inspired professional aesthetic: single large
+// centered persona stage, subtle live-caption below avatar, floating
+// glass control pill, contextual overlays for hint / coach / countdown.
 //
-//   • Left pane: scenario context (persona + scenario + mode)
-//   • Center pane: chat transcript + composer
-//   • Right pane: rubric criteria as "what we're scoring" coach cards
+// State + effects are IDENTICAL to RoleplayPlayer (V1). Only the
+// render tree diverges. This lets us A/B via `?ui=v2` on the play
+// page without regressing V1, and swap the default once we're happy.
 //
-// Behavior unchanged from the Phase 2.3 spike:
-//   • Calls POST /api/roleplay/start on mount → renders opening turn
-//   • POST /api/roleplay/turn (streamed) on submit, appends chunks
-//   • POST /api/roleplay/end → redirects to results
-//
-// Bubble styling follows prototype.css `.bubble.bot` / `.bubble.me` —
-// surface-2 fill for persona, ink fill for learner, with one corner
-// squared off (4px) so the bubbles "point" toward the speaker.
+// Design pillars:
+//   • One focal point — the persona avatar with pulsing wave ring
+//   • Live caption below avatar in elegant type, auto-fades
+//   • Trainee indicator subtly present, no video-call symmetry
+//   • Controls in a floating glass pill at the bottom
+//   • Hint + coach tips overlay non-blockingly, never compete with
+//     the persona for attention
 
 "use client";
 
@@ -45,7 +47,7 @@ type Rubric = {
   criteria: RubricCriterion[];
 };
 
-export function RoleplayPlayer({
+export function RoleplayPlayerV2({
   moduleId,
   moduleName,
   trainingTitle = "",
@@ -1355,195 +1357,157 @@ export function RoleplayPlayer({
   const showMicListening =
     voiceMode && voice.sttSupported && voice.state === "listening";
 
+  const remainingSec =
+    duration && maxSec > 0 ? Math.max(0, maxSec - elapsedSec) : null;
+  const showCountdown =
+    duration && maxSec > 0 && !ending && !endedFiredRef.current
+      ? remainingSec !== null && remainingSec <= 30
+      : false;
+
   return (
-    <div className="space-y-4 pb-24">
-      {/* V2 opt-in — small unobtrusive pill above the header */}
-      <div className="flex justify-end">
-        <a
-          href="?ui=v2"
-          className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-accent hover:text-accent-strong underline underline-offset-2"
-        >
-          <Icon name="ai-sparkle" size={10} />
-          Try the new design
-        </a>
-      </div>
-
-      {/* Header — Role Play title + timer (left), module/scenario tags (right) */}
-      <header className="flex items-center justify-between gap-3 flex-wrap">
-        <div className="flex items-center gap-3 min-w-0">
-          <h1
-            className="font-display text-[22px] leading-none -tracking-[0.01em]"
-            style={{ color: "#5b2eea" }}
-          >
-            Role Play
-          </h1>
-          {duration ? (
-            <TimerPill
-              elapsedSec={elapsedSec}
-              maxSec={maxSec}
-              maxReached={maxReached}
-            />
-          ) : null}
-          {attemptInfo ? (
-            <span
-              className="text-[11px] font-semibold uppercase tracking-[0.08em] px-2 py-[3px] rounded-sm border bg-surface-2 text-ink-2 border-border"
-              title="Attempts used of the trainer's cap"
-            >
-              Attempt {attemptInfo.used + 1} / {attemptInfo.limit}
-            </span>
-          ) : null}
-          {recordAv ? (
-            <span
-              className={cn(
-                "inline-flex items-center gap-1 text-[10.5px] font-semibold uppercase tracking-[0.08em] px-2 py-[3px] rounded-sm border",
-                recordingStatus === "recording"
-                  ? "bg-bad-pale text-bad border-bad/20"
-                  : recordingStatus === "uploading"
-                    ? "bg-warn-pale text-warn border-warn/20"
-                    : recordingStatus === "saved"
-                      ? "bg-good-pale text-good border-good/20"
-                      : "bg-surface-2 text-ink-3 border-border",
-              )}
-              title={
-                recordingStatus === "recording"
-                  ? "Audio is being recorded — uploaded when the session ends."
-                  : recordingStatus === "uploading"
-                    ? "Uploading the recording…"
-                    : recordingStatus === "saved"
-                      ? "Recording saved to your results page."
-                      : recordingStatus === "failed"
-                        ? "Recording unavailable (mic denied or upload failed)."
-                        : "Recording…"
-              }
-            >
-              <span
-                className={cn(
-                  "inline-block w-1.5 h-1.5 rounded-full",
-                  recordingStatus === "recording"
-                    ? "bg-bad animate-pulse"
-                    : "bg-current",
-                )}
-                aria-hidden
-              />
-              REC
-            </span>
-          ) : null}
-        </div>
-        <div className="flex items-center gap-2 flex-wrap">
-          {trainingTitle ? (
-            <TopicPill icon="training" label={trainingTitle} />
-          ) : null}
-          <TopicPill icon="layers" label={moduleName} />
-        </div>
-      </header>
-
-      {/* Body — left video tiles + right Caption/Hint panels */}
+    <div className="v2-shell relative min-h-[calc(100vh-56px)] -mx-7 -mt-6 pb-32">
+      {/* Ambient background — warm dark gradient with soft accent glows */}
       <div
-        className="grid gap-4 items-start"
-        style={{ gridTemplateColumns: "360px minmax(0, 1fr)" }}
-      >
-        {/* Left column — stacked video tiles */}
-        <div className="space-y-4">
-          <VideoTile
-            label={personaRole || personaShort}
-            // Persona tile is the current speaker whenever it's mid-stream
-            // OR has a settled caption on screen. Previously this was
-            // `!streaming && …`, so the avatar visibly *deactivated*
-            // exactly when the AI was talking — the ring vanished the
-            // moment tokens started flowing back.
-            isActive={streaming || captionText.length > 0}
-            cornerAction={
-              avatarMode ? (
-                <button
-                  type="button"
-                  onClick={() => setAvatarMode(false)}
-                  suppressHydrationWarning
-                  className="px-2.5 py-[5px] rounded-md text-[10.5px] font-semibold text-white"
-                  style={{ background: "#5b2eea" }}
-                >
-                  Show Audio Only
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => setAvatarMode(true)}
-                  suppressHydrationWarning
-                  className="px-2.5 py-[5px] rounded-md text-[10.5px] font-semibold text-white"
-                  style={{ background: "#5b2eea" }}
-                >
-                  Show Video
-                </button>
-              )
-            }
-          >
-            {avatarMode ? (
-              <PersonaVideoSurface
-                attach={avatar.attach}
-                state={avatar.state}
-                error={avatar.error}
-                fallbackName={personaShort}
-              />
-            ) : (
-              <PersonaAudioSurface
-                speaking={voice.state === "speaking" || streaming}
-                name={personaShort}
-                portraitUrl={personaPortraitUrl}
-              />
-            )}
-          </VideoTile>
+        className="absolute inset-0 pointer-events-none"
+        style={{
+          background:
+            "radial-gradient(circle at 20% 15%, rgba(232,93,58,0.10) 0%, transparent 55%), radial-gradient(circle at 80% 85%, rgba(124,92,214,0.10) 0%, transparent 55%), linear-gradient(180deg, #16121a 0%, #1a1420 55%, #1e1524 100%)",
+        }}
+        aria-hidden
+      />
 
-          <VideoTile label="You" isActive={showMicListening}>
-            {userVideoOn ? (
-              <UserVideoSurface />
-            ) : (
-              <UserAvatarSurface
-                listening={showMicListening}
-                name="You"
+      <div className="relative">
+        {/* ── Top ribbon: breadcrumb (L) / mode chip (C) / timer + REC (R) ── */}
+        <header className="px-7 pt-5 pb-3 flex items-center justify-between gap-4 text-white">
+          <div className="flex items-center gap-3 min-w-0">
+            <button
+              type="button"
+              onClick={handleEndClick}
+              suppressHydrationWarning
+              className="inline-flex items-center gap-1 text-[12px] text-white/60 hover:text-white transition-colors"
+            >
+              <Icon name="chevron-right" size={14} className="rotate-180" />
+              Exit
+            </button>
+            <div className="hidden md:block h-4 w-px bg-white/15" />
+            <div className="min-w-0">
+              <div className="text-[10.5px] font-bold uppercase tracking-[0.14em] text-white/50">
+                {trainingTitle || "Roleplay"}
+              </div>
+              <div className="text-[13.5px] font-semibold truncate max-w-[420px]">
+                {moduleName}
+              </div>
+            </div>
+          </div>
+
+          <div className="hidden md:flex items-center gap-2">
+            <span
+              className="inline-flex items-center gap-1.5 text-[10.5px] font-bold uppercase tracking-[0.12em] text-white/70 bg-white/[0.06] border border-white/10 rounded-full px-3 py-[5px]"
+            >
+              <Icon name="mic" size={10} />
+              {mode === "video" ? "Video" : mode === "voice" ? "Audio" : "Text"}
+            </span>
+            {attemptInfo ? (
+              <span className="text-[10.5px] font-mono text-white/60 bg-white/[0.06] border border-white/10 rounded-full px-3 py-[5px]">
+                Attempt {attemptInfo.used + 1}/{attemptInfo.limit}
+              </span>
+            ) : null}
+          </div>
+
+          <div className="flex items-center gap-3">
+            {recordAv ? (
+              <span
+                className="inline-flex items-center gap-1.5 text-[10.5px] font-bold uppercase tracking-[0.12em] text-white/80"
+                title={
+                  recordingStatus === "recording"
+                    ? "Audio is being recorded — uploaded when the session ends."
+                    : recordingStatus === "uploading"
+                      ? "Uploading the recording…"
+                      : recordingStatus === "saved"
+                        ? "Recording saved to your results page."
+                        : recordingStatus === "failed"
+                          ? "Recording unavailable."
+                          : "Recording"
+                }
+              >
+                <span
+                  className={cn(
+                    "inline-block w-1.5 h-1.5 rounded-full",
+                    recordingStatus === "recording"
+                      ? "bg-[#ff5b5b] animate-pulse"
+                      : "bg-white/40",
+                  )}
+                  aria-hidden
+                />
+                REC
+              </span>
+            ) : null}
+            {duration ? (
+              <RingTimer
+                elapsedSec={elapsedSec}
+                maxSec={maxSec}
+                maxReached={maxReached}
               />
-            )}
-          </VideoTile>
-        </div>
+            ) : null}
+          </div>
+        </header>
 
-        {/* Right column — Caption (tabs) + Hint */}
-        <div className="space-y-4">
-          <CaptionPanel
-            captionText={captionText}
-            captionThinking={captionThinking}
-            personaName={personaName}
-            personaBlurb={personaBlurb}
-            personaShort={personaShort}
-            scenario={scenario}
-            sessionWaiting={!sessionId}
-            flowStartByUser={flow?.startBy === "user"}
-          />
-
-          {hintsAllowed ? (
-            <HintPanel
-              hint={currentHint}
-              hintType={hints?.type ?? "complete"}
-              loading={hintLoading}
-              refreshing={hintRefreshing}
-              error={hintError}
-              exhausted={hintsExhausted}
-              onRequest={requestHint}
-              disabled={!sessionId || hintLoading || hintsExhausted}
-              hintsUsed={hintsUsed}
-              hintsLimit={hintsLimited ? hints!.limit : null}
+        {/* ── Center stage: persona avatar + live caption + user indicator ── */}
+        <main className="px-6 pb-10 flex flex-col items-center">
+          {/* Persona stage */}
+          <div className="mt-6 md:mt-8 flex flex-col items-center">
+            <PersonaStage
+              speaking={voice.state === "speaking" || streaming}
+              thinking={captionThinking}
+              waitingForUser={!captionThinking && !streaming && voice.state !== "speaking"}
+              portraitUrl={personaPortraitUrl}
+              name={personaShort}
+              avatarMode={avatarMode}
+              avatar={avatar}
             />
-          ) : null}
 
-          {coachHint ? (
-            <CoachInline hint={coachHint} loading={coachLoading} />
-          ) : null}
+            <div className="mt-6 text-center space-y-1">
+              <div className="font-display text-[22px] leading-tight -tracking-[0.01em] text-white">
+                {personaShort}
+              </div>
+              {personaRole ? (
+                <div className="text-[12.5px] text-white/60">
+                  {personaRole}
+                </div>
+              ) : null}
+              <StageStatePill
+                streaming={streaming}
+                captionThinking={captionThinking}
+                voiceSpeaking={voice.state === "speaking"}
+                listening={showMicListening}
+                sessionReady={!!sessionId}
+                flowStartByUser={flow?.startBy === "user"}
+              />
+            </div>
 
-          {/* Text composer — voice/avatar modes hide this in favor of the mic */}
+            {/* Live caption — persona's current spoken text */}
+            <LiveCaption text={captionText} thinking={captionThinking} />
+          </div>
+
+          {/* User indicator — small, subtle, below the persona stage */}
+          <div className="mt-8 flex flex-col items-center">
+            <UserIndicator
+              listening={showMicListening}
+              userVideoOn={userVideoOn}
+            />
+            <div className="mt-2 text-[10.5px] font-bold uppercase tracking-[0.14em] text-white/40">
+              You
+            </div>
+          </div>
+
+          {/* Text composer — only in text-only mode */}
           {!voiceMode ? (
             <form
               onSubmit={(e) => {
                 e.preventDefault();
                 void send();
               }}
-              className="rounded-[14px] border border-border bg-surface px-4 py-3 flex items-end gap-2"
+              className="mt-8 w-full max-w-[640px] rounded-2xl border border-white/10 bg-white/[0.04] backdrop-blur-md px-4 py-3 flex items-end gap-2"
             >
               <textarea
                 value={input}
@@ -1561,11 +1525,7 @@ export function RoleplayPlayer({
                 }
                 disabled={!sessionId || streaming}
                 rows={2}
-                className={cn(
-                  "flex-1 resize-none bg-surface border border-border-strong rounded-md",
-                  "px-3 py-[9px] text-[13px] focus:outline-none focus:border-accent",
-                  "disabled:opacity-60",
-                )}
+                className="flex-1 resize-none bg-transparent text-white placeholder:text-white/40 px-2 py-1 text-[13.5px] focus:outline-none disabled:opacity-60"
                 suppressHydrationWarning
               />
               <Button
@@ -1579,112 +1539,122 @@ export function RoleplayPlayer({
               </Button>
             </form>
           ) : null}
-        </div>
-      </div>
 
-      {/* Bottom inline status — turns, rubric link, AI-ends note */}
-      <div className="flex items-center justify-center gap-3 text-[11.5px] text-ink-3 font-mono">
-        <span>{turnsTaken} {turnsTaken === 1 ? "turn" : "turns"}</span>
-        {flow?.endBy === "ai" ? (
-          <span title="The persona ends this roleplay — wait for them to wrap up.">
-            · AI ends the call
-          </span>
-        ) : null}
-        <ModePill mode={mode} />
-      </div>
-
-      {error ? (
-        <div className="text-[12px] text-bad font-mono text-center">
-          {error}
-        </div>
-      ) : null}
-
-      {voiceMode && voice.sttError ? (
-        <div className="mx-auto max-w-[520px] rounded-md border border-warn/40 bg-warn-pale text-warn px-4 py-3 text-[12.5px] leading-[1.5] text-center">
-          <div className="font-semibold mb-0.5">
-            Microphone isn&rsquo;t working
-          </div>
-          <div>{describeSttError(voice.sttError)}</div>
-        </div>
-      ) : null}
-
-      {/* Time's-almost-up banner. Shown in the last 30s so the trainee
-          has visible warning that the session will auto-end at the max
-          duration. Suppressed once ending has actually started so it
-          doesn't overlap the closing state. */}
-      {duration && maxSec > 0 && !ending && !endedFiredRef.current
-        ? (() => {
-            const remaining = maxSec - elapsedSec;
-            if (remaining > 30 || remaining < 0) return null;
-            return (
-              <div className="mx-auto max-w-[520px] rounded-md border border-warn/50 bg-warn-pale text-warn px-4 py-2.5 text-[12.5px] leading-[1.5] text-center">
-                <span className="font-semibold">
-                  {remaining <= 0
-                    ? "Time's up — wrapping up now…"
-                    : `${remaining}s remaining`}
-                </span>
-                <span className="text-warn/80 ml-2">
-                  The session will end automatically and take you to your
-                  results.
-                </span>
-              </div>
-            );
-          })()
-        : null}
-
-      {/* Floating call controls — mic + end-call, centered */}
-      <CallControlsBar
-        voiceMode={voiceMode}
-        voiceState={voice.state}
-        voiceSttSupported={voice.sttSupported}
-        voiceTtsSupported={voice.ttsSupported}
-        streaming={streaming}
-        sessionReady={!!sessionId}
-        ending={ending}
-        autoFlow={autoFlow}
-        autoFlowAvailable={Boolean(hintsAllowed) && voice.ttsSupported}
-        onToggleAutoFlow={handleToggleAutoFlow}
-        onToggleVoice={() => {
-          const next = !voiceMode;
-          setVoiceMode(next);
-          if (!next) {
-            voice.cancelSpeech();
-            voice.stopListening();
-          }
-        }}
-        onStartListen={voice.startListening}
-        onStopListen={voice.stopListening}
-        onEnd={handleEndClick}
-      />
-
-      {/* Scoring rubric — collapsed under the fold, kept available */}
-      {rubric.criteria.length > 0 ? (
-        <details className="rounded-[14px] border border-border bg-surface p-4">
-          <summary className="cursor-pointer text-[11px] font-bold uppercase tracking-[0.1em] text-ink-3">
-            What we&apos;re scoring
-          </summary>
-          <div className="mt-3 space-y-2">
-            {rubric.criteria.map((c, i) => (
-              <CoachCard
-                key={c.id || c.label || i}
-                label={c.label}
-                body={c.description}
-                weight={c.weight}
-                tone={i === 0 ? "tip" : "neutral"}
-              />
-            ))}
-            {rubric.pass_score != null ? (
-              <div className="text-[12.5px] text-ink-2 pt-1">
-                Aim for{" "}
-                <span className="font-semibold text-ink">
-                  {rubric.pass_score}+
-                </span>{" "}
-                across the criteria.
-              </div>
+          {/* Turn counter — minimal, below the composer */}
+          <div className="mt-8 flex items-center justify-center gap-3 text-[11px] text-white/40 font-mono">
+            <span>
+              {turnsTaken} {turnsTaken === 1 ? "turn" : "turns"}
+            </span>
+            {flow?.endBy === "ai" ? (
+              <span title="The persona ends this roleplay — wait for them to wrap up.">
+                · AI ends the call
+              </span>
             ) : null}
           </div>
-        </details>
-      ) : null}
+
+          {/* Errors + mic errors */}
+          {error ? (
+            <div className="mt-4 text-[12px] text-[#ff8f8f] font-mono text-center">
+              {error}
+            </div>
+          ) : null}
+
+          {voiceMode && voice.sttError ? (
+            <div className="mt-4 mx-auto max-w-[520px] rounded-xl border border-[#ffb84a]/30 bg-[#3a2a1a] text-[#ffcf8a] px-4 py-3 text-[12.5px] leading-[1.5] text-center">
+              <div className="font-semibold mb-0.5">
+                Microphone isn&rsquo;t working
+              </div>
+              <div className="text-[#ffcf8a]/85">
+                {describeSttError(voice.sttError)}
+              </div>
+            </div>
+          ) : null}
+        </main>
+
+        {/* ── Contextual overlays ── */}
+
+        {/* Coach tip toast — slides down from top-center */}
+        {coachHint ? (
+          <div className="fixed top-16 left-1/2 -translate-x-1/2 z-40 pointer-events-none">
+            <div className="pointer-events-auto rounded-full bg-black/70 backdrop-blur-md border border-white/10 text-white text-[12.5px] px-4 py-2 shadow-lg max-w-[420px]">
+              <span className="inline-flex items-center gap-2">
+                <Icon
+                  name="ai-sparkle"
+                  size={11}
+                  className={
+                    coachHint.tone === "warn"
+                      ? "text-[#ffb84a]"
+                      : "text-[#7cd6a0]"
+                  }
+                />
+                <span>{coachHint.hint}</span>
+              </span>
+            </div>
+          </div>
+        ) : null}
+
+        {/* Countdown pill above the controls */}
+        {showCountdown && remainingSec != null ? (
+          <div className="fixed left-1/2 -translate-x-1/2 bottom-28 z-40 pointer-events-none">
+            <div className="rounded-full bg-[#3a2a1a] border border-[#ffb84a]/30 text-[#ffcf8a] px-4 py-1.5 text-[12px] font-semibold shadow-lg">
+              {remainingSec <= 0
+                ? "Time's up — wrapping up…"
+                : `${remainingSec}s remaining — session will end automatically`}
+            </div>
+          </div>
+        ) : null}
+
+        {/* Hint card — always visible when the admin allows hints. Uses
+             a subtle glass card so it doesn't compete with the persona
+             stage. Includes Say This / Try Another actions. */}
+        {hintsAllowed ? (
+          <div className="fixed right-6 top-24 z-30 w-[340px] max-w-[calc(100vw-3rem)] hidden lg:block">
+            <HintCardV2
+              hint={currentHint}
+              hintType={hints?.type ?? "complete"}
+              loading={hintLoading}
+              refreshing={hintRefreshing}
+              error={hintError}
+              exhausted={hintsExhausted}
+              onRequest={requestHint}
+              disabled={!sessionId || hintLoading || hintsExhausted}
+              hintsUsed={hintsUsed}
+              hintsLimit={hintsLimited ? hints!.limit : null}
+            />
+          </div>
+        ) : null}
+
+        {/* ── Floating glass control pill (bottom center) ── */}
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50">
+          <ControlPill
+            voiceMode={voiceMode}
+            voiceState={voice.state}
+            voiceSttSupported={voice.sttSupported}
+            voiceTtsSupported={voice.ttsSupported}
+            streaming={streaming}
+            sessionReady={!!sessionId}
+            ending={ending}
+            autoFlow={autoFlow}
+            autoFlowAvailable={Boolean(hintsAllowed) && voice.ttsSupported}
+            onToggleAutoFlow={handleToggleAutoFlow}
+            onToggleVoice={() => {
+              const next = !voiceMode;
+              setVoiceMode(next);
+              if (!next) {
+                voice.cancelSpeech();
+                voice.stopListening();
+              }
+            }}
+            onStartListen={voice.startListening}
+            onStopListen={voice.stopListening}
+            onEnd={handleEndClick}
+            onOpenHint={hintsAllowed ? requestHint : undefined}
+            hintDisabled={
+              !hintsAllowed || !sessionId || hintLoading || hintsExhausted
+            }
+          />
+        </div>
+      </div>
     </div>
   );
 }
@@ -2910,4 +2880,511 @@ function describeSttError(err: SttError): string {
     default:
       return "We couldn't open your microphone. Reload the page and try again — or type your reply below.";
   }
+}
+
+// ───────────────────────────────────────────────────────────────
+// V2 UI COMPONENTS
+// New primitives for the focus-mode layout. Kept in-file so V2 is
+// self-contained; if we promote V2 to default we can split into
+// their own files.
+// ───────────────────────────────────────────────────────────────
+
+/** Circular ring timer — thin, elegant, with a small dot indicator. */
+function RingTimer({
+  elapsedSec,
+  maxSec,
+  maxReached,
+}: {
+  elapsedSec: number;
+  maxSec: number;
+  maxReached: boolean;
+}) {
+  const size = 44;
+  const r = 18;
+  const c = 2 * Math.PI * r;
+  const pct = maxSec > 0 ? Math.min(1, elapsedSec / maxSec) : 0;
+  const dashOffset = c * (1 - pct);
+  const stroke = maxReached ? "#ff5b5b" : "#e85d3a";
+  return (
+    <div className="relative" style={{ width: size, height: size }}>
+      <svg width={size} height={size} className="rotate-[-90deg]">
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={r}
+          fill="none"
+          stroke="rgba(255,255,255,0.10)"
+          strokeWidth={3}
+        />
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={r}
+          fill="none"
+          stroke={stroke}
+          strokeWidth={3}
+          strokeLinecap="round"
+          strokeDasharray={c}
+          strokeDashoffset={dashOffset}
+          style={{ transition: "stroke-dashoffset 0.5s linear" }}
+        />
+      </svg>
+      <div className="absolute inset-0 grid place-items-center text-[10px] font-mono font-bold text-white">
+        {fmtMmSs(elapsedSec)}
+      </div>
+    </div>
+  );
+}
+
+/** The centerpiece — persona avatar with speaking wave rings. */
+function PersonaStage({
+  speaking,
+  thinking,
+  waitingForUser,
+  portraitUrl,
+  name,
+  avatarMode,
+  avatar,
+}: {
+  speaking: boolean;
+  thinking: boolean;
+  waitingForUser: boolean;
+  portraitUrl: string | null;
+  name: string;
+  avatarMode: boolean;
+  avatar: ReturnType<typeof useStreamingAvatar>;
+}) {
+  const size = 172;
+  return (
+    <div className="relative" style={{ width: size + 60, height: size + 60 }}>
+      {/* Outer pulse ring — only when speaking */}
+      <div
+        className={cn(
+          "absolute inset-0 rounded-full transition-opacity duration-300",
+          speaking ? "opacity-100" : "opacity-0",
+        )}
+        aria-hidden
+      >
+        <div
+          className="absolute inset-0 rounded-full animate-ping"
+          style={{
+            background:
+              "radial-gradient(circle, rgba(232,93,58,0.35) 0%, rgba(232,93,58,0) 60%)",
+          }}
+        />
+      </div>
+      {/* Static glow ring — subtle presence */}
+      <div
+        className="absolute inset-0 rounded-full"
+        style={{
+          background:
+            "radial-gradient(circle, rgba(232,93,58,0.10) 0%, transparent 65%)",
+        }}
+        aria-hidden
+      />
+      {/* Avatar card — glass, elevated */}
+      <div
+        className="absolute inset-[30px] rounded-full overflow-hidden border-2 shadow-2xl"
+        style={{
+          borderColor: speaking
+            ? "rgba(232,93,58,0.65)"
+            : waitingForUser
+              ? "rgba(255,255,255,0.20)"
+              : "rgba(255,255,255,0.12)",
+          transition: "border-color 300ms ease",
+          boxShadow: speaking
+            ? "0 0 60px rgba(232,93,58,0.35), 0 20px 60px rgba(0,0,0,0.4)"
+            : "0 20px 60px rgba(0,0,0,0.4)",
+        }}
+      >
+        {avatarMode &&
+        (avatar.state === "ready" || avatar.state === "speaking") ? (
+          <video
+            ref={avatar.attach}
+            autoPlay
+            playsInline
+            className="w-full h-full object-cover bg-black"
+            aria-label="Streaming avatar"
+          />
+        ) : portraitUrl ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={portraitUrl}
+            alt={name}
+            className="w-full h-full object-cover"
+          />
+        ) : (
+          <div
+            className="w-full h-full grid place-items-center font-display text-[64px] text-white"
+            style={{
+              background:
+                "linear-gradient(135deg, #7c5cd6 0%, #b94e8d 55%, #e85d3a 100%)",
+            }}
+          >
+            {(name.match(/[A-Z]/g) ?? [name[0]?.toUpperCase() ?? "?"])
+              .slice(0, 2)
+              .join("")}
+          </div>
+        )}
+      </div>
+      {/* Thinking dots */}
+      {thinking ? (
+        <div className="absolute -bottom-1 left-1/2 -translate-x-1/2 flex items-center gap-1">
+          {[0, 150, 300].map((delay) => (
+            <span
+              key={delay}
+              className="w-1.5 h-1.5 rounded-full bg-white/60 animate-pulse"
+              style={{ animationDelay: `${delay}ms` }}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function StageStatePill({
+  streaming,
+  captionThinking,
+  voiceSpeaking,
+  listening,
+  sessionReady,
+  flowStartByUser,
+}: {
+  streaming: boolean;
+  captionThinking: boolean;
+  voiceSpeaking: boolean;
+  listening: boolean;
+  sessionReady: boolean;
+  flowStartByUser: boolean;
+}) {
+  let label: string;
+  let color: string;
+  if (!sessionReady) {
+    label = flowStartByUser ? "Your turn to open" : "Connecting…";
+    color = "text-white/40";
+  } else if (streaming || captionThinking) {
+    label = "Thinking";
+    color = "text-white/60";
+  } else if (voiceSpeaking) {
+    label = "Speaking";
+    color = "text-[#e85d3a]";
+  } else if (listening) {
+    label = "Listening — go ahead";
+    color = "text-[#7cd6a0]";
+  } else {
+    label = "Your turn";
+    color = "text-white/50";
+  }
+  return (
+    <div
+      className={cn(
+        "mt-1 text-[11px] font-bold uppercase tracking-[0.14em]",
+        color,
+      )}
+    >
+      · {label} ·
+    </div>
+  );
+}
+
+function LiveCaption({
+  text,
+  thinking,
+}: {
+  text: string;
+  thinking: boolean;
+}) {
+  if (thinking) {
+    return (
+      <div className="mt-8 text-white/45 text-[15px] italic text-center max-w-[720px] px-6">
+        …
+      </div>
+    );
+  }
+  if (!text) return null;
+  return (
+    <div className="mt-8 max-w-[720px] px-6 text-center">
+      <p className="font-display text-[19px] leading-[1.5] text-white/85 -tracking-[0.005em]">
+        &ldquo;{text}&rdquo;
+      </p>
+    </div>
+  );
+}
+
+function UserIndicator({
+  listening,
+  userVideoOn,
+}: {
+  listening: boolean;
+  userVideoOn: boolean;
+}) {
+  const size = 64;
+  return (
+    <div className="relative" style={{ width: size + 20, height: size + 20 }}>
+      {listening ? (
+        <div className="absolute inset-0 rounded-full animate-ping"
+          style={{
+            background:
+              "radial-gradient(circle, rgba(124,214,160,0.30) 0%, transparent 60%)",
+          }}
+          aria-hidden
+        />
+      ) : null}
+      <div
+        className="absolute inset-[10px] rounded-full grid place-items-center border-2 overflow-hidden"
+        style={{
+          borderColor: listening
+            ? "rgba(124,214,160,0.60)"
+            : "rgba(255,255,255,0.15)",
+          background: listening
+            ? "linear-gradient(135deg, rgba(124,214,160,0.15), rgba(232,93,58,0.10))"
+            : "rgba(255,255,255,0.04)",
+        }}
+      >
+        {userVideoOn ? (
+          <div className="text-white/40 text-[10px]">(camera)</div>
+        ) : (
+          <Icon
+            name={listening ? "mic" : "users"}
+            size={20}
+            className={listening ? "text-[#a8f0c8]" : "text-white/40"}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Hint card — persistent, non-blocking, top-right of the stage. */
+function HintCardV2({
+  hint,
+  hintType,
+  loading,
+  refreshing,
+  error,
+  exhausted,
+  onRequest,
+  disabled,
+  hintsUsed,
+  hintsLimit,
+}: {
+  hint: string | null;
+  hintType: "complete" | "bullet";
+  loading: boolean;
+  refreshing: boolean;
+  error: string | null;
+  exhausted: boolean;
+  onRequest: () => void;
+  disabled: boolean;
+  hintsUsed: number;
+  hintsLimit: number | null;
+}) {
+  return (
+    <div className="rounded-2xl border border-white/10 bg-white/[0.05] backdrop-blur-xl shadow-xl overflow-hidden">
+      <div className="flex items-center justify-between px-4 py-2.5 border-b border-white/10">
+        <div className="flex items-center gap-2 text-[10.5px] font-bold uppercase tracking-[0.14em] text-white/70">
+          <Icon name="ai-sparkle" size={11} className="text-[#e85d3a]" />
+          Say this
+        </div>
+        <div className="text-[10.5px] font-mono text-white/40">
+          {hintsLimit != null ? `${hintsUsed}/${hintsLimit}` : `${hintsUsed}`}
+        </div>
+      </div>
+      <div className="px-4 py-3 min-h-[80px]">
+        {loading && !hint ? (
+          <div className="text-[12.5px] text-white/50 italic">
+            Thinking of a hint…
+          </div>
+        ) : hint ? (
+          <div
+            className={cn(
+              "text-[13px] leading-[1.55] text-white/90 transition-opacity",
+              refreshing ? "opacity-50" : "opacity-100",
+              hintType === "bullet" ? "whitespace-pre-wrap" : "",
+            )}
+          >
+            {hint}
+          </div>
+        ) : error ? (
+          <div className="text-[12.5px] text-[#ffb84a]">{error}</div>
+        ) : (
+          <div className="text-[12.5px] text-white/50 italic">
+            Tap &ldquo;Suggest&rdquo; if you get stuck — you&rsquo;ll get a
+            line to read aloud.
+          </div>
+        )}
+      </div>
+      <div className="px-4 py-2.5 border-t border-white/10 flex items-center gap-2">
+        <button
+          type="button"
+          onClick={onRequest}
+          disabled={disabled}
+          suppressHydrationWarning
+          className={cn(
+            "inline-flex items-center gap-1 text-[11.5px] font-semibold px-3 py-1.5 rounded-full transition-colors",
+            "bg-white/10 text-white hover:bg-white/20 disabled:opacity-40 disabled:cursor-not-allowed",
+          )}
+        >
+          <Icon name="ai-sparkle" size={10} />
+          {hint ? "Try another" : "Suggest"}
+        </button>
+        {exhausted ? (
+          <span className="text-[10.5px] font-mono text-white/40">
+            Limit reached
+          </span>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+/** Floating glass control pill — bottom center. */
+function ControlPill({
+  voiceMode,
+  voiceState,
+  voiceSttSupported,
+  voiceTtsSupported,
+  streaming,
+  sessionReady,
+  ending,
+  autoFlow,
+  autoFlowAvailable,
+  onToggleAutoFlow,
+  onToggleVoice,
+  onStartListen,
+  onStopListen,
+  onEnd,
+  onOpenHint,
+  hintDisabled,
+}: {
+  voiceMode: boolean;
+  voiceState: "idle" | "listening" | "speaking";
+  voiceSttSupported: boolean;
+  voiceTtsSupported: boolean;
+  streaming: boolean;
+  sessionReady: boolean;
+  ending: boolean;
+  autoFlow: boolean;
+  autoFlowAvailable: boolean;
+  onToggleAutoFlow: () => void;
+  onToggleVoice: () => void;
+  onStartListen: () => void;
+  onStopListen: () => void;
+  onEnd: () => void;
+  onOpenHint?: () => void;
+  hintDisabled: boolean;
+}) {
+  const listening = voiceMode && voiceState === "listening";
+  const voiceAvailable = voiceSttSupported || voiceTtsSupported;
+  function handleMicClick() {
+    if (!voiceMode) {
+      onToggleVoice();
+      return;
+    }
+    if (listening) {
+      onStopListen();
+    } else {
+      onStartListen();
+    }
+  }
+  return (
+    <div className="rounded-full bg-black/60 backdrop-blur-2xl border border-white/10 shadow-2xl px-3 py-2 flex items-center gap-2">
+      {onOpenHint ? (
+        <button
+          type="button"
+          onClick={onOpenHint}
+          disabled={hintDisabled}
+          suppressHydrationWarning
+          aria-label="Get a hint"
+          title="Get a hint"
+          className={cn(
+            "w-11 h-11 rounded-full grid place-items-center text-white/80 hover:text-white transition-colors",
+            "bg-white/[0.06] hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed",
+          )}
+        >
+          <Icon name="ai-sparkle" size={15} />
+        </button>
+      ) : null}
+      {autoFlowAvailable ? (
+        <button
+          type="button"
+          onClick={onToggleAutoFlow}
+          disabled={!sessionReady || streaming || ending}
+          suppressHydrationWarning
+          aria-label={autoFlow ? "Turn off Auto-flow" : "Turn on Auto-flow"}
+          title={autoFlow ? "Auto-flow: On" : "Auto-flow: Off"}
+          className={cn(
+            "px-3.5 h-11 rounded-full grid place-items-center text-[11.5px] font-semibold transition-colors",
+            autoFlow
+              ? "bg-[#e85d3a] text-white"
+              : "bg-white/[0.06] text-white/80 hover:bg-white/10",
+            "disabled:opacity-40 disabled:cursor-not-allowed",
+          )}
+        >
+          Auto-flow
+        </button>
+      ) : null}
+
+      {/* Central mic — the star */}
+      <button
+        type="button"
+        onClick={handleMicClick}
+        disabled={!voiceAvailable || autoFlow}
+        suppressHydrationWarning
+        aria-label={listening ? "Mute mic" : "Unmute mic"}
+        title={listening ? "Click to stop" : "Click to talk"}
+        className={cn(
+          "relative w-14 h-14 rounded-full grid place-items-center text-white transition-all shadow-lg",
+          "hover:scale-[1.03] disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:scale-100",
+        )}
+        style={{
+          background: listening
+            ? "linear-gradient(135deg, #ff6b57, #c5392f)"
+            : voiceMode
+              ? "linear-gradient(135deg, #7c5cd6, #5b2eea)"
+              : "rgba(255,255,255,0.10)",
+          boxShadow: listening
+            ? "0 0 24px rgba(255,107,87,0.55), 0 8px 20px rgba(0,0,0,0.4)"
+            : voiceMode
+              ? "0 0 20px rgba(124,92,214,0.4), 0 8px 20px rgba(0,0,0,0.4)"
+              : "0 8px 20px rgba(0,0,0,0.4)",
+        }}
+      >
+        <Icon name="mic" size={20} />
+        {listening ? (
+          <span
+            className="absolute inset-0 rounded-full animate-ping pointer-events-none"
+            style={{ background: "rgba(255,107,87,0.35)" }}
+            aria-hidden
+          />
+        ) : null}
+      </button>
+
+      {/* End call */}
+      <button
+        type="button"
+        onClick={onEnd}
+        disabled={!sessionReady || ending}
+        suppressHydrationWarning
+        aria-label="End call"
+        title="End the roleplay"
+        className={cn(
+          "w-11 h-11 rounded-full grid place-items-center text-white transition-colors shadow-md",
+          "disabled:opacity-40 disabled:cursor-not-allowed",
+        )}
+        style={{ background: "linear-gradient(135deg, #ff5b5b, #c5392f)" }}
+      >
+        <svg
+          width={16}
+          height={16}
+          viewBox="0 0 24 24"
+          fill="currentColor"
+          aria-hidden
+        >
+          <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.79 19.79 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2.03z" />
+        </svg>
+      </button>
+    </div>
+  );
 }

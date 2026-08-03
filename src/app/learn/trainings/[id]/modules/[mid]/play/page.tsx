@@ -10,6 +10,7 @@ import { getSessionUser } from "@/lib/auth/session";
 import { loadModuleForUser } from "@/lib/ai/roleplay-access";
 import { prisma } from "@/lib/db/client";
 import { RoleplayPlayer } from "@/components/roleplay/RoleplayPlayer";
+import { RoleplayPlayerV2 } from "@/components/roleplay/RoleplayPlayerV2";
 import { Button } from "@/components/ui/Button";
 import {
   parseAdditionalSettings,
@@ -36,10 +37,15 @@ export default async function PlayPage({
   searchParams,
 }: {
   params: Promise<{ id: string; mid: string }>;
-  searchParams: Promise<{ lang?: string; mode?: string }>;
+  searchParams: Promise<{ lang?: string; mode?: string; ui?: string }>;
 }) {
   const { id, mid } = await params;
-  const { lang: langParam, mode: modeParam } = await searchParams;
+  const {
+    lang: langParam,
+    mode: modeParam,
+    ui: uiParam,
+  } = await searchParams;
+  const useV2 = uiParam === "v2";
   const user = await getSessionUser();
   if (!user || user.role !== "trainee") notFound();
 
@@ -169,9 +175,18 @@ export default async function PlayPage({
       ? (personaBodyForVoice.persona.elevenLabsVoiceId as string)
       : null;
 
+  const Player = useV2 ? RoleplayPlayerV2 : RoleplayPlayer;
+
+  // V2's shell paints its own dark background edge-to-edge, so we skip
+  // the light-mode padding wrapper the legacy player relies on. V1 uses
+  // the original padded frame.
+  const wrapperClass = useV2
+    ? ""
+    : "px-7 pt-5 pb-8 max-w-[1280px] mx-auto";
+
   return (
-    <div className="px-7 pt-5 pb-8 max-w-[1280px] mx-auto">
-      <RoleplayPlayer
+    <div className={wrapperClass}>
+      <Player
         moduleId={mod.id}
         moduleName={mod.name}
         trainingTitle={mod.training?.title ?? ""}
