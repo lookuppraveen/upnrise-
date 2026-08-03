@@ -32,7 +32,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useElevenLabsTTS } from "./useElevenLabsTTS";
-import { useElevenLabsSTT } from "./useElevenLabsSTT";
+import { useElevenLabsSTT, type SttError } from "./useElevenLabsSTT";
+
+export type { SttError };
 
 // Threshold of silence after the user has spoken before we commit
 // the transcript. Long enough to survive a "uhh… let me think" pause,
@@ -135,6 +137,10 @@ export function useVoiceMode(opts: {
   /** Voices the browser exposes for the current lang family, ranked
    *  by quality. UI can render a dropdown directly from this list. */
   availableVoices: VoiceOption[];
+  /** Last mic-open failure. `null` when the mic is healthy or hasn't
+   *  been tried. Consumers render this to explain why speech isn't
+   *  being captured (denied permission, no device, etc.). */
+  sttError: SttError | null;
 } {
   const {
     enabled,
@@ -509,6 +515,13 @@ export function useVoiceMode(opts: {
         if ((opts?.mode ?? "active") === "active") {
           window.speechSynthesis?.cancel();
         }
+        // Optimistically flip to "listening" so the UI doesn't lag by
+        // a frame. If the mic fails to open (denied / no device / in
+        // use), the effect below that mirrors elevenLabsStt.state
+        // pulls us back to "idle" and the hook exposes `sttError` so
+        // the player can render a real message. Prior behavior was
+        // fire-and-forget with no recovery — the UI stayed "listening"
+        // forever while nothing was captured.
         void elevenLabsStt.startListening({ mode: opts?.mode });
         setState((s) => (s === "speaking" ? s : "listening"));
         return;
@@ -594,6 +607,19 @@ export function useVoiceMode(opts: {
   const combinedSttSupported =
     (useElevenLabsSttPath && elevenLabsStt.supported) || sttSupported;
 
+  // If the STT hook reports a real mic-open error (getUserMedia denied,
+  // no device, in use), reconcile our own state so the UI mic indicator
+  // doesn't lie about being "listening". Only fires on an actual error —
+  // NOT on a plain idle state, because idle is also the STT hook's
+  // steady state before startListening resolves. Watching state=idle
+  // here caused a race that dragged us back to idle before the async
+  // MediaRecorder startup finished.
+  useEffect(() => {
+    if (!useElevenLabsSttPath) return;
+    if (elevenLabsStt.error === null) return;
+    setState((s) => (s === "listening" ? "idle" : s));
+  }, [useElevenLabsSttPath, elevenLabsStt.error]);
+
   return {
     state,
     ttsSupported,
@@ -605,6 +631,7 @@ export function useVoiceMode(opts: {
     cancelSpeech,
     selectedVoiceUri,
     availableVoices,
+    sttError: useElevenLabsSttPath ? elevenLabsStt.error : null,
   };
 }
 

@@ -39,9 +39,20 @@ const MIN_THRESHOLD = 15;
 const FALLBACK_THRESHOLD = 20; // used before calibration completes
 const NOISE_MULTIPLIER = 3.0;
 const CALIBRATION_MS = 500;
-// Minimum time above threshold before we consider it "real speech"
-// (not a cough / mic bump). Avoids sending 100ms of noise to Scribe.
-const MIN_SPEECH_MS = 250;
+// Minimum time above threshold before we consider it "real speech".
+// Two values because the modes have different noise profiles:
+//   - active mode (mic-only, TTS silent): 250ms — a short "yes" or
+//     "hi" still triggers, coughs don't.
+//   - background mode (mic open DURING persona TTS): 800ms — this is
+//     the false-barge-in filter. Persona voice bleeding into the mic
+//     on speakers/laptop mics can sustain 400-600ms bursts as phrases
+//     land. A real interruption from the trainee easily crosses 800ms
+//     because they're speaking their own full sentence, not just a
+//     word-echo. Prior 500ms let too much bleed through, which then
+//     cascaded into the "calibrate-during-wind-down → threshold-too-
+//     high → stuck mic" pathology.
+const MIN_SPEECH_MS_ACTIVE = 250;
+const MIN_SPEECH_MS_BACKGROUND = 800;
 // How often the VAD polls the analyser. 100ms is a good balance of
 // responsiveness and CPU cost.
 const VAD_TICK_MS = 100;
@@ -79,10 +90,21 @@ type Options = {
   onInterruption?: () => void;
 };
 
+export type SttError =
+  | "permission_denied"
+  | "no_device"
+  | "in_use"
+  | "unsupported"
+  | "unknown";
+
 export type UseElevenLabsSTTResult = {
   /** MediaRecorder + getUserMedia both available on this browser. */
   supported: boolean;
   state: "idle" | "listening";
+  /** Last mic-open error. `null` when mic is healthy or hasn't been
+   *  tried yet. Consumers (useVoiceMode / RoleplayPlayer) render this
+   *  as a user-facing message so a denied mic isn't invisible. */
+  error: SttError | null;
   /** Attempt to open the mic (prompts for permission on first call). */
   startListening: (opts?: { mode?: ListeningMode }) => Promise<void>;
   /** Switch an already-open mic between background and active without
@@ -103,6 +125,7 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
 
   const [supported, setSupported] = useState(false);
   const [state, setState] = useState<"idle" | "listening">("idle");
+  const [error, setError] = useState<SttError | null>(null);
 
   // Live refs so the VAD tick doesn't need to be re-created on every
   // render or option change.
@@ -146,6 +169,9 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
   const calibrationStartRef = useRef<number | null>(null);
   const calibrationSamplesRef = useRef<number[]>([]);
   const adaptiveThresholdRef = useRef(FALLBACK_THRESHOLD);
+  // Throttled VAD trace — log once per second so the console isn't
+  // flooded but we can still see mode + volume + threshold health.
+  const lastTraceAtRef = useRef(0);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -194,6 +220,7 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
   // the caller's POV — onTranscript fires when the round-trip finishes.
   const commit = useCallback(async () => {
     const rec = recorderRef.current;
+    console.log("[stt] commit called", { hasRecorder: !!rec });
     if (!rec) return;
     // Grab whatever chunks land after stop().
     const finalChunks = chunksRef.current;
@@ -228,9 +255,13 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
     } catch {
       return;
     }
+    console.log("[stt] blob assembled", { size: blob.size });
     // Discard tiny blobs — usually a mis-fired VAD or a cough. Below
     // ~1KB of opus is well under 100ms of audio.
-    if (blob.size < 1024) return;
+    if (blob.size < 1024) {
+      console.log("[stt] blob too small, discarding");
+      return;
+    }
 
     try {
       const form = new FormData();
@@ -241,16 +272,19 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
       if (sessionIdRef.current) {
         form.append("sessionId", sessionIdRef.current);
       }
+      console.log("[stt] POST /api/roleplay/stt");
       const res = await fetch("/api/roleplay/stt", {
         method: "POST",
         body: form,
       });
+      console.log("[stt] POST result", res.status);
       if (!res.ok) {
         // Let the caller catch this via a session-scoped fallback.
         throw new Error(`stt_${res.status}`);
       }
       const data = (await res.json()) as { text?: string };
       const text = (data.text ?? "").trim();
+      console.log("[stt] transcribed", { textLen: text.length, textPreview: text.slice(0, 40) });
       // Silence is idle — the parent typically re-opens the mic on
       // the next turn via a fresh startListening() call.
       setState("idle");
@@ -328,21 +362,49 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
       const threshold = adaptiveThresholdRef.current;
       const isSound = vol > threshold;
 
+      // 1Hz VAD trace so we can see whether audio is even landing.
+      if (now - lastTraceAtRef.current >= 1000) {
+        lastTraceAtRef.current = now;
+        console.log("[stt-vad] tick", {
+          mode: modeRef.current,
+          vol: Math.round(vol),
+          threshold,
+          isSound,
+          hasSpoke: hasSpokeRef.current,
+        });
+      }
+
       if (modeRef.current === "background") {
-        // Interruption detection during persona TTS: any sustained
-        // sound flips us to active AND fires the callback.
+        // Interruption detection during persona TTS: sustained sound
+        // for MIN_SPEECH_MS_BACKGROUND flips us to active AND fires the
+        // callback. Longer threshold here (vs active mode) filters out
+        // persona-voice bleed from speakers/laptop mics that would
+        // otherwise falsely trigger barge-in.
         if (isSound) {
           if (speechStartedAtRef.current == null) {
             speechStartedAtRef.current = now;
-          } else if (now - speechStartedAtRef.current >= MIN_SPEECH_MS) {
+          } else if (
+            now - speechStartedAtRef.current >=
+            MIN_SPEECH_MS_BACKGROUND
+          ) {
+            console.log("[stt-vad] BARGE-IN triggered", { vol, threshold });
             modeRef.current = "active";
             onInterruptionRef.current?.();
             hasSpokeRef.current = true;
             lastSoundAtRef.current = now;
-            // Kick calibration for the newly-active mode so the silence
-            // check uses a locked-in threshold instead of the wobbly
-            // interim reading during barge-in.
-            calibrationStartRef.current = now;
+            // Do NOT recalibrate here. cancelSpeech() doesn't silence
+            // audio instantly — the wind-down keeps bleeding into the
+            // mic for a few hundred ms. Sampling that as "room noise"
+            // computes a threshold that's way above the user's real
+            // voice, and every subsequent utterance falls below it →
+            // stuck mic that captures nothing.
+            //
+            // Instead, force the threshold back to FALLBACK so the
+            // trainee's real speech is guaranteed to trigger. If the
+            // environment is genuinely noisy, they can retry via the
+            // idle→active recalibration on the next mic reopen.
+            adaptiveThresholdRef.current = FALLBACK_THRESHOLD;
+            calibrationStartRef.current = null;
             calibrationSamplesRef.current = [];
           }
         } else {
@@ -355,11 +417,13 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
       if (isSound) {
         if (speechStartedAtRef.current == null) {
           speechStartedAtRef.current = now;
+          console.log("[stt-vad] speech onset", { vol, threshold });
         } else if (
           !hasSpokeRef.current &&
-          now - speechStartedAtRef.current >= MIN_SPEECH_MS
+          now - speechStartedAtRef.current >= MIN_SPEECH_MS_ACTIVE
         ) {
           hasSpokeRef.current = true;
+          console.log("[stt-vad] speech confirmed (armed for commit)");
         }
         lastSoundAtRef.current = now;
       } else if (
@@ -368,6 +432,7 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
         now - lastSoundAtRef.current >= silenceThresholdRef.current
       ) {
         // Silence has run long enough after real speech — commit.
+        console.log("[stt-vad] silence threshold reached, committing");
         teardownVad();
         void commit();
       }
@@ -397,21 +462,57 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
       analyser.fftSize = 1024;
       source.connect(analyser);
       analyserRef.current = analyser;
+      // Successful open — clear any prior error so the player drops
+      // the "mic not working" banner.
+      setError(null);
       return true;
     } catch (err) {
+      // Classify the failure so the player can render an actionable
+      // message. Browsers use consistent DOMException names here.
+      const name =
+        err instanceof Error
+          ? (err as Error & { name?: string }).name ?? ""
+          : "";
+      let cls: SttError;
+      if (name === "NotAllowedError" || name === "SecurityError") {
+        cls = "permission_denied";
+      } else if (name === "NotFoundError" || name === "OverconstrainedError") {
+        cls = "no_device";
+      } else if (name === "NotReadableError" || name === "AbortError") {
+        cls = "in_use";
+      } else {
+        cls = "unknown";
+      }
       console.warn(
         "[stt] getUserMedia failed",
+        cls,
         err instanceof Error ? err.message : err,
       );
+      setError(cls);
       return false;
     }
   }, []);
 
   const startListening = useCallback(
     async (o?: { mode?: ListeningMode }) => {
-      if (!enabled || !supported) return;
+      console.log("[stt] startListening called", {
+        mode: o?.mode,
+        enabled,
+        supported,
+      });
+      if (!enabled || !supported) {
+        console.log("[stt] startListening early-return: not enabled/supported");
+        if (!supported) setError("unsupported");
+        return;
+      }
       const ok = await ensureMedia();
-      if (!ok) return;
+      console.log("[stt] ensureMedia result", ok);
+      if (!ok) {
+        // ensureMedia already set the classified error state. Ensure
+        // we don't leave a stale "listening" flag hanging around.
+        setState("idle");
+        return;
+      }
       const stream = streamRef.current;
       const mime = mimeRef.current;
       if (!stream || !mime) return;
@@ -430,11 +531,14 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
       try {
         // Chunked start so a mid-utterance stop still has data.
         rec.start(250);
+        console.log("[stt] MediaRecorder started", { mode: modeRef.current });
       } catch (err) {
         console.warn(
           "[stt] MediaRecorder.start failed",
           err instanceof Error ? err.message : err,
         );
+        setError("unknown");
+        setState("idle");
         recorderRef.current = null;
         return;
       }
@@ -445,12 +549,24 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
   );
 
   const setListeningMode = useCallback((mode: ListeningMode) => {
+    const prev = modeRef.current;
+    console.log("[stt] setListeningMode", { from: prev, to: mode });
     modeRef.current = mode;
     // Reset speech-onset tracking so the mode switch doesn't
     // false-commit against stale timers.
     speechStartedAtRef.current = null;
     lastSoundAtRef.current = null;
     hasSpokeRef.current = false;
+    // Same guard as the barge-in path: on background→active, force
+    // threshold back to the safe fallback. Any prior calibration
+    // may have sampled TTS wind-down and inflated the bar. Skipping
+    // calibration here is intentional — we can't calibrate cleanly
+    // while echo cancellation is still draining persona audio.
+    if (prev === "background" && mode === "active") {
+      adaptiveThresholdRef.current = FALLBACK_THRESHOLD;
+      calibrationStartRef.current = null;
+      calibrationSamplesRef.current = [];
+    }
   }, []);
 
   // Full teardown when the hook unmounts or the feature disables.
@@ -487,5 +603,12 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
     };
   }, []);
 
-  return { supported, state, startListening, setListeningMode, stopListening };
+  return {
+    supported,
+    state,
+    error,
+    startListening,
+    setListeningMode,
+    stopListening,
+  };
 }

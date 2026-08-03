@@ -20,7 +20,7 @@ import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/Button";
 import { Icon } from "@/components/ui/Icon";
 import { cn } from "@/lib/cn";
-import { useVoiceMode } from "@/hooks/useVoiceMode";
+import { useVoiceMode, type SttError } from "@/hooks/useVoiceMode";
 import { useStreamingAvatar } from "@/hooks/useStreamingAvatar";
 import {
   MODE_DESCRIPTIONS,
@@ -238,13 +238,13 @@ export function RoleplayPlayer({
     // on the right row + counts toward the per-session cap. Null until
     // /api/roleplay/start returns; before then no TTS fires anyway.
     sessionId,
-    // 1000ms of silence → commit. Tuned down from 2000ms because the
-    // longer window made every turn feel dead — trainees stopped
-    // speaking and stared at nothing for a full two seconds before
-    // the AI reacted. A one-second gap is still long enough to
-    // tolerate brief "uhh…" pauses while feeling like a real
-    // conversation.
-    silenceThresholdMs: 1000,
+    // 1500ms of silence → commit. Prior 1000ms cut trainees off
+    // mid-sentence on natural thinking pauses ("um… let me…").
+    // 1500ms matches how consumer voice bots (ChatGPT Voice, Grok
+    // Voice) tune this — tolerates real pauses without feeling dead.
+    // Trade-off: 500ms extra latency on clean turn-ends is worth
+    // never cutting off the trainee.
+    silenceThresholdMs: 1500,
     onTranscript: (text) => {
       // The hook calls this when STT commits a chunk (silence timer or
       // final result). Stick it straight into the composer and
@@ -333,6 +333,19 @@ export function RoleplayPlayer({
   // Pause the auto-listen loop while ending so we don't trigger a mic
   // session after the player has already navigated away.
   const stoppingRef = useRef(false);
+
+  // Serialize every avatar.speak() call — pushIncrementalSpeak fires
+  // per completed sentence as chunks stream in, and some driver
+  // implementations aren't queue-safe (calls can interleave, causing
+  // two voices at once). We chain each speak onto the tail of a
+  // per-render promise so sentence N always finishes before N+1
+  // begins. Reset per bubble so a fresh persona reply starts clean.
+  const avatarSpeakChainRef = useRef<Promise<void>>(Promise.resolve());
+  // Global "something is currently vocalizing" guard. Prevents the
+  // post-stream voice-loop effect from firing voice.speak() while
+  // incremental sentences are still being spoken by the avatar path
+  // (double-speak race). Cleared when the chain drains.
+  const isSpeakingRef = useRef(false);
 
   useEffect(() => {
     if (startedRef.current) return;
@@ -440,7 +453,17 @@ export function RoleplayPlayer({
     if (sentences.length === 0) return;
     const consumed = sentences.reduce((sum, s) => sum + s.length, 0);
     incrementalSpokenLenRef.current.set(bubbleIdx, offset + consumed);
-    for (const s of sentences) void av.speak(s);
+    // Chain onto the running speech tail so sentence N always
+    // completes before N+1 begins. Some avatar drivers accept parallel
+    // speak() calls and interleave them, producing two voices at once.
+    for (const s of sentences) {
+      isSpeakingRef.current = true;
+      avatarSpeakChainRef.current = avatarSpeakChainRef.current
+        .then(() => av.speak(s))
+        .catch(() => {
+          /* single-sentence errors don't break the chain */
+        });
+    }
   }
 
   // End-of-stream flush. Sends any final un-terminated text (e.g. the
@@ -452,7 +475,19 @@ export function RoleplayPlayer({
     const av = avatarRef.current;
     const offset = incrementalSpokenLenRef.current.get(bubbleIdx) ?? 0;
     const remainder = streamingContentRef.current.slice(offset).trim();
-    if (remainder) void av.speak(remainder);
+    if (remainder) {
+      isSpeakingRef.current = true;
+      avatarSpeakChainRef.current = avatarSpeakChainRef.current
+        .then(() => av.speak(remainder))
+        .catch(() => {
+          /* ignore */
+        });
+    }
+    // When the whole chain has drained, drop the "speaking in flight"
+    // flag so the post-stream mic-reopen loop can proceed.
+    avatarSpeakChainRef.current = avatarSpeakChainRef.current.finally(() => {
+      isSpeakingRef.current = false;
+    });
     spokenIdxRef.current.add(bubbleIdx);
   }
 
@@ -557,30 +592,61 @@ export function RoleplayPlayer({
       // If the streaming avatar is connected, push text to HeyGen so
       // the avatar speaks it (and we don't double-up with browser TTS).
       // Otherwise fall back to the browser SpeechSynthesis.
+      //
+      // Turn-integrity guard: if incremental sentences from mid-stream
+      // are still draining through avatarSpeakChainRef, wait for them
+      // to complete before firing any additional speak. Prevents the
+      // classic "two voices at once" race where mid-stream chunks and
+      // the post-stream fallback both hit the audio device.
       const av = avatarRef.current;
+      // Hard cap on any single TTS pass. 12s covers even a very long
+      // persona reply on a slow network; past that, we assume the
+      // upstream is stuck and hand the mic back so the trainee
+      // isn't frozen waiting for a dead audio stream.
+      const TTS_TIMEOUT_MS = 12_000;
       if (av.state === "ready" || av.state === "speaking") {
-        // Sentence-by-sentence so D-ID can start the first one before
-        // the rest are even queued. Mid-stream chunks are already
-        // flushed by pushIncrementalSpeak; this branch only fires for
-        // non-streamed bubbles (the opening, or replays after errors).
+        // Wait for any in-flight incremental sentences to drain first.
+        await withTimeout(avatarSpeakChainRef.current, TTS_TIMEOUT_MS).catch(
+          () => {},
+        );
         const sentences = splitCompleteSentences(last.content);
-        if (sentences.length === 0) {
-          await av.speak(last.content);
-        } else {
-          for (const s of sentences) await av.speak(s);
-          const consumed = sentences.reduce((sum, s) => sum + s.length, 0);
-          const tail = last.content.slice(consumed).trim();
-          if (tail) await av.speak(tail);
+        isSpeakingRef.current = true;
+        try {
+          if (sentences.length === 0) {
+            await withTimeout(av.speak(last.content), TTS_TIMEOUT_MS);
+          } else {
+            for (const s of sentences) {
+              await withTimeout(av.speak(s), TTS_TIMEOUT_MS);
+            }
+            const consumed = sentences.reduce((sum, s) => sum + s.length, 0);
+            const tail = last.content.slice(consumed).trim();
+            if (tail) await withTimeout(av.speak(tail), TTS_TIMEOUT_MS);
+          }
+        } finally {
+          isSpeakingRef.current = false;
         }
       } else {
-        await voice.speak(last.content);
+        await withTimeout(avatarSpeakChainRef.current, TTS_TIMEOUT_MS).catch(
+          () => {},
+        );
+        isSpeakingRef.current = true;
+        try {
+          await withTimeout(voice.speak(last.content), TTS_TIMEOUT_MS);
+        } finally {
+          isSpeakingRef.current = false;
+        }
       }
 
-      // Short turn-gap before the user's mic opens. 700ms felt like a
-      // walkie-talkie — after every persona line the trainee waited
-      // most of a second before they could reply. 150ms is enough to
-      // separate the two speakers without stalling the exchange.
-      await new Promise((r) => setTimeout(r, 150));
+      // Turn-gap before the user's mic opens. 300ms serves two
+      // purposes: (1) natural pause between speakers so the exchange
+      // feels human, not walkie-talkie, (2) audio drain for the
+      // browser's echo canceller — persona TTS wind-down keeps
+      // bleeding into the mic for ~200ms after `end`, and if we open
+      // the mic during that window the leaked audio gets sampled as
+      // ambient sound. 300ms is enough to clear it without stalling
+      // the exchange. Anything under ~200ms triggered the "stuck mic
+      // because threshold locked in during bleed" pathology.
+      await new Promise((r) => setTimeout(r, 300));
       if (stoppingRef.current) return;
 
       // Branch: auto-flow takes over the trainee's turn; manual mode
@@ -605,6 +671,23 @@ export function RoleplayPlayer({
         } else {
           voice.startListening({ mode: "active" });
         }
+
+        // Watchdog: verify the mic actually opened. setListeningMode()
+        // is a no-op if the underlying MediaRecorder died; startListening
+        // can silently fail if getUserMedia raced with a track cleanup.
+        // Either way, if state hasn't flipped to "listening" within
+        // 1.5s, force a fresh startListening as a recovery. Without
+        // this the trainee stares at a dead mic forever.
+        setTimeout(() => {
+          if (stoppingRef.current || streaming) return;
+          if (voiceStateRef.current === "listening") return;
+          if (voice.sttError !== null) return; // real error — banner handles it
+          try {
+            voice.startListening({ mode: "active" });
+          } catch {
+            /* best effort — a second failure will surface via sttError */
+          }
+        }, 1500);
       }
     })();
     // runAutoFlowAfterPersona is read via ref-stable closures (autoFlowRef,
@@ -1505,6 +1588,15 @@ export function RoleplayPlayer({
       {error ? (
         <div className="text-[12px] text-bad font-mono text-center">
           {error}
+        </div>
+      ) : null}
+
+      {voiceMode && voice.sttError ? (
+        <div className="mx-auto max-w-[520px] rounded-md border border-warn/40 bg-warn-pale text-warn px-4 py-3 text-[12.5px] leading-[1.5] text-center">
+          <div className="font-semibold mb-0.5">
+            Microphone isn&rsquo;t working
+          </div>
+          <div>{describeSttError(voice.sttError)}</div>
         </div>
       ) : null}
 
@@ -2742,6 +2834,22 @@ function CallControlsBar({
   );
 }
 
+// Race a promise against a hard timeout. Used to cap the time any
+// single TTS call can wedge the voice loop. If the timeout wins the
+// promise settles anyway (fire-and-forget); we just move on so the
+// mic reopen doesn't wait forever on a stuck upstream.
+async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+  });
+  try {
+    return await Promise.race([p, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 // Split a paragraph into discrete sentences ending in .!?…  D-ID
 // processes each speak() independently, so pushing one sentence at a
 // time lets it start lip-syncing the first one while later sentences
@@ -2751,4 +2859,23 @@ function CallControlsBar({
 function splitCompleteSentences(text: string): string[] {
   const matches = text.match(/[^.!?…\n]+[.!?…]+(?=\s|$)/g);
   return matches ? matches.map((s) => s.trim()).filter(Boolean) : [];
+}
+
+// Turn the classified STT error into a plain-English tip the trainee
+// can act on. Covers the four buckets useElevenLabsSTT emits:
+// permission_denied / no_device / in_use / unsupported / unknown.
+function describeSttError(err: SttError): string {
+  switch (err) {
+    case "permission_denied":
+      return "Your browser blocked microphone access. Click the mic icon in the address bar, allow this site to use the microphone, then try again — or type your reply below.";
+    case "no_device":
+      return "No microphone was found. Plug one in (or check your system audio settings), reload the page, and try again — or type your reply below.";
+    case "in_use":
+      return "Another app is using your microphone. Close it (Zoom, Meet, Teams, etc.), reload the page, and try again — or type your reply below.";
+    case "unsupported":
+      return "This browser can't capture voice. Try Chrome, Edge, or Safari — or just type your reply below.";
+    case "unknown":
+    default:
+      return "We couldn't open your microphone. Reload the page and try again — or type your reply below.";
+  }
 }
