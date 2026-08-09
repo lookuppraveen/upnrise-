@@ -72,6 +72,21 @@ const VAD_TICK_MS = 100;
 // Fallback silence threshold if the caller doesn't provide one.
 const DEFAULT_SILENCE_MS = 1200;
 
+// Adaptive silence — long utterances get much more patience before
+// auto-commit fires. A single fixed threshold has an unwinnable
+// tradeoff: short enough to feel responsive for one-liners means it
+// fires during natural mid-sentence pauses on long thoughts (2-3s
+// pauses on a 20-second monologue are normal, especially in Indian-
+// English cadence). Long enough for monologues makes short replies
+// feel sluggish.
+//
+// Two-tier rule: past LONG_UTTERANCE_MS of continuous speech the
+// trainee is clearly on a roll — bump the required silence gap by
+// LONG_UTTERANCE_BONUS_MS so a thinking pause doesn't cut them off.
+// Under the threshold, use the caller's base silence value as-is.
+const LONG_UTTERANCE_MS = 6_000;
+const LONG_UTTERANCE_BONUS_MS = 1_400;
+
 function pickMimeType(): string | null {
   if (typeof window === "undefined" || typeof MediaRecorder === "undefined") {
     return null;
@@ -108,6 +123,11 @@ export type SttError =
   | "no_device"
   | "in_use"
   | "unsupported"
+  // POST to /api/roleplay/stt failed. Almost always upstream auth
+  // (ElevenLabs key wrong / expired) or network. Distinct from the
+  // getUserMedia failures above so the player can render "voice input
+  // unavailable, type instead" instead of "check mic permission".
+  | "transcribe_failed"
   | "unknown";
 
 export type UseElevenLabsSTTResult = {
@@ -124,6 +144,10 @@ export type UseElevenLabsSTTResult = {
    *  restarting the MediaRecorder session. */
   setListeningMode: (mode: ListeningMode) => void;
   stopListening: () => void;
+  /** Force-commit whatever the recorder has captured so far — used by
+   *  the "Send now" button so the trainee can override the silence
+   *  timer when they know they're done. No-op when idle. */
+  commitNow: () => void;
 };
 
 export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
@@ -300,6 +324,9 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
       const res = await fetch("/api/roleplay/stt", {
         method: "POST",
         body: form,
+        // 20s cap so a hung upstream doesn't wedge the mic loop; a
+        // typical Scribe round-trip is under 3s.
+        signal: AbortSignal.timeout(20_000),
       });
       console.log("[stt] POST result", res.status);
       if (!res.ok) {
@@ -309,18 +336,26 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
       const data = (await res.json()) as { text?: string };
       const text = (data.text ?? "").trim();
       console.log("[stt] transcribed", { textLen: text.length, textPreview: text.slice(0, 40) });
+      // Success — clear any prior transcribe error so the "voice
+      // input unavailable" banner drops after transient failures.
+      setError((prev) => (prev === "transcribe_failed" ? null : prev));
       // Silence is idle — the parent typically re-opens the mic on
       // the next turn via a fresh startListening() call.
       setState("idle");
       if (text) onTranscriptRef.current(text);
     } catch (err) {
-      // Silently swallow so a network blip doesn't break the mic loop.
-      // The caller (useVoiceMode) monitors the STT hook's overall
-      // health via a separate error path if needed.
+      // Surface the failure so the player can render a banner. Before
+      // this fix the mic UI stayed stuck in "listening" forever with
+      // no signal to the trainee that transcription was dead — most
+      // commonly caused by a bad/expired ELEVENLABS_API_KEY on the
+      // server. Also flip state back to idle so the mic doesn't keep
+      // pretending to capture audio it can't process.
       console.warn(
         "[stt] POST failed",
         err instanceof Error ? err.message : err,
       );
+      setError("transcribe_failed");
+      setState("idle");
     }
   }, []);
 
@@ -453,12 +488,26 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
       } else if (
         hasSpokeRef.current &&
         lastSoundAtRef.current != null &&
-        now - lastSoundAtRef.current >= silenceThresholdRef.current
+        speechStartedAtRef.current != null
       ) {
-        // Silence has run long enough after real speech — commit.
-        console.log("[stt-vad] silence threshold reached, committing");
-        teardownVad();
-        void commit();
+        // Adaptive silence gate: past LONG_UTTERANCE_MS of continuous
+        // speech, extend the required silence so a mid-sentence
+        // thinking pause on a long thought doesn't cut the trainee
+        // off. Short one-liner replies still commit at the caller's
+        // base threshold.
+        const utteranceMs = now - speechStartedAtRef.current;
+        const effectiveSilenceMs =
+          utteranceMs >= LONG_UTTERANCE_MS
+            ? silenceThresholdRef.current + LONG_UTTERANCE_BONUS_MS
+            : silenceThresholdRef.current;
+        if (now - lastSoundAtRef.current >= effectiveSilenceMs) {
+          console.log("[stt-vad] silence threshold reached, committing", {
+            utteranceMs,
+            effectiveSilenceMs,
+          });
+          teardownVad();
+          void commit();
+        }
       }
     }, VAD_TICK_MS);
   }, [readVolume, teardownVad, commit]);
@@ -669,6 +718,17 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
     };
   }, []);
 
+  const commitNow = useCallback(() => {
+    // Only meaningful if the recorder is armed AND we've heard real
+    // speech — otherwise there's nothing worth transcribing and we'd
+    // just fire a wasted STT round-trip. teardownVad first so the
+    // ongoing tick can't race and double-commit.
+    if (!recorderRef.current || !hasSpokeRef.current) return;
+    console.log("[stt-vad] manual commit (user pressed Send now)");
+    teardownVad();
+    void commit();
+  }, [teardownVad, commit]);
+
   return {
     supported,
     state,
@@ -676,5 +736,6 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
     startListening,
     setListeningMode,
     stopListening,
+    commitNow,
   };
 }

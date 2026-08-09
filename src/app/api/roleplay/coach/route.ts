@@ -97,12 +97,17 @@ export async function POST(req: Request) {
   let raw = "";
   try {
     const ai = await getAIConfig();
-    const resp = await anthropic.messages.create({
-      model: ai.fastModel,
-      max_tokens: 200,
-      system,
-      messages: [{ role: "user", content: userMsg }],
-    });
+    const resp = await anthropic.messages.create(
+      {
+        model: ai.fastModel,
+        max_tokens: 200,
+        system,
+        messages: [{ role: "user", content: userMsg }],
+      },
+      // Coach is fire-and-forget from the client; a hung upstream
+      // used to leave a promise pinned and delay the next tick.
+      { signal: req.signal, timeout: 15_000 },
+    );
     raw = resp.content
       .map((b) => (b.type === "text" ? b.text : ""))
       .join("")

@@ -95,24 +95,36 @@ export async function POST(req: Request) {
     },
   );
 
-  const claudeStream = anthropic.messages.stream({
-    model: ROLEPLAY_MODEL,
-    // 380 = comfortable headroom for the "1-4 sentences" rule without
-    // letting the model ramble. Lower values risk truncating a reply
-    // mid-sentence which is jarring during voice playback.
-    max_tokens: 380,
-    // Cache the system block so turns 2+ in the same session skip
-    // re-processing persona + scenario + ideal conversation. 5-min
-    // ephemeral cache is a natural fit for a single roleplay session.
-    system: [
-      {
-        type: "text",
-        text: systemPrompt,
-        cache_control: { type: "ephemeral" },
-      },
-    ],
-    messages: toClaudeMessages(withLearner),
-  });
+  // Client-abort AND upstream stall both need to unblock the reader.
+  // req.signal fires when the trainee closes the tab or navigates away;
+  // the 45s cap catches a wedged Anthropic connection (Sonnet 4.6 rarely
+  // exceeds ~15s for a 380-token reply, so 45s is generous headroom).
+  const upstreamAbort = new AbortController();
+  const upstreamTimer = setTimeout(() => upstreamAbort.abort(), 45_000);
+  const onClientAbort = () => upstreamAbort.abort();
+  req.signal.addEventListener("abort", onClientAbort);
+
+  const claudeStream = anthropic.messages.stream(
+    {
+      model: ROLEPLAY_MODEL,
+      // 380 = comfortable headroom for the "1-4 sentences" rule without
+      // letting the model ramble. Lower values risk truncating a reply
+      // mid-sentence which is jarring during voice playback.
+      max_tokens: 380,
+      // Cache the system block so turns 2+ in the same session skip
+      // re-processing persona + scenario + ideal conversation. 5-min
+      // ephemeral cache is a natural fit for a single roleplay session.
+      system: [
+        {
+          type: "text",
+          text: systemPrompt,
+          cache_control: { type: "ephemeral" },
+        },
+      ],
+      messages: toClaudeMessages(withLearner),
+    },
+    { signal: upstreamAbort.signal },
+  );
 
   const encoder = new TextEncoder();
   const sessionId = session.id;
@@ -159,7 +171,16 @@ export async function POST(req: Request) {
           // ignore secondary failure
         }
         controller.error(err);
+      } finally {
+        clearTimeout(upstreamTimer);
+        req.signal.removeEventListener("abort", onClientAbort);
       }
+    },
+    cancel() {
+      // Reader was released client-side (fetch aborted, tab closed).
+      // Tear down the upstream so we don't keep pulling tokens the
+      // trainee will never see.
+      upstreamAbort.abort();
     },
   });
 

@@ -244,7 +244,14 @@ export function RoleplayPlayer({
     // Voice) tune this — tolerates real pauses without feeling dead.
     // Trade-off: 500ms extra latency on clean turn-ends is worth
     // never cutting off the trainee.
-    silenceThresholdMs: 1500,
+    // 2200ms silence-after-speech before auto-commit. 1500ms was too
+    // aggressive — normal intra-sentence pauses (thinking, breath,
+    // "um…") frequently exceeded it, causing the persona to start
+    // replying while the trainee was still forming their thought.
+    // 2200ms is a compromise: still responsive when the trainee is
+    // actually done, tolerant of mid-sentence pauses common in
+    // Indian-English and other cadences with longer natural gaps.
+    silenceThresholdMs: 2200,
     onTranscript: (text) => {
       // The hook calls this when STT commits a chunk (silence timer or
       // final result). Stick it straight into the composer and
@@ -511,11 +518,27 @@ export function RoleplayPlayer({
     ]);
     setStreaming(true);
 
+    // Streaming turn: use an idle watchdog rather than a fixed cap.
+    // Rearmed on every chunk; if no data arrives for 20s we assume the
+    // upstream (Anthropic or the /turn route) has wedged and abort so
+    // the UI can recover instead of freezing on a dead stream.
+    const turnAbort = new AbortController();
+    const IDLE_MS = 20_000;
+    let idleTimer: ReturnType<typeof setTimeout> = setTimeout(
+      () => turnAbort.abort(),
+      IDLE_MS,
+    );
+    const rearmIdle = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => turnAbort.abort(), IDLE_MS);
+    };
+
     try {
       const res = await fetch("/api/roleplay/turn", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sessionId, userMessage }),
+        signal: turnAbort.signal,
       });
       if (!res.ok || !res.body) throw new Error(`turn failed: ${res.status}`);
       const reader = res.body.getReader();
@@ -523,6 +546,7 @@ export function RoleplayPlayer({
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
+        rearmIdle();
         const chunk = decoder.decode(value, { stream: true });
         streamingContentRef.current += chunk;
         setBubbles((b) => {
@@ -540,13 +564,22 @@ export function RoleplayPlayer({
       }
       flushFinalSpeak(personaIdx);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to send");
+      const aborted =
+        e instanceof DOMException && e.name === "AbortError";
+      setError(
+        aborted
+          ? "Reply timed out — the server didn't respond. Try again."
+          : e instanceof Error
+            ? e.message
+            : "Failed to send",
+      );
       setBubbles((b) =>
         b[b.length - 1]?.role === "persona" && b[b.length - 1]?.content === ""
           ? b.slice(0, -1)
           : b,
       );
     } finally {
+      clearTimeout(idleTimer);
       setStreaming(false);
       // Live coach: poll the fast model after every *other* learner turn.
       // Fire-and-forget — coach failures never block the player.
@@ -703,6 +736,7 @@ export function RoleplayPlayer({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sessionId }),
+        signal: AbortSignal.timeout(20_000),
       });
       if (!res.ok) return;
       const data: { hint: string | null; tone: "tip" | "warn" } =
@@ -834,6 +868,9 @@ export function RoleplayPlayer({
       const res = await fetch("/api/roleplay/recording", {
         method: "POST",
         body: fd,
+        // 60s cap accommodates a full-length session recording on
+        // moderate connections; larger blobs would need chunked upload.
+        signal: AbortSignal.timeout(60_000),
       });
       if (!res.ok) {
         const data = (await res.json().catch(() => ({}))) as {
@@ -857,16 +894,21 @@ export function RoleplayPlayer({
     voice.stopListening();
     startEnd(async () => {
       try {
-        // Upload the audio recording (if recording was active) BEFORE
-        // hitting /end. Failures here are non-fatal — the session
-        // ends either way; only the playback affordance is lost.
+        // Recording upload runs in the BACKGROUND — a 3-5MB blob on
+        // weak Wi-Fi used to add a 20s spinner between "End" and the
+        // results page. The upload continues after client-side
+        // navigation (fetch is not tied to component lifecycle) and
+        // is best-effort — failures only lose the playback affordance.
         if (recordAv) {
-          await flushRecording();
+          void flushRecording().catch((e) =>
+            console.warn("[end] background recording upload failed:", e),
+          );
         }
         const res = await fetch("/api/roleplay/end", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ sessionId }),
+          signal: AbortSignal.timeout(20_000),
         });
         if (!res.ok) throw new Error(`end failed: ${res.status}`);
         const data: { redirect: string } = await res.json();
@@ -980,6 +1022,7 @@ export function RoleplayPlayer({
           sessionId,
           type: hints?.type ?? "complete",
         }),
+        signal: AbortSignal.timeout(20_000),
       });
       if (!res.ok) {
         const data = (await res.json().catch(() => ({}))) as { error?: string };
@@ -1032,6 +1075,7 @@ export function RoleplayPlayer({
           type: hints?.type ?? "complete",
           auto: true,
         }),
+        signal: AbortSignal.timeout(20_000),
       });
       if (!res.ok) {
         const data = (await res.json().catch(() => ({}))) as { error?: string };
@@ -1131,6 +1175,7 @@ export function RoleplayPlayer({
           sessionId,
           type: hints?.type ?? "complete",
         }),
+        signal: AbortSignal.timeout(20_000),
       });
       if (!res.ok) {
         const data = (await res.json().catch(() => ({}))) as { error?: string };
@@ -1158,10 +1203,23 @@ export function RoleplayPlayer({
       // the conversation.
       voice.stopListening();
 
+      // Kick the hint fetch immediately so it overlaps with the 700ms
+      // cosmetic pause. Previously we awaited the pause and THEN the
+      // fetch sequentially, so a 2s LLM call added a visible 2s silence
+      // between persona and learner voice. Now the pause is guaranteed
+      // to run in parallel with the network round-trip.
+      const hintPromise: Promise<string | null> =
+        hintsAllowed && !hintsExhausted
+          ? fetchHintNow()
+          : Promise.resolve(null);
+
       // Pause briefly so the conversation doesn't feel robotic.
       await new Promise((r) => setTimeout(r, 700));
       if (!autoFlowRef.current || stoppingRef.current) {
         bailed = true;
+        // Still consume the in-flight hint promise so hintsUsed state
+        // and any error handling settle rather than dangling.
+        void hintPromise.catch(() => {});
         return;
       }
 
@@ -1174,7 +1232,7 @@ export function RoleplayPlayer({
         }
         return;
       }
-      const hint = await fetchHintNow();
+      const hint = await hintPromise;
       if (!hint || !autoFlowRef.current || stoppingRef.current) {
         bailed = true;
         return;
@@ -1425,7 +1483,11 @@ export function RoleplayPlayer({
                 )}
                 aria-hidden
               />
-              REC
+              {/* Wrapped span + suppressHydrationWarning: the bare text
+                  "REC" gets rewritten by trader browser extensions
+                  (Upstox, Groww) that recognize it as an NSE ticker
+                  symbol (REC LIMITED) before React hydrates. */}
+              <span suppressHydrationWarning>REC</span>
             </span>
           ) : null}
         </div>
@@ -1654,6 +1716,7 @@ export function RoleplayPlayer({
         }}
         onStartListen={voice.startListening}
         onStopListen={voice.stopListening}
+        onCommitVoice={voice.commitNow}
         onEnd={handleEndClick}
       />
 
@@ -2750,6 +2813,7 @@ function CallControlsBar({
   onToggleVoice,
   onStartListen,
   onStopListen,
+  onCommitVoice,
   onEnd,
 }: {
   voiceMode: boolean;
@@ -2765,6 +2829,10 @@ function CallControlsBar({
   onToggleVoice: () => void;
   onStartListen: () => void;
   onStopListen: () => void;
+  /** Force-commit the current utterance now — overrides the silence
+   *  timer so a trainee who knows they're done doesn't have to wait
+   *  for auto-detection. */
+  onCommitVoice: () => void;
   onEnd: () => void;
 }) {
   const voiceAvailable = voiceSttSupported || voiceTtsSupported;
@@ -2836,6 +2904,26 @@ function CallControlsBar({
         >
           <Icon name="mic" size={18} />
         </button>
+        {/* "Send now" — appears only while the mic is listening, gives
+            the trainee explicit control to commit their utterance
+            immediately instead of waiting for the adaptive silence
+            timer. Solves the "AI cut me off mid-sentence" problem on
+            long thoughts by letting the trainee signal "I'm done"
+            when they know they are. Hidden in auto-flow (the mic is
+            driven by the orchestrator, not the trainee). */}
+        {listening && !autoFlow ? (
+          <button
+            type="button"
+            onClick={onCommitVoice}
+            suppressHydrationWarning
+            aria-label="Send now"
+            title="Send what you've said — skip the silence-detect wait"
+            className="inline-flex items-center h-[36px] px-3.5 rounded-full text-[11.5px] font-semibold text-white shadow-md"
+            style={{ background: "#2a7d4f" }}
+          >
+            Send now
+          </button>
+        ) : null}
         <button
           type="button"
           onClick={onEnd}
@@ -2906,6 +2994,8 @@ function describeSttError(err: SttError): string {
       return "Another app is using your microphone. Close it (Zoom, Meet, Teams, etc.), reload the page, and try again — or type your reply below.";
     case "unsupported":
       return "This browser can't capture voice. Try Chrome, Edge, or Safari — or just type your reply below.";
+    case "transcribe_failed":
+      return "Voice input is temporarily unavailable — the speech service didn't respond. Type your reply below and continue. (If this persists, the ElevenLabs API key on the server may need to be checked.)";
     case "unknown":
     default:
       return "We couldn't open your microphone. Reload the page and try again — or type your reply below.";

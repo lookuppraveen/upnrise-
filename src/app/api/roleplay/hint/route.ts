@@ -112,15 +112,21 @@ export async function POST(req: Request) {
 
   try {
     const ai = await getAIConfig();
-    const resp = await anthropic.messages.create({
-      model: ai.fastModel,
-      // Hard cap on generation length — 200 tokens ≈ 150 words at most.
-      // Combined with the "25 words max" prompt rule and the 350-char
-      // schema cap, this triangulates on short, deliverable hints.
-      max_tokens: 200,
-      system,
-      messages: [{ role: "user", content: userMsg }],
-    });
+    const resp = await anthropic.messages.create(
+      {
+        model: ai.fastModel,
+        // Hard cap on generation length — 200 tokens ≈ 150 words at most.
+        // Combined with the "25 words max" prompt rule and the 350-char
+        // schema cap, this triangulates on short, deliverable hints.
+        max_tokens: 200,
+        system,
+        messages: [{ role: "user", content: userMsg }],
+      },
+      // 15s upstream cap; client-abort forwarded so a stale hint
+      // request (trainee already sent their reply) doesn't keep
+      // burning tokens.
+      { signal: req.signal, timeout: 15_000 },
+    );
     const text = resp.content
       .map((b) => (b.type === "text" ? b.text : ""))
       .join("")

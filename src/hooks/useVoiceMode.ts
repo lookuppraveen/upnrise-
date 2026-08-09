@@ -131,6 +131,12 @@ export function useVoiceMode(opts: {
    *  versa) without restarting the recognition session. */
   setListeningMode: (mode: ListeningMode) => void;
   stopListening: () => void;
+  /** Force-commit the current voice utterance immediately (skip the
+   *  silence-based auto-commit). Used by the "Send now" button so the
+   *  trainee can override the timer when they know they're done. No-op
+   *  on the browser SpeechRecognition path (it commits on final result
+   *  events, not a silence timer). */
+  commitNow: () => void;
   cancelSpeech: () => void;
   /** The voice URI the hook is currently using, or null if default. */
   selectedVoiceUri: string | null;
@@ -590,6 +596,16 @@ export function useVoiceMode(opts: {
     setState((s) => (s === "listening" ? "idle" : s));
   }, [useElevenLabsSttPath, elevenLabsStt, clearSilenceTimer]);
 
+  const commitNow = useCallback(() => {
+    // Only the ElevenLabs Scribe path has an explicit force-commit.
+    // The browser SpeechRecognition backend commits on its own final
+    // result events, so there's nothing meaningful to override there
+    // — no-op keeps the caller code branch-free.
+    if (useElevenLabsSttPath) {
+      elevenLabsStt.commitNow();
+    }
+  }, [useElevenLabsSttPath, elevenLabsStt]);
+
   const cancelSpeech = useCallback(() => {
     if (typeof window !== "undefined" && window.speechSynthesis) {
       window.speechSynthesis.cancel();
@@ -628,6 +644,7 @@ export function useVoiceMode(opts: {
     startListening,
     setListeningMode,
     stopListening,
+    commitNow,
     cancelSpeech,
     selectedVoiceUri,
     availableVoices,

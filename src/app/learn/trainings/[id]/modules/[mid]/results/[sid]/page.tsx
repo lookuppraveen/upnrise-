@@ -14,6 +14,11 @@ import { AIBadge } from "@/components/ui/AIBadge";
 import { cn } from "@/lib/cn";
 import { parseAdditionalSettings } from "@/lib/roleplay/additional-settings";
 import {
+  parseEvaluationCriteria,
+  visibleChecklistItemsFor,
+  type EvaluationChecklistItem,
+} from "@/lib/roleplay/evaluation-criteria";
+import {
   computeAttemptStats,
   computeKeywordCoverage,
   countHintsUsed,
@@ -54,6 +59,12 @@ export default async function ResultsPage({
     (session.rubricScores as Record<string, number> | null) ?? {};
 
   const settings = parseAdditionalSettings(session.module.body);
+  // Read the admin's structured criteria (with per-item checklist +
+  // visibility) directly from module.body. The runtime rubric stored
+  // in RoleplayConfig collapses each criterion's items into a single
+  // description string for the AI scorer, so we go back to the source
+  // to render the checklist the admin actually authored.
+  const adminCriteria = parseEvaluationCriteria(session.module.body);
 
   const [aiFeedback, recordingRow, history, hintsUsed, fullUser, systemNote] =
     await Promise.all([
@@ -475,16 +486,23 @@ export default async function ResultsPage({
           />
           {rubric && rubric.criteria.length > 0 ? (
             <div className="space-y-2.5">
-              {rubric.criteria.map((c, i) => (
-                <CriterionDetail
-                  key={c.id}
-                  label={c.label}
-                  description={c.description}
-                  score={rubricScores[c.id]}
-                  passScore={passScore}
-                  color={SKILL_COLORS[i % SKILL_COLORS.length]}
-                />
-              ))}
+              {rubric.criteria.map((c, i) => {
+                const items = visibleChecklistItemsFor(adminCriteria, c.id);
+                // When admin-authored items exist, prefer the structured
+                // checklist over the auto-composed description string —
+                // the checklist IS the description, expanded.
+                return (
+                  <CriterionDetail
+                    key={c.id}
+                    label={c.label}
+                    description={items.length > 0 ? undefined : c.description}
+                    items={items}
+                    score={rubricScores[c.id]}
+                    passScore={passScore}
+                    color={SKILL_COLORS[i % SKILL_COLORS.length]}
+                  />
+                );
+              })}
             </div>
           ) : (
             <div className="border border-dashed border-border rounded-md p-6 text-center">
@@ -974,12 +992,17 @@ function RubricBars({
 function CriterionDetail({
   label,
   description,
+  items,
   score,
   passScore,
   color,
 }: {
   label: string;
   description?: string;
+  /** Admin-authored checklist for this criterion. Rendered as a
+   *  bulleted list under the score. When present, `description` is
+   *  typically omitted (the list is the description, expanded). */
+  items?: EvaluationChecklistItem[];
   score: number | undefined;
   passScore: number;
   color: string;
@@ -1038,6 +1061,28 @@ function CriterionDetail({
       ) : null}
       {description ? (
         <p className="text-[11.5px] text-ink-2 leading-[1.5]">{description}</p>
+      ) : null}
+      {items && items.length > 0 ? (
+        <div className="pt-1">
+          <div className="text-[10.5px] font-semibold uppercase tracking-[0.06em] text-ink-3 mb-1.5">
+            What we looked for
+          </div>
+          <ul className="space-y-1">
+            {items.map((it) => (
+              <li
+                key={it.id}
+                className="flex items-start gap-1.5 text-[11.5px] text-ink-2 leading-[1.5]"
+              >
+                <span
+                  aria-hidden
+                  className="inline-block w-1 h-1 rounded-full shrink-0 mt-[7px]"
+                  style={{ background: color, opacity: 0.6 }}
+                />
+                <span>{it.label}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
       ) : null}
     </div>
   );

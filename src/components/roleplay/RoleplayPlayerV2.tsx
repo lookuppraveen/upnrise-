@@ -246,7 +246,11 @@ export function RoleplayPlayerV2({
     // Voice) tune this — tolerates real pauses without feeling dead.
     // Trade-off: 500ms extra latency on clean turn-ends is worth
     // never cutting off the trainee.
-    silenceThresholdMs: 1500,
+    // 2200ms silence-after-speech before auto-commit. 1500ms was too
+    // aggressive — normal intra-sentence pauses (thinking, breath,
+    // "um…") frequently exceeded it, causing the persona to start
+    // replying while the trainee was still forming their thought.
+    silenceThresholdMs: 2200,
     onTranscript: (text) => {
       // The hook calls this when STT commits a chunk (silence timer or
       // final result). Stick it straight into the composer and
@@ -1439,7 +1443,10 @@ export function RoleplayPlayerV2({
                   )}
                   aria-hidden
                 />
-                REC
+                {/* Trader browser extensions (Upstox, Groww) rewrite the
+                    bare token "REC" as an NSE ticker link before React
+                    hydrates — suppress to avoid the mismatch. */}
+                <span suppressHydrationWarning>REC</span>
               </span>
             ) : null}
             {duration ? (
@@ -1647,6 +1654,7 @@ export function RoleplayPlayerV2({
             }}
             onStartListen={voice.startListening}
             onStopListen={voice.stopListening}
+            onCommitVoice={voice.commitNow}
             onEnd={handleEndClick}
             onOpenHint={hintsAllowed ? requestHint : undefined}
             hintDisabled={
@@ -2876,6 +2884,8 @@ function describeSttError(err: SttError): string {
       return "Another app is using your microphone. Close it (Zoom, Meet, Teams, etc.), reload the page, and try again — or type your reply below.";
     case "unsupported":
       return "This browser can't capture voice. Try Chrome, Edge, or Safari — or just type your reply below.";
+    case "transcribe_failed":
+      return "Voice input is temporarily unavailable — the speech service didn't respond. Type your reply below and continue. (If this persists, the ElevenLabs API key on the server may need to be checked.)";
     case "unknown":
     default:
       return "We couldn't open your microphone. Reload the page and try again — or type your reply below.";
@@ -3254,6 +3264,7 @@ function ControlPill({
   onToggleVoice,
   onStartListen,
   onStopListen,
+  onCommitVoice,
   onEnd,
   onOpenHint,
   hintDisabled,
@@ -3271,6 +3282,9 @@ function ControlPill({
   onToggleVoice: () => void;
   onStartListen: () => void;
   onStopListen: () => void;
+  /** Force-commit the current utterance — overrides the silence-based
+   *  auto-commit so the trainee can send when they know they're done. */
+  onCommitVoice: () => void;
   onEnd: () => void;
   onOpenHint?: () => void;
   hintDisabled: boolean;
@@ -3360,6 +3374,27 @@ function ControlPill({
           />
         ) : null}
       </button>
+
+      {/* "Send now" — appears only while listening, gives the trainee
+          explicit control to commit their utterance immediately instead
+          of waiting for the adaptive silence timer. Solves the "AI cut
+          me off mid-sentence" complaint on long thoughts. Hidden in
+          auto-flow (mic is orchestrator-driven, not trainee-driven). */}
+      {listening && !autoFlow ? (
+        <button
+          type="button"
+          onClick={onCommitVoice}
+          suppressHydrationWarning
+          aria-label="Send now"
+          title="Send what you've said — skip the silence-detect wait"
+          className="inline-flex items-center h-11 px-4 rounded-full text-[12px] font-semibold text-white shadow-md"
+          style={{
+            background: "linear-gradient(135deg, #3ea56a, #2a7d4f)",
+          }}
+        >
+          Send now
+        </button>
+      ) : null}
 
       {/* End call */}
       <button

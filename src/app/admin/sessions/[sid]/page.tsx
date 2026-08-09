@@ -27,6 +27,10 @@ import { AIBadge } from "@/components/ui/AIBadge";
 import { cn } from "@/lib/cn";
 import { parseAdditionalSettings } from "@/lib/roleplay/additional-settings";
 import {
+  parseEvaluationCriteria,
+  type EvaluationChecklistItem,
+} from "@/lib/roleplay/evaluation-criteria";
+import {
   computeAttemptStats,
   computeKeywordCoverage,
   countHintsUsed,
@@ -65,6 +69,11 @@ export default async function AdminSessionPage({
     (session.rubricScores as Record<string, number> | null) ?? {};
 
   const settings = parseAdditionalSettings(session.module.body);
+  // Admin auditing view: read the full structured criteria the admin
+  // authored, including items marked hidden-from-trainee. The trainee
+  // page filters by `visible`; admins get to see everything so they
+  // can verify the full rubric was applied.
+  const adminCriteria = parseEvaluationCriteria(session.module.body);
 
   const [aiFeedback, recordingRow, history, hintsUsed, systemNote] =
     await Promise.all([
@@ -470,16 +479,24 @@ export default async function AdminSessionPage({
           />
           {rubric && rubric.criteria.length > 0 ? (
             <div className="space-y-2.5">
-              {rubric.criteria.map((c, i) => (
-                <CriterionDetail
-                  key={c.id}
-                  label={c.label}
-                  description={c.description}
-                  score={rubricScores[c.id]}
-                  passScore={passScore}
-                  color={SKILL_COLORS[i % SKILL_COLORS.length]}
-                />
-              ))}
+              {rubric.criteria.map((c, i) => {
+                // Admin view: show ALL items (visible + hidden) so the
+                // admin can audit exactly what was scored. Hidden items
+                // are visually annotated in CriterionDetail below.
+                const items =
+                  adminCriteria.find((a) => a.id === c.id)?.items ?? [];
+                return (
+                  <CriterionDetail
+                    key={c.id}
+                    label={c.label}
+                    description={items.length > 0 ? undefined : c.description}
+                    items={items}
+                    score={rubricScores[c.id]}
+                    passScore={passScore}
+                    color={SKILL_COLORS[i % SKILL_COLORS.length]}
+                  />
+                );
+              })}
             </div>
           ) : (
             <div className="border border-dashed border-border rounded-md p-6 text-center">
@@ -926,12 +943,17 @@ function RubricBars({
 function CriterionDetail({
   label,
   description,
+  items,
   score,
   passScore,
   color,
 }: {
   label: string;
   description?: string;
+  /** Admin-authored checklist. Admin view passes all items (both
+   *  visible and hidden); trainee-hidden items are annotated below
+   *  so the admin can distinguish them at a glance. */
+  items?: EvaluationChecklistItem[];
   score: number | undefined;
   passScore: number;
   color: string;
@@ -990,6 +1012,36 @@ function CriterionDetail({
       ) : null}
       {description ? (
         <p className="text-[11.5px] text-ink-2 leading-[1.5]">{description}</p>
+      ) : null}
+      {items && items.length > 0 ? (
+        <div className="pt-1">
+          <div className="text-[10.5px] font-semibold uppercase tracking-[0.06em] text-ink-3 mb-1.5">
+            What we looked for
+          </div>
+          <ul className="space-y-1">
+            {items.map((it) => (
+              <li
+                key={it.id}
+                className="flex items-start gap-1.5 text-[11.5px] text-ink-2 leading-[1.5]"
+              >
+                <span
+                  aria-hidden
+                  className="inline-block w-1 h-1 rounded-full shrink-0 mt-[7px]"
+                  style={{ background: color, opacity: 0.6 }}
+                />
+                <span className="flex-1">{it.label}</span>
+                {!it.visible ? (
+                  <span
+                    className="text-[9.5px] font-semibold uppercase tracking-[0.06em] text-ink-3 border border-border rounded-sm px-1 py-[1px] shrink-0"
+                    title="Marked hidden from trainee — admin-only view"
+                  >
+                    Hidden
+                  </span>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </div>
       ) : null}
     </div>
   );
