@@ -21,8 +21,23 @@ export type RoleplayConfigShape = {
   rubric: unknown; // not used here; the scorer reads it
 };
 
-/** Hard cap on transcript turns to keep prompts cheap + sessions sane. */
-export const MAX_TRANSCRIPT_TURNS = 40;
+/**
+ * Truncation policy for long conversations. We keep the FIRST few turns
+ * (the opening — how the scenario was framed, the trainee's first
+ * objections, any specific facts stated up-front) AND the LAST N turns
+ * (recent context the model needs to respond coherently). A pure
+ * sliding window that only kept the tail lost the opening entirely,
+ * so past turn 40 the persona would "forget" that the trainee had
+ * mentioned a budget of $10k on turn 3, etc.
+ *
+ * Both counts are even so the interleaved learner→persona pattern
+ * stays valid across the join even after truncation. Sonnet 4.6
+ * handles 100 turns × ~50 tokens each (~5000 tokens) trivially.
+ */
+export const HEAD_TRANSCRIPT_TURNS = 4;
+export const TAIL_TRANSCRIPT_TURNS = 96;
+export const MAX_TRANSCRIPT_TURNS =
+  HEAD_TRANSCRIPT_TURNS + TAIL_TRANSCRIPT_TURNS;
 
 /**
  * Adaptive-difficulty tier derived from the learner's rolling
@@ -144,12 +159,22 @@ export function buildSystemPrompt(
 export function toClaudeMessages(
   transcript: TranscriptTurn[],
 ): Array<{ role: "user" | "assistant"; content: string }> {
-  return transcript
-    .slice(-MAX_TRANSCRIPT_TURNS)
-    .map((t) => ({
-      role: t.role === "persona" ? ("assistant" as const) : ("user" as const),
-      content: t.content,
-    }));
+  // Under the cap: send the whole transcript. Over the cap: preserve
+  // the opening (HEAD) and the recent tail (TAIL), dropping the middle
+  // — see MAX_TRANSCRIPT_TURNS comment for rationale. Alternation is
+  // preserved because HEAD + TAIL are both even and the raw transcript
+  // strictly alternates learner→persona.
+  const slice =
+    transcript.length <= MAX_TRANSCRIPT_TURNS
+      ? transcript
+      : [
+          ...transcript.slice(0, HEAD_TRANSCRIPT_TURNS),
+          ...transcript.slice(-TAIL_TRANSCRIPT_TURNS),
+        ];
+  return slice.map((t) => ({
+    role: t.role === "persona" ? ("assistant" as const) : ("user" as const),
+    content: t.content,
+  }));
 }
 
 export function appendTurn(

@@ -966,6 +966,9 @@ const AdditionalSettingsSchema = z
     tipsOnReportGif: z
       .object({ name: z.string().min(1).max(200), dataUrl: z.string().max(2000) })
       .nullable(),
+    // Fast mode — /turn uses Haiku instead of Sonnet. Optional so
+    // modules saved before this field existed continue to parse.
+    fastMode: z.boolean().optional().default(false),
   })
   .refine(
     (d) =>
@@ -1481,6 +1484,15 @@ export async function saveRoleplayModule(
   }
 
   revalidatePath(`/admin/trainings/${trainingId}/edit`);
+  // Cross-user invalidation: trainee play pages read the same
+  // module.body (voice ID, persona, criteria) via loadModuleForUser.
+  // Without this, a trainee who had the play page loaded before the
+  // admin's save would still be served the pre-change RSC payload
+  // from Next's route cache — leading to the "admin changed the
+  // voice but trainee still hears the old one" report. The wildcard
+  // covers every module route under this training.
+  revalidatePath(`/learn/trainings/${trainingId}`);
+  revalidatePath(`/learn/trainings/${trainingId}/modules/${moduleId}/play`);
 }
 
 /**

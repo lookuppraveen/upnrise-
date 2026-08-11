@@ -13,11 +13,16 @@ import { prisma } from "@/lib/db/client";
 import { anthropic } from "@/lib/ai/client";
 import { loadSessionForUser } from "@/lib/ai/roleplay-access";
 
-// Sonnet 4.6 is the sweet spot for in-character roleplay turns: ~3× faster than
-// Opus with no meaningful quality loss for conversational scenes. Override with
-// ANTHROPIC_MODEL_ROLEPLAY (e.g. "claude-haiku-4-5-20251001" for max speed).
+// Default model for in-character roleplay turns. Sonnet 4.6 is the
+// sweet spot: ~3× faster than Opus with no meaningful quality loss.
+// Override globally with ANTHROPIC_MODEL_ROLEPLAY, or per-module by
+// enabling `additionalSettings.fastMode` in the admin editor — that
+// swaps in Haiku 4.5 for ~2× faster turns at the cost of some nuance.
 const ROLEPLAY_MODEL =
   process.env.ANTHROPIC_MODEL_ROLEPLAY ?? "claude-sonnet-4-6";
+const ROLEPLAY_MODEL_FAST =
+  process.env.ANTHROPIC_MODEL_ROLEPLAY_FAST ??
+  "claude-haiku-4-5-20251001";
 import {
   appendTurn,
   buildSystemPrompt,
@@ -104,9 +109,18 @@ export async function POST(req: Request) {
   const onClientAbort = () => upstreamAbort.abort();
   req.signal.addEventListener("abort", onClientAbort);
 
+  // Admin per-module opt-in for the Haiku fast path. The env override
+  // ROLEPLAY_MODEL still wins when set globally.
+  const modelToUse =
+    process.env.ANTHROPIC_MODEL_ROLEPLAY
+      ? ROLEPLAY_MODEL
+      : settings.fastMode
+        ? ROLEPLAY_MODEL_FAST
+        : ROLEPLAY_MODEL;
+
   const claudeStream = anthropic.messages.stream(
     {
-      model: ROLEPLAY_MODEL,
+      model: modelToUse,
       // 380 = comfortable headroom for the "1-4 sentences" rule without
       // letting the model ramble. Lower values risk truncating a reply
       // mid-sentence which is jarring during voice playback.

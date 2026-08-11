@@ -72,10 +72,9 @@ export async function POST(req: Request) {
     "You are a silent coach watching a live sales roleplay.",
     "Your job is to give the learner ONE short in-the-moment nudge — but only when it would meaningfully change their next reply.",
     "",
-    "Return JSON only:",
-    `  { "hint": "...one sentence, max 25 words..." | null, "tone": "tip" | "warn" }`,
+    "You MUST respond by calling the `emit_coaching` tool exactly once. Do not write any other output.",
     "",
-    "Return hint=null when:",
+    "Set hint=null (and tone still required, use 'tip' as default) when:",
     "- The learner just did well; nothing to add.",
     "- The conversation is going fine and a comment would be noise.",
     "- The customer just spoke and the learner hasn't responded yet.",
@@ -89,47 +88,81 @@ export async function POST(req: Request) {
     criteria ? `## Rubric we're scoring on\n${criteria}\n` : "",
     `## Recent transcript\n${transcriptBlock}`,
     "",
-    "Return ONLY the JSON object, no prose.",
+    "Call emit_coaching with your judgment for the learner's most recent turn.",
   ]
     .filter(Boolean)
     .join("\n");
 
-  let raw = "";
+  // Tool-use guarantees structured output. Previous version asked the
+  // model to return raw JSON in a text block; ~5% of the time it added
+  // prose framing or hit the 200-token cap mid-JSON, and the parse
+  // fell back to "no hint" — silently swallowing what may have been
+  // a useful nudge. With tool_choice forced, Anthropic returns a
+  // tool_use content block whose `input` is already-parsed JSON that
+  // conforms to the input_schema. No manual JSON.parse, no code-fence
+  // stripping, no truncation risk.
+  const emitCoachingTool = {
+    name: "emit_coaching" as const,
+    description:
+      "Emit a single in-the-moment coaching signal for the learner's most recent turn. Pass hint=null when no nudge is warranted.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        hint: {
+          type: ["string", "null"] as const,
+          description:
+            "One-sentence nudge tied to what just happened in the transcript. Max 25 words, max 200 chars. null when no nudge is warranted.",
+          maxLength: 200,
+        },
+        tone: {
+          type: "string" as const,
+          enum: ["tip", "warn"] as const,
+          description:
+            "'warn' for clear errors (interrupting, missing an objection, oversharing pricing); 'tip' for gentle improvements. Required even when hint is null (use 'tip').",
+        },
+      },
+      required: ["hint", "tone"],
+    },
+  };
+
+  let toolInput: unknown;
   try {
     const ai = await getAIConfig();
     const resp = await anthropic.messages.create(
       {
         model: ai.fastModel,
-        max_tokens: 200,
+        // 300 tokens leaves comfortable headroom for the tool_use
+        // wrapper + the small JSON payload; the 200-char schema cap
+        // keeps the hint itself short regardless.
+        max_tokens: 300,
         system,
         messages: [{ role: "user", content: userMsg }],
+        tools: [emitCoachingTool],
+        tool_choice: { type: "tool", name: emitCoachingTool.name },
       },
-      // Coach is fire-and-forget from the client; a hung upstream
-      // used to leave a promise pinned and delay the next tick.
       { signal: req.signal, timeout: 15_000 },
     );
-    raw = resp.content
-      .map((b) => (b.type === "text" ? b.text : ""))
-      .join("")
-      .trim();
+    const toolUse = resp.content.find((b) => b.type === "tool_use");
+    if (!toolUse || toolUse.type !== "tool_use") {
+      // Shouldn't happen with tool_choice forced, but degrade gracefully.
+      console.warn("[coach] no tool_use in response");
+      return NextResponse.json({ hint: null, tone: "tip" });
+    }
+    toolInput = toolUse.input;
   } catch (err) {
     console.error("[coach] LLM error", err);
     return NextResponse.json({ hint: null, tone: "tip" });
   }
 
-  // Strip any code-fence wrapper Claude occasionally adds.
-  const jsonText = raw
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/```\s*$/i, "")
-    .trim();
-
-  let parsedOut;
-  try {
-    parsedOut = Out.parse(JSON.parse(jsonText));
-  } catch {
-    // Bad JSON → behave as "no hint" rather than break the player.
+  const parsedOut = Out.safeParse(toolInput);
+  if (!parsedOut.success) {
+    // Model violated the schema despite tool_use — treat as no-op.
+    console.warn(
+      "[coach] tool input failed schema",
+      parsedOut.error.flatten(),
+    );
     return NextResponse.json({ hint: null, tone: "tip" });
   }
 
-  return NextResponse.json(parsedOut);
+  return NextResponse.json(parsedOut.data);
 }

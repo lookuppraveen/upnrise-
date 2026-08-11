@@ -147,6 +147,16 @@ export function RoleplayPlayerV2({
   const [introDismissed, setIntroDismissed] = useState(!scenarioIntroGif);
   const sessionGated = needsModePick || needsLanguagePick || !introDismissed;
 
+  // "3 · 2 · 1 · Go" countdown overlay — see V1 for rationale.
+  const COUNTDOWN_SECONDS = 3;
+  const [showStartCountdown, setShowStartCountdown] = useState(false);
+  const [countdownValue, setCountdownValue] = useState(COUNTDOWN_SECONDS);
+  const countdownDoneRef = useRef(false);
+  const pendingStartRef = useRef<{
+    sessionId: string;
+    opening: string | null;
+  } | null>(null);
+
   // Resolve the chosen player mode (or admin fallback) into the
   // voice / avatar / webcam flags the existing player flow consumes.
   const resolved = resolvePlayerFlags(chosenMode, mode);
@@ -347,11 +357,56 @@ export function RoleplayPlayerV2({
   // per-render promise so sentence N always finishes before N+1
   // begins. Reset per bubble so a fresh persona reply starts clean.
   const avatarSpeakChainRef = useRef<Promise<void>>(Promise.resolve());
+  // Voice-only counterpart — see V1 for full rationale. Chains
+  // per-sentence voice.speak() calls fired during streaming so the
+  // first sentence becomes audible 1-2s after the model emits it
+  // instead of waiting for the whole reply to finish streaming.
+  const voiceSpeakChainRef = useRef<Promise<void>>(Promise.resolve());
+  // Signals to the post-stream effect that incremental TTS covered
+  // the full reply; the effect skips its own speak() call but still
+  // runs mic re-open / auto-flow handoff logic downstream.
+  const incrementallySpokenRef = useRef<Set<number>>(new Set());
   // Global "something is currently vocalizing" guard. Prevents the
   // post-stream voice-loop effect from firing voice.speak() while
   // incremental sentences are still being spoken by the avatar path
   // (double-speak race). Cleared when the chain drains.
   const isSpeakingRef = useRef(false);
+
+  // Countdown driver — see V1 for details.
+  useEffect(() => {
+    if (sessionGated) return;
+    if (countdownDoneRef.current) return;
+    setShowStartCountdown(true);
+    setCountdownValue(COUNTDOWN_SECONDS);
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    for (let i = 1; i < COUNTDOWN_SECONDS; i++) {
+      timers.push(
+        setTimeout(
+          () => setCountdownValue(COUNTDOWN_SECONDS - i),
+          i * 1000,
+        ),
+      );
+    }
+    timers.push(
+      setTimeout(() => {
+        setShowStartCountdown(false);
+        countdownDoneRef.current = true;
+        const pending = pendingStartRef.current;
+        if (pending) {
+          setSessionId(pending.sessionId);
+          if (pending.opening) {
+            setBubbles([{ role: "persona", content: pending.opening }]);
+          } else {
+            setBubbles([]);
+          }
+          pendingStartRef.current = null;
+        }
+      }, COUNTDOWN_SECONDS * 1000),
+    );
+    return () => {
+      for (const t of timers) clearTimeout(t);
+    };
+  }, [sessionGated]);
 
   useEffect(() => {
     if (startedRef.current) return;
@@ -401,6 +456,10 @@ export function RoleplayPlayerV2({
         }
         const data: { sessionId: string; opening: string | null } =
           await res.json();
+        if (!countdownDoneRef.current) {
+          pendingStartRef.current = data;
+          return;
+        }
         setSessionId(data.sessionId);
         // When the admin set "Start Roleplay By" = User, the start
         // route returns opening=null and the trainee speaks first.
@@ -497,6 +556,44 @@ export function RoleplayPlayerV2({
     spokenIdxRef.current.add(bubbleIdx);
   }
 
+  // Voice-only counterparts — see V1 for detailed rationale.
+  function pushIncrementalVoiceSpeak(bubbleIdx: number) {
+    if (!voiceMode || avatarMode) return;
+    const offset = incrementalSpokenLenRef.current.get(bubbleIdx) ?? 0;
+    const full = streamingContentRef.current;
+    const tail = full.slice(offset);
+    const sentences = splitCompleteSentences(tail);
+    if (sentences.length === 0) return;
+    const consumed = sentences.reduce((sum, s) => sum + s.length, 0);
+    incrementalSpokenLenRef.current.set(bubbleIdx, offset + consumed);
+    for (const s of sentences) {
+      isSpeakingRef.current = true;
+      voiceSpeakChainRef.current = voiceSpeakChainRef.current
+        .then(() => voice.speak(s))
+        .catch(() => {
+          /* per-sentence failure never breaks the chain */
+        });
+    }
+  }
+
+  function flushFinalVoiceSpeak(bubbleIdx: number) {
+    if (!voiceMode || avatarMode) return;
+    const offset = incrementalSpokenLenRef.current.get(bubbleIdx) ?? 0;
+    const remainder = streamingContentRef.current.slice(offset).trim();
+    if (remainder) {
+      isSpeakingRef.current = true;
+      voiceSpeakChainRef.current = voiceSpeakChainRef.current
+        .then(() => voice.speak(remainder))
+        .catch(() => {
+          /* ignore */
+        });
+    }
+    voiceSpeakChainRef.current = voiceSpeakChainRef.current.finally(() => {
+      isSpeakingRef.current = false;
+    });
+    incrementallySpokenRef.current.add(bubbleIdx);
+  }
+
   async function sendText(userMessage: string) {
     if (!sessionId || streaming || !userMessage.trim()) return;
     setInput("");
@@ -543,8 +640,10 @@ export function RoleplayPlayerV2({
           return next;
         });
         pushIncrementalSpeak(personaIdx);
+        pushIncrementalVoiceSpeak(personaIdx);
       }
       flushFinalSpeak(personaIdx);
+      flushFinalVoiceSpeak(personaIdx);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to send");
       setBubbles((b) =>
@@ -632,14 +731,23 @@ export function RoleplayPlayerV2({
           isSpeakingRef.current = false;
         }
       } else {
+        // Drain both avatar and voice chains before deciding what
+        // (if anything) still needs to be spoken. See V1 for detail.
         await withTimeout(avatarSpeakChainRef.current, TTS_TIMEOUT_MS).catch(
           () => {},
         );
-        isSpeakingRef.current = true;
-        try {
-          await withTimeout(voice.speak(last.content), TTS_TIMEOUT_MS);
-        } finally {
-          isSpeakingRef.current = false;
+        await withTimeout(voiceSpeakChainRef.current, TTS_TIMEOUT_MS).catch(
+          () => {},
+        );
+        if (incrementallySpokenRef.current.has(lastIdx)) {
+          incrementallySpokenRef.current.delete(lastIdx);
+        } else {
+          isSpeakingRef.current = true;
+          try {
+            await withTimeout(voice.speak(last.content), TTS_TIMEOUT_MS);
+          } finally {
+            isSpeakingRef.current = false;
+          }
         }
       }
 
@@ -901,16 +1009,29 @@ export function RoleplayPlayerV2({
   // taking: the trainee always hears the full persona reply before
   // the session closes.
   const endedFiredRef = useRef(false);
+  // Grace-period override — see V1 for rationale. If streaming or TTS
+  // gets stuck true past the cap (hung upstream, wedged audio) the
+  // session used to sit forever waiting on a turn that will never
+  // finish. Past AUTO_END_GRACE_SEC of overtime we force-end
+  // regardless of guards.
+  const AUTO_END_GRACE_SEC = 60;
   useEffect(() => {
     if (!sessionId || ending || endedFiredRef.current) return;
     if (!maxReached) return;
-    if (streaming || voice.state === "speaking") return;
+    const overtimeSec = elapsedSec - maxSec;
+    const forceEnd = overtimeSec >= AUTO_END_GRACE_SEC;
+    if (!forceEnd && (streaming || voice.state === "speaking")) return;
+    if (forceEnd) {
+      console.warn(
+        `[roleplay] force-ending: ${overtimeSec}s past cap, streaming=${streaming}, voiceState=${voice.state}`,
+      );
+    }
     endedFiredRef.current = true;
     end();
     // end() is stable for the duration of the session; ESLint can't see
     // that, so we deliberately scope deps to the trigger inputs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [maxReached, sessionId, ending, streaming, voice.state]);
+  }, [maxReached, sessionId, ending, streaming, voice.state, elapsedSec, maxSec]);
 
   // Bump the activity ref every time a turn lands — either side counts.
   useEffect(() => {
@@ -1363,13 +1484,16 @@ export function RoleplayPlayerV2({
 
   const remainingSec =
     duration && maxSec > 0 ? Math.max(0, maxSec - elapsedSec) : null;
-  const showCountdown =
+  const showEndCountdown =
     duration && maxSec > 0 && !ending && !endedFiredRef.current
       ? remainingSec !== null && remainingSec <= 30
       : false;
 
   return (
     <div className="v2-shell relative min-h-[calc(100vh-56px)] -mx-7 -mt-6 pb-32">
+      {showStartCountdown ? (
+        <StartingCountdownV2 value={countdownValue} />
+      ) : null}
       {/* Ambient background — warm dark gradient with soft accent glows */}
       <div
         className="absolute inset-0 pointer-events-none"
@@ -1601,7 +1725,7 @@ export function RoleplayPlayerV2({
         ) : null}
 
         {/* Countdown pill above the controls */}
-        {showCountdown && remainingSec != null ? (
+        {showEndCountdown && remainingSec != null ? (
           <div className="fixed left-1/2 -translate-x-1/2 bottom-28 z-40 pointer-events-none">
             <div className="rounded-full bg-[#3a2a1a] border border-[#ffb84a]/30 text-[#ffcf8a] px-4 py-1.5 text-[12px] font-semibold shadow-lg">
               {remainingSec <= 0
@@ -2839,6 +2963,39 @@ function CallControlsBar({
             <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.79 19.79 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2.03z" />
           </svg>
         </button>
+      </div>
+    </div>
+  );
+}
+
+// V2 countdown overlay — matches the dark shell aesthetic.
+function StartingCountdownV2({ value }: { value: number }) {
+  const label = value <= 0 ? "Go" : String(value);
+  return (
+    <div
+      className="fixed inset-0 z-[60] grid place-items-center backdrop-blur-md"
+      style={{ background: "rgba(15, 12, 30, 0.78)" }}
+      aria-live="polite"
+      aria-label="Roleplay starting"
+    >
+      <div className="flex flex-col items-center gap-4 text-white">
+        <div className="text-[13px] font-semibold uppercase tracking-[0.18em] opacity-80">
+          Your roleplay is starting
+        </div>
+        <div
+          key={label}
+          className="font-display leading-none tabular-nums animate-pulse"
+          style={{
+            fontSize: "144px",
+            background:
+              "linear-gradient(135deg, #e85d3a 0%, #7c5cd6 100%)",
+            WebkitBackgroundClip: "text",
+            WebkitTextFillColor: "transparent",
+          }}
+        >
+          {label}
+        </div>
+        <div className="text-[12.5px] opacity-70">Get ready…</div>
       </div>
     </div>
   );

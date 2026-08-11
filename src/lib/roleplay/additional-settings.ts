@@ -28,6 +28,10 @@ export type AdditionalSettings = {
   endRoleplayBy: "ai" | "user" | "either";
   scenarioIntroGif: { name: string; dataUrl: string } | null;
   tipsOnReportGif: { name: string; dataUrl: string } | null;
+  /** When true, /api/roleplay/turn uses Haiku 4.5 instead of Sonnet
+   *  4.6 for the persona reply. ~2× faster turn latency, slightly less
+   *  nuanced persona reasoning. Admin toggle per module. */
+  fastMode: boolean;
 };
 
 export const DEFAULT_ADDITIONAL_SETTINGS: AdditionalSettings = {
@@ -53,6 +57,7 @@ export const DEFAULT_ADDITIONAL_SETTINGS: AdditionalSettings = {
   endRoleplayBy: "ai",
   scenarioIntroGif: null,
   tipsOnReportGif: null,
+  fastMode: false,
 };
 
 const GifSchema = z
@@ -91,6 +96,9 @@ const SettingsSchema = z.object({
   endRoleplayBy: z.enum(["ai", "user", "either"]),
   scenarioIntroGif: GifSchema,
   tipsOnReportGif: GifSchema,
+  // Optional with default false — modules saved before this field
+  // existed keep loading without a re-save.
+  fastMode: z.boolean().optional().default(false),
 });
 
 /**

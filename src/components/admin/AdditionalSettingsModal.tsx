@@ -41,6 +41,10 @@ export type AdditionalSettings = {
   endRoleplayBy: "ai" | "user" | "either";
   scenarioIntroGif: { name: string; dataUrl: string } | null;
   tipsOnReportGif: { name: string; dataUrl: string } | null;
+  /** When true, /api/roleplay/turn uses Haiku 4.5 for ~2× faster
+   *  persona replies at the cost of some nuance. See runtime shape
+   *  in `src/lib/roleplay/additional-settings.ts`. */
+  fastMode: boolean;
 };
 
 export const DEFAULT_ADDITIONAL_SETTINGS: AdditionalSettings = {
@@ -70,6 +74,7 @@ export const DEFAULT_ADDITIONAL_SETTINGS: AdditionalSettings = {
   endRoleplayBy: "ai",
   scenarioIntroGif: null,
   tipsOnReportGif: null,
+  fastMode: false,
 };
 
 const MAX_GIF_BYTES = 20 * 1024 * 1024;
@@ -393,6 +398,12 @@ export function AdditionalSettingsModal({
               }
               label="Disconnect on User's Inactivity"
               info="Auto-end if the learner is idle past 30s."
+            />
+            <Check
+              checked={s.fastMode}
+              onChange={() => setS({ ...s, fastMode: !s.fastMode })}
+              label="Fast mode (Haiku)"
+              info="Uses Claude Haiku 4.5 instead of Sonnet 4.6 for persona replies. ~2× faster turn latency; slightly less nuanced replies. Recommended for practice drills; leave off for high-stakes coaching."
             />
           </section>
 
