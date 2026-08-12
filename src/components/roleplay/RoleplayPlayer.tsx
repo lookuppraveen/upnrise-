@@ -207,6 +207,7 @@ export function RoleplayPlayer({
       lastActivityRef.current = Date.now();
     }
     const t = setInterval(() => {
+      if (pausedAtRef.current !== null) return;
       if (sessionStartRef.current !== null) {
         setElapsedSec(
           Math.round((Date.now() - sessionStartRef.current) / 1000),
@@ -301,6 +302,13 @@ export function RoleplayPlayer({
   const [autoFlow, setAutoFlow] = useState(false);
   const autoFlowRef = useRef(autoFlow);
   autoFlowRef.current = autoFlow;
+  // Pause — trainee-controlled hold on the session. Freezes the
+  // elapsed timer, silences the persona, and stops the mic loop until
+  // the trainee resumes. `pausedAtRef` records when the pause began
+  // so the resume handler can advance sessionStartRef by the pause
+  // duration and keep elapsed time honest.
+  const [paused, setPaused] = useState(false);
+  const pausedAtRef = useRef<number | null>(null);
   // Pick a "learner" voice that's distinct from the persona's so the
   // two sides of the conversation sound like different people. Falls
   // through to null (the picker's selected voice) when nothing matches.
@@ -1516,6 +1524,33 @@ export function RoleplayPlayer({
     }
   }
 
+  function handleTogglePause() {
+    if (paused) {
+      const heldFor = pausedAtRef.current
+        ? Date.now() - pausedAtRef.current
+        : 0;
+      if (heldFor > 0 && sessionStartRef.current !== null) {
+        sessionStartRef.current += heldFor;
+      }
+      pausedAtRef.current = null;
+      setPaused(false);
+      return;
+    }
+    if (autoFlow) setAutoFlow(false);
+    voice.cancelSpeech();
+    voice.stopListening();
+    const av = avatarRef.current;
+    if (av && "stop" in av && typeof (av as { stop?: unknown }).stop === "function") {
+      try {
+        (av as { stop: () => void }).stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    pausedAtRef.current = Date.now();
+    setPaused(true);
+  }
+
   function handleEndClick() {
     if (
       duration?.failBelowMin &&
@@ -1866,6 +1901,8 @@ export function RoleplayPlayer({
         streaming={streaming}
         sessionReady={!!sessionId}
         ending={ending}
+        paused={paused}
+        onTogglePause={handleTogglePause}
         autoFlow={autoFlow}
         autoFlowAvailable={Boolean(hintsAllowed) && voice.ttsSupported}
         onToggleAutoFlow={handleToggleAutoFlow}
@@ -2970,6 +3007,8 @@ function CallControlsBar({
   streaming,
   sessionReady,
   ending,
+  paused,
+  onTogglePause,
   autoFlow,
   autoFlowAvailable,
   onToggleAutoFlow,
@@ -2986,6 +3025,8 @@ function CallControlsBar({
   streaming: boolean;
   sessionReady: boolean;
   ending: boolean;
+  paused: boolean;
+  onTogglePause: () => void;
   autoFlow: boolean;
   autoFlowAvailable: boolean;
   onToggleAutoFlow: () => void;
@@ -3087,6 +3128,31 @@ function CallControlsBar({
             Send now
           </button>
         ) : null}
+        {/* Pause / Resume — freezes the timer, silences the persona, and
+            closes the mic so the trainee can step away without losing the
+            session. Clicking again resumes where they left off. */}
+        <button
+          type="button"
+          onClick={onTogglePause}
+          disabled={!sessionReady || ending}
+          suppressHydrationWarning
+          aria-pressed={paused}
+          aria-label={paused ? "Resume roleplay" : "Pause roleplay"}
+          title={paused ? "Resume the roleplay" : "Pause the roleplay"}
+          className="w-[52px] h-[52px] rounded-full grid place-items-center text-white shadow-md disabled:opacity-60"
+          style={{ background: paused ? "#2a7d4f" : "#1a1a1a" }}
+        >
+          {paused ? (
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+              <path d="M8 5v14l11-7z" />
+            </svg>
+          ) : (
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+              <rect x="6" y="5" width="4" height="14" rx="1" />
+              <rect x="14" y="5" width="4" height="14" rx="1" />
+            </svg>
+          )}
+        </button>
         <button
           type="button"
           onClick={onEnd}

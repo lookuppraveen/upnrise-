@@ -193,9 +193,14 @@ export async function POST(req: Request) {
     // The opening sets the tone for the entire roleplay. Generic "Hi,
     // how can I help you?" openings waste the trainee's first turn on
     // a boilerplate exchange. We steer toward openings that:
+    //   • Greet the trainee by their first name for a personal feel
     //   • Anchor to the scenario (why we're talking today)
     //   • Give the trainee something concrete to engage with
     //   • Sound like a real person, not a receptionist script
+    const firstName = (user.name ?? "").trim().split(/\s+/)[0] ?? "";
+    const greetingLine = firstName
+      ? `MUST start with the exact phrase "Hello ${firstName}," (a warm, personal greeting using the learner's first name).`
+      : `MUST start with "Hello there,".`;
     const completion = await anthropic.messages.create({
       model: ROLEPLAY_MODEL,
       max_tokens: 180,
@@ -209,8 +214,7 @@ export async function POST(req: Request) {
       messages: [
         {
           role: "user",
-          content:
-            "[The learner has just connected and is waiting for you to speak. Open the conversation in character with a single line, 1–2 sentences (25 words max total). Ground the opening in THIS specific scenario — reference what brought you here, what you're looking for, or a specific concern you have — so the learner has something concrete to respond to. Avoid empty pleasantries like 'How can I help you?' or 'Nice to meet you'; get to the point quickly. Speak like a real person, not a script.]",
+          content: `[The learner has just connected and is waiting for you to speak. Open the conversation in character with 1–2 sentences (30 words max total). ${greetingLine} After the greeting, immediately anchor to THIS specific scenario — reference what brought you here, what you're looking for, or a specific concern — so the learner has something concrete to respond to. Do NOT begin with "Hey", "Hi", or generic filler; the opening MUST begin with "Hello". Speak like a real person, not a script.]`,
         },
       ],
     });

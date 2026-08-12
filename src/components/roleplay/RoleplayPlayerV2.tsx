@@ -202,6 +202,7 @@ export function RoleplayPlayerV2({
       lastActivityRef.current = Date.now();
     }
     const t = setInterval(() => {
+      if (pausedAtRef.current !== null) return;
       if (sessionStartRef.current !== null) {
         setElapsedSec(
           Math.round((Date.now() - sessionStartRef.current) / 1000),
@@ -293,6 +294,13 @@ export function RoleplayPlayerV2({
   const [autoFlow, setAutoFlow] = useState(false);
   const autoFlowRef = useRef(autoFlow);
   autoFlowRef.current = autoFlow;
+  // Pause — trainee-controlled hold on the session. Freezes the
+  // elapsed timer, silences the persona, and stops the mic loop until
+  // the trainee resumes. `pausedAtRef` records when the pause began
+  // so the resume handler can advance sessionStartRef by the pause
+  // duration and keep elapsed time honest.
+  const [paused, setPaused] = useState(false);
+  const pausedAtRef = useRef<number | null>(null);
   // Pick a "learner" voice that's distinct from the persona's so the
   // two sides of the conversation sound like different people. Falls
   // through to null (the picker's selected voice) when nothing matches.
@@ -1423,6 +1431,36 @@ export function RoleplayPlayerV2({
     }
   }
 
+  function handleTogglePause() {
+    if (paused) {
+      const heldFor = pausedAtRef.current
+        ? Date.now() - pausedAtRef.current
+        : 0;
+      if (heldFor > 0 && sessionStartRef.current !== null) {
+        sessionStartRef.current += heldFor;
+      }
+      pausedAtRef.current = null;
+      setPaused(false);
+      return;
+    }
+    // Entering pause: silence any in-flight speech + close the mic so
+    // the trainee's break is actually quiet. Auto-flow is a hands-off
+    // demo loop; snap it off so it doesn't tick over on resume.
+    if (autoFlow) setAutoFlow(false);
+    voice.cancelSpeech();
+    voice.stopListening();
+    const av = avatarRef.current;
+    if (av && "stop" in av && typeof (av as { stop?: unknown }).stop === "function") {
+      try {
+        (av as { stop: () => void }).stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    pausedAtRef.current = Date.now();
+    setPaused(true);
+  }
+
   function handleEndClick() {
     if (
       duration?.failBelowMin &&
@@ -1765,6 +1803,8 @@ export function RoleplayPlayerV2({
             streaming={streaming}
             sessionReady={!!sessionId}
             ending={ending}
+            paused={paused}
+            onTogglePause={handleTogglePause}
             autoFlow={autoFlow}
             autoFlowAvailable={Boolean(hintsAllowed) && voice.ttsSupported}
             onToggleAutoFlow={handleToggleAutoFlow}
@@ -3415,6 +3455,8 @@ function ControlPill({
   streaming,
   sessionReady,
   ending,
+  paused,
+  onTogglePause,
   autoFlow,
   autoFlowAvailable,
   onToggleAutoFlow,
@@ -3433,6 +3475,8 @@ function ControlPill({
   streaming: boolean;
   sessionReady: boolean;
   ending: boolean;
+  paused: boolean;
+  onTogglePause: () => void;
   autoFlow: boolean;
   autoFlowAvailable: boolean;
   onToggleAutoFlow: () => void;
@@ -3552,6 +3596,39 @@ function ControlPill({
           Send now
         </button>
       ) : null}
+
+      {/* Pause / Resume — freezes the timer, silences the persona, and
+          closes the mic so the trainee can step away without losing the
+          session. Clicking again resumes where they left off. */}
+      <button
+        type="button"
+        onClick={onTogglePause}
+        disabled={!sessionReady || ending}
+        suppressHydrationWarning
+        aria-pressed={paused}
+        aria-label={paused ? "Resume roleplay" : "Pause roleplay"}
+        title={paused ? "Resume the roleplay" : "Pause the roleplay"}
+        className={cn(
+          "w-11 h-11 rounded-full grid place-items-center text-white transition-colors shadow-md",
+          "disabled:opacity-40 disabled:cursor-not-allowed",
+        )}
+        style={{
+          background: paused
+            ? "linear-gradient(135deg, #3ea56a, #2a7d4f)"
+            : "rgba(255,255,255,0.10)",
+        }}
+      >
+        {paused ? (
+          <svg width={16} height={16} viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+            <path d="M8 5v14l11-7z" />
+          </svg>
+        ) : (
+          <svg width={16} height={16} viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+            <rect x="6" y="5" width="4" height="14" rx="1" />
+            <rect x="14" y="5" width="4" height="14" rx="1" />
+          </svg>
+        )}
+      </button>
 
       {/* End call */}
       <button
