@@ -27,10 +27,8 @@
 import { z } from "zod";
 import { after } from "next/server";
 import { getSessionUser } from "@/lib/auth/session";
-import {
-  streamTts,
-  DEFAULT_TTS_MODEL,
-} from "@/lib/voice/elevenlabs-tts-stream";
+import { DEFAULT_TTS_MODEL } from "@/lib/voice/elevenlabs-tts-stream";
+import { getTtsDriver } from "@/lib/tts";
 import { pickDefaultVoice } from "@/lib/voice/voice-catalog";
 import { estimateTtsCostCents } from "@/lib/voice/cost";
 import {
@@ -53,26 +51,36 @@ const Body = z.object({
 });
 
 export async function POST(req: Request) {
+  const tHandlerStart = performance.now();
   const user = await getSessionUser();
   if (!user) return jsonError(401, "unauthorized");
   if (user.role !== "trainee" && user.role !== "admin")
     return jsonError(403, "forbidden");
 
-  const providerDefault = process.env.VOICE_PROVIDER_DEFAULT ?? "elevenlabs";
-  const apiKey = process.env.ELEVENLABS_API_KEY;
-  if (providerDefault !== "elevenlabs" || !apiKey)
+  // VOICE_PROVIDER_DEFAULT=browser is the operator-side kill-switch that
+  // forces every tenant onto browser TTS regardless of TtsProvider rows.
+  if ((process.env.VOICE_PROVIDER_DEFAULT ?? "elevenlabs") === "browser")
     return jsonError(503, "provider_disabled");
 
   const parsed = Body.safeParse(await req.json().catch(() => null));
   if (!parsed.success) return jsonError(400, "bad_body");
 
-  const voiceId =
-    parsed.data.voiceId ?? pickDefaultVoice(parsed.data.gender ?? null).id;
-  const model = parsed.data.model ?? DEFAULT_TTS_MODEL;
+  const companyId = user.companyId;
+  const driver = await getTtsDriver(companyId ?? null);
+  if (!driver) return jsonError(503, "provider_disabled");
+
+  // For ElevenLabs we keep the "voice-catalog default when the caller
+  // didn't specify" behavior; for Sarvam the driver's own default speaker
+  // wins because the catalog is ElevenLabs-only.
+  const fallbackVoice =
+    driver.kind === "elevenlabs"
+      ? pickDefaultVoice(parsed.data.gender ?? null).id
+      : (driver.defaultVoiceId ?? "meera");
+  const voiceId = parsed.data.voiceId ?? driver.defaultVoiceId ?? fallbackVoice;
+  const model = parsed.data.model ?? driver.defaultModel ?? DEFAULT_TTS_MODEL;
   const sessionId = parsed.data.sessionId ?? null;
   const kind: "tts" | "tts_preview" = sessionId ? "tts" : "tts_preview";
   const charsIn = parsed.data.text.length;
-  const companyId = user.companyId;
 
   // Cap enforcement — session cap only applies to real sessions
   // (previews are unbounded, admin's problem). Tenant cap applies to
@@ -112,19 +120,20 @@ export async function POST(req: Request) {
     }
   }
 
-  const upstream = await streamTts({
-    apiKey,
-    voiceId,
-    text: parsed.data.text,
-    model,
-    signal: req.signal,
-  }).catch((err: unknown) => {
-    console.error(
-      "[roleplay/tts] elevenlabs fetch threw",
-      err instanceof Error ? err.message : err,
-    );
-    return null;
-  });
+  const upstream = await driver
+    .streamTts({
+      voiceId,
+      text: parsed.data.text,
+      model,
+      signal: req.signal,
+    })
+    .catch((err: unknown) => {
+      console.error(
+        `[roleplay/tts] ${driver.kind} fetch threw`,
+        err instanceof Error ? err.message : err,
+      );
+      return null;
+    });
 
   if (!upstream || !upstream.ok || !upstream.body) {
     const statusMsg = upstream ? `${upstream.status}` : "network";
@@ -170,12 +179,22 @@ export async function POST(req: Request) {
     });
   }
 
+  // Sarvam returns audio/wav, ElevenLabs returns audio/mpeg. Honor the
+  // upstream Content-Type so the browser <audio> element picks the right
+  // decoder without us hard-coding a MIME.
+  const contentType =
+    upstream.headers.get("Content-Type") ?? "audio/mpeg";
+  // Handler time here = TTS TTFB from the client's perspective, since we
+  // haven't started piping the audio yet (upstream stream just opened).
+  const handlerMs = Math.round(performance.now() - tHandlerStart);
   return new Response(upstream.body, {
     status: 200,
     headers: {
-      "Content-Type": "audio/mpeg",
+      "Content-Type": contentType,
       "Cache-Control": "no-store",
       "X-TTS-Voice": voiceId,
+      "X-TTS-Provider": driver.kind,
+      "X-Handler-Ms": String(handlerMs),
     },
   });
 }

@@ -27,6 +27,7 @@ const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
 const STT_MODEL = process.env.ELEVENLABS_STT_MODEL ?? "scribe_v1";
 
 export async function POST(req: Request) {
+  const tHandlerStart = performance.now();
   const user = await getSessionUser();
   if (!user)
     return jsonError(401, "unauthorized");
@@ -91,6 +92,7 @@ export async function POST(req: Request) {
       });
     }
 
+    const handlerMs = Math.round(performance.now() - tHandlerStart);
     return new Response(
       JSON.stringify({
         text: result.text,
@@ -101,6 +103,7 @@ export async function POST(req: Request) {
         headers: {
           "Content-Type": "application/json",
           "Cache-Control": "no-store",
+          "X-Handler-Ms": String(handlerMs),
         },
       },
     );

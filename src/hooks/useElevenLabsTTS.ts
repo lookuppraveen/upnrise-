@@ -39,6 +39,7 @@ function canStreamAudioMp3(): boolean {
 }
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { pushTiming, getTurn } from "@/lib/roleplay/latency-telemetry";
 
 export type ElevenLabsSpeakOpts = {
   voiceId?: string;
@@ -50,10 +51,32 @@ export type ElevenLabsSpeakOpts = {
   sessionId?: string | null;
 };
 
+/**
+ * Handle returned by `prepare()`. The fetch is already in flight; call
+ * `play()` when you want to hear it. Multiple prepared handles can be
+ * held simultaneously so their fetches parallelize — the caller is
+ * responsible for playing them in the right order (usually via a chain
+ * so the single shared audio element only plays one at a time).
+ */
+export type PreparedSpeech = {
+  /** Consume the buffered/streaming response and play it end-to-end. */
+  play: () => Promise<void>;
+  /** Abort the underlying fetch + playback if it hasn't been played yet. */
+  cancel: () => void;
+};
+
 export type UseElevenLabsTTSResult = {
   /** Play `text` and resolve on `ended`. Throws on any error so the
    *  caller can fall back to browser TTS for that utterance. */
   speak: (text: string, opts?: ElevenLabsSpeakOpts) => Promise<void>;
+  /** Start the TTS fetch now and return a handle whose `play()` method
+   *  consumes the response later. Enables pipelining: prepare(N+1) while
+   *  N is still playing so the network round-trip lands in parallel
+   *  with the audio, eliminating the perceptible gap between chunks. */
+  prepare: (
+    text: string,
+    opts?: ElevenLabsSpeakOpts,
+  ) => Promise<PreparedSpeech>;
   /** Cancel any in-flight fetch + playback. Safe to call multiple times. */
   cancel: () => void;
   /** True while the audio element is playing back (used to drive the
@@ -70,7 +93,10 @@ export function useElevenLabsTTS(): UseElevenLabsTTSResult {
   // The trainee clicks Start (user gesture) → the persona's opening
   // line plays → every subsequent turn reuses the primed element.
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
+  // Every prepare() gets its own controller so cancel() can abort them
+  // all in one pass — including ones whose fetch has resolved but whose
+  // play() hasn't been called yet (pipelined queue).
+  const preparedControllersRef = useRef<Set<AbortController>>(new Set());
   const objectUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -94,10 +120,15 @@ export function useElevenLabsTTS(): UseElevenLabsTTSResult {
   }, []);
 
   const cancel = useCallback(() => {
-    if (abortRef.current) {
-      abortRef.current.abort();
-      abortRef.current = null;
+    // Abort every prepared handle — in-flight fetches, buffered-but-
+    // unplayed responses, and the currently-playing one. Clearing the
+    // set inside the loop is safe because each controller's own
+    // teardown deletes itself; iterating a snapshot avoids a mutate-
+    // during-iterate surprise.
+    for (const c of Array.from(preparedControllersRef.current)) {
+      c.abort();
     }
+    preparedControllersRef.current.clear();
     const a = audioRef.current;
     if (a) {
       try {
@@ -116,22 +147,27 @@ export function useElevenLabsTTS(): UseElevenLabsTTSResult {
     setPlaying(false);
   }, []);
 
-  const speak = useCallback(
-    async (text: string, opts?: ElevenLabsSpeakOpts): Promise<void> => {
+  const prepare = useCallback(
+    async (
+      text: string,
+      opts?: ElevenLabsSpeakOpts,
+    ): Promise<PreparedSpeech> => {
       const trimmed = text.trim();
-      if (!trimmed) return;
+      if (!trimmed) {
+        // Empty text — hand back a no-op handle so callers don't have
+        // to special-case blanks.
+        return { play: async () => {}, cancel: () => {} };
+      }
       const audio = audioRef.current;
       if (!audio) throw new Error("audio_element_missing");
 
-      // Kill any prior in-flight fetch / playback so overlapping turns
-      // don't queue.
-      cancel();
-
       const controller = new AbortController();
-      abortRef.current = controller;
+      preparedControllersRef.current.add(controller);
 
+      let res: Response;
       try {
-        const res = await fetch("/api/roleplay/tts", {
+        const tFetchStart = performance.now();
+        res = await fetch("/api/roleplay/tts", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -143,43 +179,88 @@ export function useElevenLabsTTS(): UseElevenLabsTTSResult {
           }),
           signal: controller.signal,
         });
-        if (!res.ok) {
-          const status = res.status;
-          throw new Error(`tts_${status}`);
-        }
-
-        // MediaSource path when the browser can decode chunked mp3 —
-        // first word plays ~2-3× sooner than the blob approach.
-        if (canStreamAudioMp3() && res.body) {
-          await playViaMediaSource(
-            audio,
-            res.body,
-            controller.signal,
-            setPlaying,
-          );
-          return;
-        }
-
-        // Fallback: buffer the whole response, play as a blob. iOS
-        // Safari <17.1 lands here; so does anything without MSE.
-        await playViaBlob(audio, res, controller.signal, setPlaying, (url) => {
-          objectUrlRef.current = url;
+        // TTFB (headers received) — the audio hasn't started playing yet
+        // but this is the number that determines "how long before the
+        // trainee hears the first byte".
+        const ttfbMs = Math.round(performance.now() - tFetchStart);
+        const serverMsHeader = res.headers.get("X-Handler-Ms");
+        const serverMs = serverMsHeader ? Number(serverMsHeader) : undefined;
+        pushTiming({
+          turn: getTurn(),
+          kind: "tts",
+          totalMs: ttfbMs,
+          serverMs,
         });
-      } catch (err) {
-        // AbortError is expected on cancel — swallow it, everything else
-        // bubbles so the caller can fall back to browser TTS.
-        if (err instanceof Error && err.name === "AbortError") return;
-        throw err;
-      } finally {
-        if (abortRef.current === controller) {
-          abortRef.current = null;
+        if (!res.ok) {
+          throw new Error(`tts_${res.status}`);
         }
+      } catch (err) {
+        preparedControllersRef.current.delete(controller);
+        if (err instanceof Error && err.name === "AbortError") {
+          // Silent — caller cancelled before headers arrived.
+          return { play: async () => {}, cancel: () => {} };
+        }
+        throw err;
       }
+
+      let played = false;
+      return {
+        play: async () => {
+          if (played) return;
+          played = true;
+          try {
+            if (controller.signal.aborted) return;
+            if (canStreamAudioMp3() && res.body) {
+              await playViaMediaSource(
+                audio,
+                res.body,
+                controller.signal,
+                setPlaying,
+              );
+              return;
+            }
+            await playViaBlob(
+              audio,
+              res,
+              controller.signal,
+              setPlaying,
+              (url) => {
+                objectUrlRef.current = url;
+              },
+            );
+          } catch (err) {
+            if (err instanceof Error && err.name === "AbortError") return;
+            throw err;
+          } finally {
+            preparedControllersRef.current.delete(controller);
+          }
+        },
+        cancel: () => {
+          if (played) return;
+          controller.abort();
+          preparedControllersRef.current.delete(controller);
+        },
+      };
     },
-    [cancel],
+    [],
   );
 
-  return { speak, cancel, playing };
+  // speak() = cancel-any-existing + prepare + play. Kept for callers
+  // that want the classic one-shot behavior (barge-in cancel of prior
+  // audio, then this line takes over). Pipelined callers should use
+  // prepare() directly.
+  const speak = useCallback(
+    async (text: string, opts?: ElevenLabsSpeakOpts): Promise<void> => {
+      const trimmed = text.trim();
+      if (!trimmed) return;
+      cancel();
+      const prep = await prepare(trimmed, opts);
+      await prep.play();
+    },
+    [cancel, prepare],
+  );
+
+  return { speak, prepare, cancel, playing };
 }
 
 // ───────────────────────────────────────────────────────────────

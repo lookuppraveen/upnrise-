@@ -128,6 +128,27 @@ enum VideoProviderKind {
   elevenlabs
 }
 
+// Chat LLM providers a tenant can plug into. Anthropic is the default
+// runtime today; Sarvam is an OpenAI-compatible option for Indic-language
+// text generation. Only the "simple text-gen" call sites (weekly briefs,
+// scoring-adjacent one-shots) actually route through the LlmProvider
+// factory — the Anthropic-tool-use Copilot loops stay hardcoded on
+// Anthropic until the factory grows an Anthropic↔OpenAI translation
+// layer. New providers add here + a driver in src/lib/ai/llm.ts.
+enum LlmProviderKind {
+  anthropic
+  sarvam
+}
+
+// TTS providers a tenant can plug into. ElevenLabs is the default runtime
+// used by the live roleplay TTS route; Sarvam's Bulbul voices are the
+// value-add for Indic personas. Add a driver in src/lib/tts/providers/
+// and wire it in src/lib/tts/index.ts.
+enum TtsProviderKind {
+  elevenlabs
+  sarvam
+}
+
 enum FeedbackKind {
   ai
   human
@@ -249,6 +270,8 @@ model Company {
   didPortraits           DidPortrait[]
   questionBankItems      QuestionBankItem[]
   voiceUsageLogs         VoiceUsageLog[]
+  llmProviders           LlmProvider[]
+  ttsProviders           TtsProvider[]
 
   @@map("companies")
 }
@@ -747,6 +770,53 @@ model VideoProvider {
 
   @@index([companyId])
   @@map("video_providers")
+}
+
+// Tenant-configured chat LLM provider. Same one-default-at-a-time shape
+// as VideoProvider. When a call site resolves through getLlmClient()
+// it picks the row with isDefault=true; a missing row means "use the
+// platform default" (Anthropic + platform-settings model). apiKey is
+// stored plaintext for v1 — future pass should encrypt at rest.
+model LlmProvider {
+  id           String          @id @default(uuid()) @db.Uuid
+  companyId    String          @map("company_id") @db.Uuid
+  kind         LlmProviderKind
+  label        String?
+  apiKey       String          @map("api_key")
+  // Optional overrides. baseUrl only matters for OpenAI-compat providers
+  // (e.g. Sarvam's https://api.sarvam.ai/v1); Anthropic ignores it.
+  baseUrl      String?         @map("base_url")
+  defaultModel String?         @map("default_model")
+  fastModel    String?         @map("fast_model")
+  isDefault    Boolean         @default(false) @map("is_default")
+  createdAt    DateTime        @default(now()) @map("created_at")
+  updatedAt    DateTime        @updatedAt @map("updated_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@map("llm_providers")
+}
+
+// Tenant-configured TTS provider. Mirrors LlmProvider — one default at a
+// time, blank apiKey pulls from the env fallback (ELEVENLABS_API_KEY or
+// SARVAM_API_KEY) at create time.
+model TtsProvider {
+  id        String          @id @default(uuid()) @db.Uuid
+  companyId String          @map("company_id") @db.Uuid
+  kind      TtsProviderKind
+  label     String?
+  apiKey    String          @map("api_key")
+  voiceId   String?         @map("voice_id")
+  model     String?
+  isDefault Boolean         @default(false) @map("is_default")
+  createdAt DateTime        @default(now()) @map("created_at")
+  updatedAt DateTime        @updatedAt @map("updated_at")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@map("tts_providers")
 }
 
 // Tenant-scoped library of D-ID portraits the admin has uploaded via

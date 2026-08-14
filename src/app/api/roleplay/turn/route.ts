@@ -38,6 +38,7 @@ const Body = z.object({
 });
 
 export async function POST(req: Request) {
+  const tHandlerStart = performance.now();
   const user = await getSessionUser();
   if (!user) return new Response("unauthorized", { status: 401 });
   if (user.role !== "trainee" && user.role !== "admin")
@@ -198,11 +199,16 @@ export async function POST(req: Request) {
     },
   });
 
+  // Server-side setup time = everything up to the point we hand the
+  // stream off. Client-side TTFB minus this = pure Anthropic latency +
+  // network. Handy signal for whether slow turns are the model or us.
+  const setupMs = Math.round(performance.now() - tHandlerStart);
   return new Response(stream, {
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
       "Cache-Control": "no-cache",
       "X-Accel-Buffering": "no", // disable proxy buffering
+      "X-Handler-Setup-Ms": String(setupMs),
     },
   });
 }

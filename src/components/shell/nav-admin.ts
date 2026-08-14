@@ -87,6 +87,18 @@ export const ADMIN_SHELL: ShellConfig = {
           icon: "play",
           ai: true,
         },
+        {
+          label: "LLM Providers",
+          href: "/admin/llm-providers",
+          icon: "ai-sparkle",
+          ai: true,
+        },
+        {
+          label: "TTS Providers",
+          href: "/admin/tts-providers",
+          icon: "mic",
+          ai: true,
+        },
       ],
     },
   ],
@@ -175,6 +187,16 @@ export const ADMIN_SHELL: ShellConfig = {
       match: "/admin/video-providers",
       title: "Avatars & Voices",
       subtitle: "Avatar render integrations (HeyGen, Synthesia, D-ID)",
+    },
+    {
+      match: "/admin/llm-providers",
+      title: "Chat LLM Providers",
+      subtitle: "Per-tenant chat model keys (Anthropic, Sarvam)",
+    },
+    {
+      match: "/admin/tts-providers",
+      title: "TTS Providers",
+      subtitle: "Per-tenant TTS keys for live roleplay voices",
     },
   ],
 };

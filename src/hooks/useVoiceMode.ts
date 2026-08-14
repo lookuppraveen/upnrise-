@@ -31,7 +31,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useElevenLabsTTS } from "./useElevenLabsTTS";
+import { useElevenLabsTTS, type PreparedSpeech } from "./useElevenLabsTTS";
 import { useElevenLabsSTT, type SttError } from "./useElevenLabsSTT";
 
 export type { SttError };
@@ -119,11 +119,31 @@ export function useVoiceMode(opts: {
   /** ms of consecutive silence before pending transcript is committed
    *  in active mode. Default 1800. */
   silenceThresholdMs?: number;
+  /** Enable per-user adaptive silence tuning inside the STT hook.
+   *  Defaults to true; pass `false` for deterministic tests. */
+  adaptive?: boolean;
+  /** localStorage key the adaptive delta is persisted under. When
+   *  omitted the delta is memory-only and resets on reload. Include
+   *  the trainee's userId so different users on the same device don't
+   *  overwrite each other. */
+  adaptiveStorageKey?: string;
 }): {
   state: VoiceState;
   ttsSupported: boolean;
   sttSupported: boolean;
   speak: (text: string, opts?: { voiceUri?: string | null }) => Promise<void>;
+  /**
+   * Pipelined variant of speak: fires the TTS fetch NOW and returns a
+   * handle whose play() consumes the response later. Callers chaining
+   * multiple sentences should prepare(N+1) while N is still playing so
+   * the network round-trips parallelize and there's no audible gap
+   * between chunks. On the browser-TTS fallback path prepare defers
+   * everything to play() since browser SpeechSynthesis can't pre-fetch.
+   */
+  prepare: (
+    text: string,
+    opts?: { voiceUri?: string | null },
+  ) => Promise<{ play: () => Promise<void>; cancel: () => void }>;
   /** Open the mic. `mode: "background"` listens for interruption only
    *  (no silence commit); `mode: "active"` (default) commits on silence. */
   startListening: (opts?: { mode?: ListeningMode }) => void;
@@ -159,6 +179,8 @@ export function useVoiceMode(opts: {
     onTranscript,
     onInterruption,
     silenceThresholdMs = DEFAULT_SILENCE_MS,
+    adaptive = true,
+    adaptiveStorageKey,
   } = opts;
   const [state, setState] = useState<VoiceState>("idle");
 
@@ -172,6 +194,8 @@ export function useVoiceMode(opts: {
     languageCode: normalizeLangForScribe(lang),
     silenceThresholdMs,
     sessionId,
+    adaptive,
+    adaptiveStorageKey,
     onTranscript,
     onInterruption,
   });
@@ -507,6 +531,80 @@ export function useVoiceMode(opts: {
     ],
   );
 
+  const prepare = useCallback(
+    async (
+      text: string,
+      opts?: { voiceUri?: string | null },
+    ): Promise<{ play: () => Promise<void>; cancel: () => void }> => {
+      const trimmed = text.trim();
+      if (!enabled || !trimmed) {
+        return { play: async () => {}, cancel: () => {} };
+      }
+      const useEleven =
+        !!elevenLabsVoiceId && !opts?.voiceUri && !elevenLabsFailedRef.current;
+      if (!useEleven) {
+        // Browser SpeechSynthesis can't pre-fetch — everything happens
+        // inside play(). Hand back a lazy handle so callers can chain
+        // both paths uniformly.
+        return {
+          play: () => speakWithBrowser(text, opts),
+          cancel: () => {
+            if (ttsSupported) window.speechSynthesis?.cancel();
+          },
+        };
+      }
+      // Kick the EL fetch NOW so it races the previous chunk's audio.
+      let elHandle: PreparedSpeech | null = null;
+      try {
+        elHandle = await elevenLabs.prepare(text, {
+          voiceId: elevenLabsVoiceId!,
+          sessionId,
+        });
+      } catch (err) {
+        console.warn(
+          "[voice] ElevenLabs prepare failed, falling back to browser TTS:",
+          err instanceof Error ? err.message : err,
+        );
+        elevenLabsFailedRef.current = true;
+        return {
+          play: () => speakWithBrowser(text, opts),
+          cancel: () => {
+            if (ttsSupported) window.speechSynthesis?.cancel();
+          },
+        };
+      }
+      return {
+        play: async () => {
+          if (ttsSupported) window.speechSynthesis?.cancel();
+          setState("speaking");
+          try {
+            await elHandle!.play();
+            setState((s) => {
+              if (s !== "speaking") return s;
+              return wantsListeningRef.current ? "listening" : "idle";
+            });
+          } catch (err) {
+            console.warn(
+              "[voice] ElevenLabs play failed, falling back to browser TTS:",
+              err instanceof Error ? err.message : err,
+            );
+            elevenLabsFailedRef.current = true;
+            await speakWithBrowser(text, opts);
+          }
+        },
+        cancel: () => elHandle!.cancel(),
+      };
+    },
+    [
+      enabled,
+      ttsSupported,
+      elevenLabsVoiceId,
+      elevenLabs,
+      speakWithBrowser,
+      sessionId,
+    ],
+  );
+
   const startListening = useCallback(
     (opts?: { mode?: ListeningMode }) => {
       if (!enabled) return;
@@ -641,6 +739,7 @@ export function useVoiceMode(opts: {
     ttsSupported,
     sttSupported: combinedSttSupported,
     speak,
+    prepare,
     startListening,
     setListeningMode,
     stopListening,

@@ -51,7 +51,11 @@ export default async function HistoryPage() {
         history={rows}
         aiBrief={
           <Suspense fallback={<HistoryBriefFallback />}>
-            <HistoryBriefText userId={user.id} signal={signal} />
+            <HistoryBriefText
+              userId={user.id}
+              companyId={user.companyId ?? null}
+              signal={signal}
+            />
           </Suspense>
         }
       />
@@ -61,12 +65,14 @@ export default async function HistoryPage() {
 
 async function HistoryBriefText({
   userId,
+  companyId,
   signal,
 }: {
   userId: string;
+  companyId: string | null;
   signal: TraineeWeeklySignal;
 }) {
-  const text = await generateTraineeWeeklyBrief({ userId, signal });
+  const text = await generateTraineeWeeklyBrief({ userId, companyId, signal });
   return <>{text}</>;
 }
 

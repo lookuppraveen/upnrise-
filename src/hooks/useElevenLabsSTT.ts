@@ -25,6 +25,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { pushTiming, getTurn } from "@/lib/roleplay/latency-telemetry";
 
 type ListeningMode = "active" | "background";
 
@@ -87,6 +88,36 @@ const DEFAULT_SILENCE_MS = 1200;
 const LONG_UTTERANCE_MS = 6_000;
 const LONG_UTTERANCE_BONUS_MS = 1_400;
 
+// Per-user adaptive silence tuner (Phase 5.2).
+//
+// The base `silenceThresholdMs` prop is a sensible default; some
+// trainees pause a lot mid-thought (bump the threshold up so we don't
+// cut them off), others speak in tight bursts (bring it down so the
+// AI reply feels instant). We adjust an internal delta based on two
+// live signals over the course of a session:
+//
+//   Signal A — "cut off": trainee starts speaking again within
+//     ADAPTIVE_RESUME_WINDOW_MS of the last commit. Bump delta up by
+//     ADAPTIVE_BUMP_UP_MS (up to ADAPTIVE_MAX_MS effective).
+//   Signal B — "clean run": ADAPTIVE_CLEAN_RUN_TARGET consecutive
+//     commits with no cut-off signal. Bump delta down by
+//     ADAPTIVE_BUMP_DOWN_MS (down to ADAPTIVE_MIN_MS effective).
+//
+// Persisted to localStorage under `adaptiveStorageKey` so the tuning
+// carries across page reloads for the same trainee-on-device.
+const ADAPTIVE_MIN_MS = 800;
+const ADAPTIVE_MAX_MS = 2400;
+const ADAPTIVE_BUMP_UP_MS = 250;
+const ADAPTIVE_BUMP_DOWN_MS = 150;
+const ADAPTIVE_RESUME_WINDOW_MS = 2000;
+const ADAPTIVE_CLEAN_RUN_TARGET = 5;
+const ADAPTIVE_DELTA_MIN = -1200;
+const ADAPTIVE_DELTA_MAX = 1200;
+
+function clampDelta(ms: number): number {
+  return Math.min(ADAPTIVE_DELTA_MAX, Math.max(ADAPTIVE_DELTA_MIN, ms));
+}
+
 function pickMimeType(): string | null {
   if (typeof window === "undefined" || typeof MediaRecorder === "undefined") {
     return null;
@@ -112,6 +143,14 @@ type Options = {
    *  attribution. Null before start returns; TTS route accepts
    *  omitted sessionId so a leading gap doesn't error. */
   sessionId?: string | null;
+  /** Enable the per-user adaptive silence tuner (default true). Turn
+   *  off for tests / deterministic playback. */
+  adaptive?: boolean;
+  /** localStorage key the adaptive delta persists under. Include the
+   *  userId (`rp:silence-delta:v1:<userId>`) so different trainees on
+   *  the same device don't overwrite each other. When omitted the
+   *  delta is memory-only and resets on reload. */
+  adaptiveStorageKey?: string;
   onTranscript: (text: string) => void;
   /** Fired when speech is detected during "background" mode (used by
    *  the player to cancel persona TTS). */
@@ -156,6 +195,8 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
     languageCode,
     silenceThresholdMs = DEFAULT_SILENCE_MS,
     sessionId,
+    adaptive = true,
+    adaptiveStorageKey,
     onTranscript,
     onInterruption,
   } = opts;
@@ -210,6 +251,113 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
   // flooded but we can still see mode + volume + threshold health.
   const lastTraceAtRef = useRef(0);
 
+  // Adaptive silence-tuner state. Survives startVadLoop resets — we
+  // want the delta to accumulate across the whole session.
+  const adaptiveDeltaRef = useRef(0);
+  const lastCommitAtRef = useRef<number | null>(null);
+  const cleanRunRef = useRef(0);
+  const adaptiveEnabledRef = useRef(adaptive);
+  const adaptiveStorageKeyRef = useRef(adaptiveStorageKey ?? null);
+  useEffect(() => {
+    adaptiveEnabledRef.current = adaptive;
+  }, [adaptive]);
+  useEffect(() => {
+    adaptiveStorageKeyRef.current = adaptiveStorageKey ?? null;
+  }, [adaptiveStorageKey]);
+  // Load a previously-persisted delta on mount. Best-effort — if
+  // localStorage is unavailable (Safari private mode etc.) we just
+  // start fresh at 0.
+  useEffect(() => {
+    if (!adaptiveStorageKey) return;
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem(adaptiveStorageKey);
+      if (!raw) return;
+      const parsed = Number(raw);
+      if (Number.isFinite(parsed)) {
+        adaptiveDeltaRef.current = clampDelta(parsed);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [adaptiveStorageKey]);
+
+  function effectiveSilenceMs(): number {
+    const base = silenceThresholdRef.current;
+    if (!adaptiveEnabledRef.current) return base;
+    const eff = base + adaptiveDeltaRef.current;
+    return Math.min(ADAPTIVE_MAX_MS, Math.max(ADAPTIVE_MIN_MS, eff));
+  }
+
+  function persistAdaptiveDelta() {
+    const key = adaptiveStorageKeyRef.current;
+    if (!key) return;
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(key, String(adaptiveDeltaRef.current));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // Called from the VAD's speech-onset branch. If the user starts
+  // talking again within ADAPTIVE_RESUME_WINDOW_MS of the last commit,
+  // we probably cut them off — bump delta up. Otherwise increment the
+  // clean-run counter and, once it hits ADAPTIVE_CLEAN_RUN_TARGET,
+  // bump delta down.
+  function noteSpeechOnset() {
+    if (!adaptiveEnabledRef.current) return;
+    const lastCommit = lastCommitAtRef.current;
+    if (lastCommit === null) return;
+    const gap = Date.now() - lastCommit;
+    // Only the FIRST onset after a commit should trigger tuning — clear
+    // the ref so subsequent VAD noise inside the same utterance can't
+    // repeatedly bump the delta.
+    lastCommitAtRef.current = null;
+    if (gap < ADAPTIVE_RESUME_WINDOW_MS) {
+      const prev = adaptiveDeltaRef.current;
+      adaptiveDeltaRef.current = clampDelta(prev + ADAPTIVE_BUMP_UP_MS);
+      cleanRunRef.current = 0;
+      if (adaptiveDeltaRef.current !== prev) {
+        persistAdaptiveDelta();
+        console.log("[stt-vad] adaptive bump UP", {
+          gap,
+          delta: adaptiveDeltaRef.current,
+          effective: effectiveSilenceMs(),
+        });
+        // totalMs = new effective silence gate; serverMs = the delta.
+        // Surfaces in the debug pill under the "adapt" column so devs
+        // can watch tuning happen in real time.
+        pushTiming({
+          turn: getTurn(),
+          kind: "adapt",
+          totalMs: effectiveSilenceMs(),
+          serverMs: adaptiveDeltaRef.current,
+        });
+      }
+    } else {
+      cleanRunRef.current += 1;
+      if (cleanRunRef.current >= ADAPTIVE_CLEAN_RUN_TARGET) {
+        cleanRunRef.current = 0;
+        const prev = adaptiveDeltaRef.current;
+        adaptiveDeltaRef.current = clampDelta(prev - ADAPTIVE_BUMP_DOWN_MS);
+        if (adaptiveDeltaRef.current !== prev) {
+          persistAdaptiveDelta();
+          console.log("[stt-vad] adaptive bump DOWN", {
+            delta: adaptiveDeltaRef.current,
+            effective: effectiveSilenceMs(),
+          });
+          pushTiming({
+            turn: getTurn(),
+            kind: "adapt",
+            totalMs: effectiveSilenceMs(),
+            serverMs: adaptiveDeltaRef.current,
+          });
+        }
+      }
+    }
+  }
+
   useEffect(() => {
     if (typeof window === "undefined") return;
     const mime = pickMimeType();
@@ -259,6 +407,9 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
     const rec = recorderRef.current;
     console.log("[stt] commit called", { hasRecorder: !!rec });
     if (!rec) return;
+    // Stamp the commit time so the next speech-onset in the following
+    // listening session can compare against ADAPTIVE_RESUME_WINDOW_MS.
+    lastCommitAtRef.current = Date.now();
     // Grab whatever chunks land after stop().
     const finalChunks = chunksRef.current;
     chunksRef.current = [];
@@ -321,12 +472,25 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
         form.append("sessionId", sessionIdRef.current);
       }
       console.log("[stt] POST /api/roleplay/stt");
+      const tStart = performance.now();
       const res = await fetch("/api/roleplay/stt", {
         method: "POST",
         body: form,
         // 20s cap so a hung upstream doesn't wedge the mic loop; a
         // typical Scribe round-trip is under 3s.
         signal: AbortSignal.timeout(20_000),
+      });
+      const totalMs = Math.round(performance.now() - tStart);
+      const serverMsHeader = res.headers.get("X-Handler-Ms");
+      const serverMs = serverMsHeader ? Number(serverMsHeader) : undefined;
+      // STT fires BEFORE sendText bumps the turn counter, so file this
+      // under the upcoming turn number (getTurn() + 1). Groups the STT
+      // and the /turn call under the same row in the debug pill.
+      pushTiming({
+        turn: getTurn() + 1,
+        kind: "stt",
+        totalMs,
+        serverMs,
       });
       console.log("[stt] POST result", res.status);
       if (!res.ok) {
@@ -477,6 +641,10 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
         if (speechStartedAtRef.current == null) {
           speechStartedAtRef.current = now;
           console.log("[stt-vad] speech onset", { vol, threshold });
+          // Adaptive tuner: compares this onset against the last commit
+          // timestamp. Bumps the delta up if it's within the resume
+          // window (we cut them off), else feeds the clean-run counter.
+          noteSpeechOnset();
         } else if (
           !hasSpokeRef.current &&
           now - speechStartedAtRef.current >= MIN_SPEECH_MS_ACTIVE
@@ -496,14 +664,19 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
         // off. Short one-liner replies still commit at the caller's
         // base threshold.
         const utteranceMs = now - speechStartedAtRef.current;
-        const effectiveSilenceMs =
+        // Use the adaptive-tuned base rather than the raw prop, then
+        // layer the long-utterance bonus on top so long monologues
+        // still get their extra patience regardless of tuning.
+        const adaptiveBase = effectiveSilenceMs();
+        const silenceGateMs =
           utteranceMs >= LONG_UTTERANCE_MS
-            ? silenceThresholdRef.current + LONG_UTTERANCE_BONUS_MS
-            : silenceThresholdRef.current;
-        if (now - lastSoundAtRef.current >= effectiveSilenceMs) {
+            ? adaptiveBase + LONG_UTTERANCE_BONUS_MS
+            : adaptiveBase;
+        if (now - lastSoundAtRef.current >= silenceGateMs) {
           console.log("[stt-vad] silence threshold reached, committing", {
             utteranceMs,
-            effectiveSilenceMs,
+            silenceGateMs,
+            adaptiveDelta: adaptiveDeltaRef.current,
           });
           teardownVad();
           void commit();

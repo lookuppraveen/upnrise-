@@ -35,7 +35,42 @@ const Body = z.object({
   language: z.string().trim().min(1).max(40).optional(),
 });
 
+// Fire small no-op requests to the LLM + TTS providers so the Node
+// process's outbound socket pool has warm TLS keep-alive by the time
+// /turn and /tts fire. Fire-and-forget — never await, never blocks
+// /start. Runs once per /start invocation which lines up neatly with
+// "trainee just clicked Begin".
+function warmupProviders() {
+  const elevenKey = process.env.ELEVENLABS_API_KEY;
+  if (elevenKey) {
+    fetch("https://api.elevenlabs.io/v1/user", {
+      headers: { "xi-api-key": elevenKey },
+      signal: AbortSignal.timeout(6_000),
+    }).catch(() => {
+      // Swallow — warmup failure just means /tts pays cold TLS later.
+    });
+  }
+  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+  if (anthropicKey) {
+    fetch("https://api.anthropic.com/v1/models?limit=1", {
+      headers: {
+        "x-api-key": anthropicKey,
+        "anthropic-version": "2023-06-01",
+      },
+      signal: AbortSignal.timeout(6_000),
+    }).catch(() => {
+      // Same — Anthropic pool warmup is best-effort.
+    });
+  }
+}
+
 export async function POST(req: Request) {
+  const tHandlerStart = performance.now();
+  // Kick off provider warmup before touching auth/DB. The opening-line
+  // Anthropic call below already warms Anthropic; this covers /tts and
+  // adds a small bonus for the opening call itself when the TLS pool
+  // is cold (first request in a new lambda / cold Node process).
+  warmupProviders();
   const user = await getSessionUser();
   if (!user) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   // Trainees + admins (the latter for /admin/preview/...) can both
@@ -239,5 +274,9 @@ export async function POST(req: Request) {
     select: { id: true },
   });
 
-  return NextResponse.json({ sessionId: session.id, opening });
+  const handlerMs = Math.round(performance.now() - tHandlerStart);
+  return NextResponse.json(
+    { sessionId: session.id, opening },
+    { headers: { "X-Handler-Ms": String(handlerMs) } },
+  );
 }

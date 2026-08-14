@@ -30,6 +30,12 @@ import {
   type PlayerMode,
 } from "@/lib/roleplay/additional-settings";
 import { pickDefaultVoice } from "@/lib/voice/voice-catalog";
+import { LatencyDebugPill } from "@/components/roleplay/LatencyDebugPill";
+import {
+  bumpTurn,
+  pushTiming,
+  resetTelemetry,
+} from "@/lib/roleplay/latency-telemetry";
 
 type Bubble = { role: "persona" | "learner"; content: string };
 
@@ -151,7 +157,11 @@ export function RoleplayPlayerV2({
   const COUNTDOWN_SECONDS = 3;
   const [showStartCountdown, setShowStartCountdown] = useState(false);
   const [countdownValue, setCountdownValue] = useState(COUNTDOWN_SECONDS);
+  const [countdownWaiting, setCountdownWaiting] = useState(false);
   const countdownDoneRef = useRef(false);
+  // Two independent gates — see V1's finalizeCountdown for details.
+  const countdownElapsedRef = useRef(false);
+  const openingReadyRef = useRef(false);
   const pendingStartRef = useRef<{
     sessionId: string;
     opening: string | null;
@@ -253,15 +263,13 @@ export function RoleplayPlayerV2({
     sessionId,
     // 1500ms of silence → commit. Prior 1000ms cut trainees off
     // mid-sentence on natural thinking pauses ("um… let me…").
-    // 1500ms matches how consumer voice bots (ChatGPT Voice, Grok
-    // Voice) tune this — tolerates real pauses without feeling dead.
-    // Trade-off: 500ms extra latency on clean turn-ends is worth
-    // never cutting off the trainee.
-    // 2200ms silence-after-speech before auto-commit. 1500ms was too
-    // aggressive — normal intra-sentence pauses (thinking, breath,
-    // "um…") frequently exceeded it, causing the persona to start
-    // replying while the trainee was still forming their thought.
-    silenceThresholdMs: 2200,
+    // 1400ms silence-after-speech before auto-commit. See RoleplayPlayer.tsx
+    // for the rationale (dropped from 2200 to 1400; the long-utterance
+    // adaptive bonus in useElevenLabsSTT protects thinking pauses on long
+    // monologues without penalizing every short reply).
+    silenceThresholdMs: 1400,
+    adaptive: true,
+    adaptiveStorageKey: "rp:silence-delta:v1",
     onTranscript: (text) => {
       // The hook calls this when STT commits a chunk (silence timer or
       // final result). Stick it straight into the composer and
@@ -380,11 +388,35 @@ export function RoleplayPlayerV2({
   // (double-speak race). Cleared when the chain drains.
   const isSpeakingRef = useRef(false);
 
+  // See V1's finalizeCountdown for the two-gate rationale.
+  function finalizeCountdown() {
+    if (countdownDoneRef.current) return;
+    if (!countdownElapsedRef.current) return;
+    if (!openingReadyRef.current) {
+      setCountdownWaiting(true);
+      return;
+    }
+    countdownDoneRef.current = true;
+    setShowStartCountdown(false);
+    setCountdownWaiting(false);
+    const pending = pendingStartRef.current;
+    if (pending) {
+      setSessionId(pending.sessionId);
+      if (pending.opening) {
+        setBubbles([{ role: "persona", content: pending.opening }]);
+      } else {
+        setBubbles([]);
+      }
+      pendingStartRef.current = null;
+    }
+  }
+
   // Countdown driver — see V1 for details.
   useEffect(() => {
     if (sessionGated) return;
     if (countdownDoneRef.current) return;
     setShowStartCountdown(true);
+    setCountdownWaiting(false);
     setCountdownValue(COUNTDOWN_SECONDS);
     const timers: ReturnType<typeof setTimeout>[] = [];
     for (let i = 1; i < COUNTDOWN_SECONDS; i++) {
@@ -397,18 +429,8 @@ export function RoleplayPlayerV2({
     }
     timers.push(
       setTimeout(() => {
-        setShowStartCountdown(false);
-        countdownDoneRef.current = true;
-        const pending = pendingStartRef.current;
-        if (pending) {
-          setSessionId(pending.sessionId);
-          if (pending.opening) {
-            setBubbles([{ role: "persona", content: pending.opening }]);
-          } else {
-            setBubbles([]);
-          }
-          pendingStartRef.current = null;
-        }
+        countdownElapsedRef.current = true;
+        finalizeCountdown();
       }, COUNTDOWN_SECONDS * 1000),
     );
     return () => {
@@ -422,6 +444,8 @@ export function RoleplayPlayerV2({
     startedRef.current = true;
     (async () => {
       try {
+        resetTelemetry();
+        const tStart = performance.now();
         const res = await fetch("/api/roleplay/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -433,6 +457,10 @@ export function RoleplayPlayerV2({
             language: chosenLanguage ?? undefined,
           }),
         });
+        const totalMs = Math.round(performance.now() - tStart);
+        const serverMsHeader = res.headers.get("X-Handler-Ms");
+        const serverMs = serverMsHeader ? Number(serverMsHeader) : undefined;
+        pushTiming({ turn: 0, kind: "start", totalMs, serverMs });
         if (!res.ok) {
           const data = (await res.json().catch(() => ({}))) as {
             error?: string;
@@ -464,20 +492,15 @@ export function RoleplayPlayerV2({
         }
         const data: { sessionId: string; opening: string | null } =
           await res.json();
-        if (!countdownDoneRef.current) {
-          pendingStartRef.current = data;
-          return;
-        }
-        setSessionId(data.sessionId);
-        // When the admin set "Start Roleplay By" = User, the start
-        // route returns opening=null and the trainee speaks first.
-        if (data.opening) {
-          setBubbles([{ role: "persona", content: data.opening }]);
-        } else {
-          setBubbles([]);
-        }
+        // Two-gate finalize — see V1 for details.
+        pendingStartRef.current = data;
+        openingReadyRef.current = true;
+        finalizeCountdown();
       } catch (e) {
         setError(e instanceof Error ? e.message : "Failed to start");
+        // Unblock the overlay on error so the trainee sees the banner.
+        openingReadyRef.current = true;
+        finalizeCountdown();
       }
     })();
   }, [moduleId, sessionGated]);
@@ -522,9 +545,8 @@ export function RoleplayPlayerV2({
     const offset = incrementalSpokenLenRef.current.get(bubbleIdx) ?? 0;
     const full = streamingContentRef.current;
     const tail = full.slice(offset);
-    const sentences = splitCompleteSentences(tail);
+    const { sentences, consumed } = splitCompleteSentences(tail);
     if (sentences.length === 0) return;
-    const consumed = sentences.reduce((sum, s) => sum + s.length, 0);
     incrementalSpokenLenRef.current.set(bubbleIdx, offset + consumed);
     // Chain onto the running speech tail so sentence N always
     // completes before N+1 begins. Some avatar drivers accept parallel
@@ -570,14 +592,19 @@ export function RoleplayPlayerV2({
     const offset = incrementalSpokenLenRef.current.get(bubbleIdx) ?? 0;
     const full = streamingContentRef.current;
     const tail = full.slice(offset);
-    const sentences = splitCompleteSentences(tail);
+    const { sentences, consumed } = splitCompleteSentences(tail);
     if (sentences.length === 0) return;
-    const consumed = sentences.reduce((sum, s) => sum + s.length, 0);
     incrementalSpokenLenRef.current.set(bubbleIdx, offset + consumed);
     for (const s of sentences) {
       isSpeakingRef.current = true;
+      // Pipelined: fetch fires now, play chains behind previous audio.
+      // See RoleplayPlayer.tsx for the full rationale.
+      const prepPromise = voice.prepare(s);
       voiceSpeakChainRef.current = voiceSpeakChainRef.current
-        .then(() => voice.speak(s))
+        .then(async () => {
+          const prep = await prepPromise;
+          await prep.play();
+        })
         .catch(() => {
           /* per-sentence failure never breaks the chain */
         });
@@ -622,18 +649,28 @@ export function RoleplayPlayerV2({
     ]);
     setStreaming(true);
 
+    // Bump the shared turn counter — STT + TTS timings pushed during
+    // this turn will group under this number in the debug pill.
+    const turnNum = bumpTurn();
     try {
+      const tTurnStart = performance.now();
       const res = await fetch("/api/roleplay/turn", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sessionId, userMessage }),
       });
       if (!res.ok || !res.body) throw new Error(`turn failed: ${res.status}`);
+      const setupMsHeader = res.headers.get("X-Handler-Setup-Ms");
+      const serverMs = setupMsHeader ? Number(setupMsHeader) : undefined;
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
+      let ttfbMs: number | undefined;
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
+        if (ttfbMs === undefined) {
+          ttfbMs = Math.round(performance.now() - tTurnStart);
+        }
         const chunk = decoder.decode(value, { stream: true });
         streamingContentRef.current += chunk;
         setBubbles((b) => {
@@ -650,6 +687,14 @@ export function RoleplayPlayerV2({
         pushIncrementalSpeak(personaIdx);
         pushIncrementalVoiceSpeak(personaIdx);
       }
+      const totalMs = Math.round(performance.now() - tTurnStart);
+      pushTiming({
+        turn: turnNum,
+        kind: "turn",
+        totalMs,
+        ttfbMs,
+        serverMs,
+      });
       flushFinalSpeak(personaIdx);
       flushFinalVoiceSpeak(personaIdx);
     } catch (e) {
@@ -722,7 +767,7 @@ export function RoleplayPlayerV2({
         await withTimeout(avatarSpeakChainRef.current, TTS_TIMEOUT_MS).catch(
           () => {},
         );
-        const sentences = splitCompleteSentences(last.content);
+        const { sentences, consumed } = splitCompleteSentences(last.content);
         isSpeakingRef.current = true;
         try {
           if (sentences.length === 0) {
@@ -731,7 +776,6 @@ export function RoleplayPlayerV2({
             for (const s of sentences) {
               await withTimeout(av.speak(s), TTS_TIMEOUT_MS);
             }
-            const consumed = sentences.reduce((sum, s) => sum + s.length, 0);
             const tail = last.content.slice(consumed).trim();
             if (tail) await withTimeout(av.speak(tail), TTS_TIMEOUT_MS);
           }
@@ -1529,8 +1573,12 @@ export function RoleplayPlayerV2({
 
   return (
     <div className="v2-shell relative min-h-[calc(100vh-56px)] -mx-7 -mt-6 pb-32">
+      <LatencyDebugPill />
       {showStartCountdown ? (
-        <StartingCountdownV2 value={countdownValue} />
+        <StartingCountdownV2
+          value={countdownValue}
+          waiting={countdownWaiting}
+        />
       ) : null}
       {/* Ambient background — warm dark gradient with soft accent glows */}
       <div
@@ -3009,8 +3057,15 @@ function CallControlsBar({
 }
 
 // V2 countdown overlay — matches the dark shell aesthetic.
-function StartingCountdownV2({ value }: { value: number }) {
-  const label = value <= 0 ? "Go" : String(value);
+function StartingCountdownV2({
+  value,
+  waiting = false,
+}: {
+  value: number;
+  waiting?: boolean;
+}) {
+  const label = waiting ? "…" : value <= 0 ? "Go" : String(value);
+  const sub = waiting ? "Warming up the persona…" : "Get ready…";
   return (
     <div
       className="fixed inset-0 z-[60] grid place-items-center backdrop-blur-md"
@@ -3035,7 +3090,7 @@ function StartingCountdownV2({ value }: { value: number }) {
         >
           {label}
         </div>
-        <div className="text-[12.5px] opacity-70">Get ready…</div>
+        <div className="text-[12.5px] opacity-70">{sub}</div>
       </div>
     </div>
   );
@@ -3057,15 +3112,33 @@ async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
   }
 }
 
-// Split a paragraph into discrete sentences ending in .!?…  D-ID
-// processes each speak() independently, so pushing one sentence at a
-// time lets it start lip-syncing the first one while later sentences
-// are still being generated upstream. Sentences without terminal
-// punctuation (typically the trailing tail of a still-streaming
-// bubble) are not returned — they'll be flushed by flushFinalSpeak.
-function splitCompleteSentences(text: string): string[] {
-  const matches = text.match(/[^.!?…\n]+[.!?…]+(?=\s|$)/g);
-  return matches ? matches.map((s) => s.trim()).filter(Boolean) : [];
+// See RoleplayPlayer.tsx for the eager-comma-splitting rationale. This
+// V2 copy stays in sync with V1's shape — returns both the speakable
+// chunks and the number of characters they consume in the source text
+// so callers can advance their per-bubble cursor without drift.
+const MIN_COMMA_WORDS = 5;
+
+function splitCompleteSentences(text: string): {
+  sentences: string[];
+  consumed: number;
+} {
+  const sentences: string[] = [];
+  const re = /([^.!?…,\n]+)([.!?…]+|,)(?=\s|$)/g;
+  let consumed = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const clause = m[1];
+    const punct = m[2];
+    const trimmed = clause.trim();
+    const isTerminal = punct !== ",";
+    const wordCount = trimmed ? trimmed.split(/\s+/).length : 0;
+    const keep = isTerminal ? trimmed.length > 0 : wordCount >= MIN_COMMA_WORDS;
+    if (keep) {
+      sentences.push((trimmed + punct).trim());
+      consumed = m.index + m[0].length;
+    }
+  }
+  return { sentences, consumed };
 }
 
 // Turn the classified STT error into a plain-English tip the trainee

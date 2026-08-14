@@ -10,8 +10,7 @@
 // fails.
 
 import "server-only";
-import { anthropic } from "@/lib/ai/client";
-import { getAIConfig } from "@/lib/ai/config";
+import { getLlmClient } from "@/lib/ai/llm";
 
 type CacheEntry = { value: string; expiresAt: number };
 const cache = new Map<string, CacheEntry>();
@@ -22,28 +21,19 @@ async function generateProse(args: {
   system: string;
   user: string;
   fallback: string;
+  companyId: string | null;
 }): Promise<string> {
   const hit = cache.get(args.cacheKey);
   if (hit && hit.expiresAt > Date.now()) return hit.value;
 
-  let prose = "";
-  try {
-    const ai = await getAIConfig();
-    const resp = await anthropic.messages.create({
-      model: ai.fastModel,
-      max_tokens: 220,
-      system: args.system,
-      messages: [{ role: "user", content: args.user }],
-    });
-    prose = resp.content
-      .map((b) => (b.type === "text" ? b.text : ""))
-      .join("")
-      .trim()
-      .replace(/^["']|["']$/g, "")
-      .trim();
-  } catch (err) {
-    console.error("[ai.summary] LLM error", err);
-  }
+  const client = await getLlmClient(args.companyId);
+  const raw = await client.generateText({
+    system: args.system,
+    user: args.user,
+    maxTokens: 220,
+    fast: true,
+  });
+  const prose = raw.trim().replace(/^["']|["']$/g, "").trim();
   if (!prose) return args.fallback;
   cache.set(args.cacheKey, {
     value: prose,
@@ -68,6 +58,8 @@ export type TraineeWeeklySignal = {
  */
 export async function generateTraineeWeeklyBrief(input: {
   userId: string;
+  /** Tenant scope for the LLM factory. Null falls back to platform default. */
+  companyId: string | null;
   signal: TraineeWeeklySignal;
 }): Promise<string> {
   const s = input.signal;
@@ -95,7 +87,13 @@ export async function generateTraineeWeeklyBrief(input: {
 
   const userMsg = traineeSignalToPrompt(s);
 
-  return generateProse({ cacheKey, system, user: userMsg, fallback });
+  return generateProse({
+    cacheKey,
+    system,
+    user: userMsg,
+    fallback,
+    companyId: input.companyId,
+  });
 }
 
 function traineeSignalToPrompt(s: TraineeWeeklySignal): string {
@@ -178,7 +176,13 @@ export async function generateAdminWeeklyBrief(input: {
   ].join("\n");
 
   const userMsg = adminSignalToPrompt(s);
-  return generateProse({ cacheKey, system, user: userMsg, fallback });
+  return generateProse({
+    cacheKey,
+    system,
+    user: userMsg,
+    fallback,
+    companyId: input.companyId,
+  });
 }
 
 function adminSignalToPrompt(s: AdminWeeklySignal): string {
