@@ -46,6 +46,24 @@ const MIN_THRESHOLD = 3;
 const FALLBACK_THRESHOLD = 8; // used before calibration completes
 const NOISE_MULTIPLIER = 3.0;
 const CALIBRATION_MS = 500;
+// Hard cap on the calibrated threshold. Real speech (with the ANALYSER_GAIN
+// boost) comfortably clears 25 even on quiet mics; ambient noise rarely
+// sustains that high. Without this cap we've seen calibration land at
+// ~90 when the persona's TTS audio tail bleeds into the mic during the
+// mic-reopen window, which makes subsequent turns silently fail
+// (isSound never becomes true, VAD sits idle forever).
+const MAX_THRESHOLD = 25;
+// Wait this long after mic-open before we START collecting calibration
+// samples. Covers the 100-300ms tail of persona TTS still flowing out
+// of speakers after the audio element fires `ended`. Without this
+// delay, calibration reads the tail as "room noise" and computes a
+// threshold that's above the trainee's real voice.
+const CALIBRATION_DELAY_MS = 250;
+// Stuck-mic auto-recovery — if we've been in active listening mode
+// for this long with hasSpoke=false and threshold > MAX_THRESHOLD/2,
+// force the threshold back down to FALLBACK. Defensive backstop for
+// any recalibration path we might miss.
+const STUCK_RECOVERY_MS = 4_000;
 // Analyser-only gain boost. The AnalyserNode gets `source → GainNode
 // → Analyser` so the VAD reads a louder signal for detection
 // purposes; MediaRecorder still gets the raw stream so audio quality
@@ -538,6 +556,11 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
     return Math.sqrt(sum / buf.length);
   }, []);
 
+  // Tracks when the mic entered ACTIVE listening mode. Used by the
+  // stuck-mic auto-recovery below — if we've been active for too long
+  // with a suspiciously high threshold and no speech, we recover.
+  const activeListenStartRef = useRef<number | null>(null);
+
   const startVadLoop = useCallback(() => {
     teardownVad();
     speechStartedAtRef.current = null;
@@ -549,6 +572,8 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
     calibrationStartRef.current = Date.now();
     calibrationSamplesRef.current = [];
     adaptiveThresholdRef.current = FALLBACK_THRESHOLD;
+    activeListenStartRef.current =
+      modeRef.current === "active" ? Date.now() : null;
 
     vadTimerRef.current = setInterval(() => {
       const vol = readVolume();
@@ -561,25 +586,67 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
       // sampling. In background mode we can't calibrate reliably
       // (persona TTS is bleeding into the mic on non-headphone setups)
       // so we skip calibration and use the fallback threshold.
+      //
+      // Two hardening tweaks vs the original impl:
+      //  1. Skip the first CALIBRATION_DELAY_MS of samples so the
+      //     tail of the persona's TTS (which keeps bleeding through
+      //     speakers for ~100-300ms after the audio element fires
+      //     `ended`) doesn't poison the noise floor.
+      //  2. Cap the resulting threshold at MAX_THRESHOLD. Without
+      //     this, a burst of TTS bleed during calibration produces
+      //     a threshold above the trainee's real voice, and the mic
+      //     goes silent for the rest of the turn.
       if (
         modeRef.current === "active" &&
         calibrationStartRef.current != null
       ) {
-        if (now - calibrationStartRef.current < CALIBRATION_MS) {
-          calibrationSamplesRef.current.push(vol);
+        const elapsed = now - calibrationStartRef.current;
+        if (elapsed < CALIBRATION_MS) {
+          if (elapsed >= CALIBRATION_DELAY_MS) {
+            calibrationSamplesRef.current.push(vol);
+          }
         } else {
           const samples = calibrationSamplesRef.current;
           if (samples.length > 0) {
             const mean =
               samples.reduce((a, b) => a + b, 0) / samples.length;
-            adaptiveThresholdRef.current = Math.max(
-              MIN_THRESHOLD,
-              Math.round(mean * NOISE_MULTIPLIER),
+            const raw = Math.round(mean * NOISE_MULTIPLIER);
+            const capped = Math.min(
+              MAX_THRESHOLD,
+              Math.max(MIN_THRESHOLD, raw),
             );
+            if (raw !== capped) {
+              console.warn(
+                "[stt-vad] calibration threshold clamped",
+                { raw, capped, mean: Math.round(mean) },
+              );
+            }
+            adaptiveThresholdRef.current = capped;
           }
           calibrationStartRef.current = null;
           calibrationSamplesRef.current = [];
         }
+      }
+
+      // Stuck-mic auto-recovery. If we've been in active mode for
+      // STUCK_RECOVERY_MS with no confirmed speech AND the threshold
+      // is at or above half-MAX (a "suspiciously high" band), force
+      // it back to FALLBACK so the trainee's real voice is guaranteed
+      // to clear the bar. Fires at most once per active-listen — we
+      // clear activeListenStartRef so subsequent ticks don't re-fire.
+      if (
+        modeRef.current === "active" &&
+        activeListenStartRef.current != null &&
+        !hasSpokeRef.current &&
+        now - activeListenStartRef.current >= STUCK_RECOVERY_MS &&
+        adaptiveThresholdRef.current > MAX_THRESHOLD / 2
+      ) {
+        console.warn("[stt-vad] stuck-mic recovery — resetting threshold", {
+          prev: adaptiveThresholdRef.current,
+          next: FALLBACK_THRESHOLD,
+        });
+        adaptiveThresholdRef.current = FALLBACK_THRESHOLD;
+        activeListenStartRef.current = null;
       }
 
       const threshold = adaptiveThresholdRef.current;
@@ -588,13 +655,10 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
       // 1Hz VAD trace so we can see whether audio is even landing.
       if (now - lastTraceAtRef.current >= 1000) {
         lastTraceAtRef.current = now;
-        console.log("[stt-vad] tick", {
-          mode: modeRef.current,
-          vol: Math.round(vol),
-          threshold,
-          isSound,
-          hasSpoke: hasSpokeRef.current,
-        });
+        const calibrating = calibrationStartRef.current != null;
+        console.log(
+          `[stt-vad] mode=${modeRef.current} vol=${Math.round(vol)} thr=${threshold} sound=${isSound} spoke=${hasSpokeRef.current}${calibrating ? " CALIBRATING" : ""}`,
+        );
       }
 
       if (modeRef.current === "background") {
@@ -629,6 +693,11 @@ export function useElevenLabsSTT(opts: Options): UseElevenLabsSTTResult {
             adaptiveThresholdRef.current = FALLBACK_THRESHOLD;
             calibrationStartRef.current = null;
             calibrationSamplesRef.current = [];
+            // Now that we're in active mode, arm the stuck-mic
+            // recovery timer (defensive: hasSpokeRef is true here so
+            // recovery won't fire this turn, but if the barge-in path
+            // ever changes the timer is ready).
+            activeListenStartRef.current = now;
           }
         } else {
           speechStartedAtRef.current = null;
