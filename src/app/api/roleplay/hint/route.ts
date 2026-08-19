@@ -81,7 +81,11 @@ export async function POST(req: Request) {
       ? "Format: 2-3 SHORT verbatim lines, one per bullet. Each line starts with '• '. Each line is 8-14 words — a single crisp sentence the learner delivers in one breath. First person only. No markdown asterisks, no preamble, no closing summary."
       : "Format: ONE line, 1-2 short sentences, 25 words max. Written in first person as the exact words the learner says. Plain text only, no headings, no bullets, no quotation marks around the whole reply, no coaching commentary. Short and punchy beats long and thorough — the learner has to say this aloud in the next second.";
 
-  const system = [
+  // System prefix: instructions + scenario + persona + criteria + format
+  // rule. All of these are constant for the lifetime of a session (and
+  // the format rule only flips when the admin changes the hint type),
+  // so pack them into one cacheable block. Only the transcript grows.
+  const systemPrefix = [
     "You are a teleprompter for a sales learner mid-roleplay. They hit the Hint button and need the EXACT words to say back to the customer RIGHT NOW.",
     "",
     "Return ONLY the line the learner should speak next. First person. Short.",
@@ -97,18 +101,20 @@ export async function POST(req: Request) {
     "- If the transcript shows no turns yet (learner opens), produce a strong opening line that fits the scenario — same short-and-punchy rule applies.",
     "",
     formatRule,
-  ].join("\n");
+    "",
+    `## Scenario\n${cfg.scenario}`,
+    "",
+    `## Customer persona\n${cfg.persona}`,
+    criteria ? `\n## What the learner is being scored on\n${criteria}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
 
   const userMsg = [
-    `## Scenario\n${cfg.scenario}`,
-    `## Customer persona\n${cfg.persona}`,
-    criteria ? `## What the learner is being scored on\n${criteria}` : "",
     `## Recent transcript\n${transcriptBlock}`,
     "",
     "Write the EXACT words the learner should say as their next line. Output only the script — nothing else.",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+  ].join("\n\n");
 
   try {
     const ai = await getAIConfig();
@@ -119,7 +125,18 @@ export async function POST(req: Request) {
         // Combined with the "25 words max" prompt rule and the 350-char
         // schema cap, this triangulates on short, deliverable hints.
         max_tokens: 200,
-        system,
+        // Ephemeral prompt caching: the system prefix (instructions +
+        // scenario + persona + criteria) is stable across every hint
+        // request in a session, so cache it. Repeat hints within the
+        // 5-min TTL skip re-processing that prefix and typically return
+        // 3-5x faster.
+        system: [
+          {
+            type: "text",
+            text: systemPrefix,
+            cache_control: { type: "ephemeral" },
+          },
+        ],
         messages: [{ role: "user", content: userMsg }],
       },
       // 15s upstream cap; client-abort forwarded so a stale hint
